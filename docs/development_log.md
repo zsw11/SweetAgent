@@ -288,6 +288,402 @@ graph LR
 - [ ] 11. Interrupt / Human-in-the-loop（Phase 7，参数不明确时暂停询问）
 - [ ] 12. Web UI（Phase 9，Streamlit MVP 或 Next.js）
 - [ ] **13. Agent 评估体系（重点！决定能否上线）** —— 详见上方「三点六」小节
+- [ ] **14. LangSmith 接入（Agent trace 可视化 + Prompt 版本管理 + 评估）** —— 替代 agent_steps/agent_tool_calls/agent_errors 手动记录；保留 agent_runs/agent_results 业务表
+
+---
+
+## 三点七、面试点与技术难点总结（按考点分类）
+
+> 本项目涉及的高频面试考点，按"面试官会怎么问 → 我们怎么设计 → 为什么这么做 → 有没有备选方案"整理。
+> 每个考点都对应真实代码，不是纸上谈兵。
+
+---
+
+### 考点一：多 Agent 编排——为什么不用固定 DAG 图？
+
+**面试官怎么问**：你有 operation/finance/logistics/decision 四个节点，为什么不直接画一张固定图，而要搞一个 router 节点循环路由？
+
+**我们的设计**：
+```
+__start__ → manager → router → [department] → router → ... → decision → END
+```
+manager 先规划任务 DAG，router 根据当前就绪任务动态决定下一个走哪个部门。
+
+**为什么不能用固定图**：
+- 用户问"销售怎么样"→ 只需要 operation
+- 用户问"利润和库存风险"→ 需要 finance + logistics
+- 用户问"全面诊断"→ 需要 operation + finance + logistics + product
+- 部门组合是 **LLM 动态决定的**，固定图无法适配
+- 如果硬写固定图：要么所有部门都跑（浪费 token、慢），要么用户问题路由不准
+
+**备选方案及缺点**：
+| 方案 | 缺点 |
+|---|---|
+| 固定全连接图 | 每次都跑所有部门，浪费 3-4 倍 token |
+| 纯 LLM 链式调用（agent.run 循环） | 不可观测、无 checkpoint、无法中断恢复 |
+| 路由模型直接选部门 | 一个分类器，不够灵活，无法处理多部门+依赖 |
+
+**核心一句话**：固定图适合流程确定的场景，多 Agent 决策系统的流程是 LLM 动态生成的，必须用"规划+动态路由"模式。
+
+---
+
+### 考点二：DAG 环检测——依赖图有环怎么办？
+
+**面试官怎么问**：Manager LLM 输出了 depends_on 依赖关系，万一形成了环（A 依赖 B，B 依赖 A），你的系统怎么处理？
+
+**我们的设计**（`ManagerAgent._parse_and_validate`）：
+1. DFS 三色标记法：白=未访问、灰=访问中、黑=已完成，O(V+E)
+2. 遇到灰色节点 = 发现环
+3. **拆环降级策略**：打破所有非 decision 的依赖边，让部门 Agent 独立执行
+
+**举例**：
+```
+输入：operation → depends_on=[decision]
+      decision  → depends_on=[operation]
+      （环：operation 等 decision，decision 等 operation）
+
+拆环后：operation 不依赖 decision，decision 依赖 operation
+→ operation 先跑 → operation 完成后 decision 再跑
+```
+
+**为什么只打破非 decision 依赖**：
+- decision 是最终汇总节点，它依赖所有部门是合理的
+- 部门之间互相依赖才是异常（operation 不该等 finance 跑完才能查销售数据）
+- 打破部门间依赖让它们独立跑，最终 decision 再汇总
+
+**会不会导致结果不一致**：
+- 不会。因为 O/F/L 三个部门查的是**不同的数据域**
+- 它们之间本来就不该互相依赖——部门独立查数，decision 负责交叉验证
+- 如果真的需要 finance 用 operation 的中间结果，那应该在 decision 层做，而不是部门层
+
+**核心一句话**：环检测用 DFS 三色标记，拆环策略是"信任 decision、打破部门间依赖"，因为部门本来就应该独立查数。
+
+---
+
+### 考点三：LLM 生成 SQL 出错怎么办？——执行→错误→repair 闭环
+
+**面试官怎么问**：LLM 生成的 SQL 可能引用不存在的表、字段名拼错、语法错误，你怎么保证 Agent 能拿到正确数据？
+
+**我们的设计**（`BaseDepartmentAgent._query_one`）：
+```
+生成 SQL → 语法校验 → 执行 →
+  ├─ 执行成功且有数据 → 返回
+  ├─ 执行成功但 0 行 → repair（"聚合查询不应为空，可能过滤条件错了"）
+  └─ 执行报错 → repair（把错误信息喂给 LLM，让它修）
+最多重试 3 次，还失败就抛异常
+```
+
+**关键设计点**：
+1. **不是一次生成就完**：SQL 生成 → 执行失败 → 把错误信息回喂 LLM → 重新生成，形成闭环
+2. **区分两种失败**：语法错误 vs 0 行结果（0 行可能是过滤条件错，不是语法错）
+3. **repair 时带上 schema 上下文**：告诉 LLM 正确的表名/字段名是什么
+4. **最多 3 次重试**：防死循环，超过就报错（不无限重试烧钱）
+
+**核心一句话**：LLM 不是一次生成正确，而是"生成→执行→错误反馈→修复"的闭环，本质是把编译器的错误提示机制用在 LLM 上。
+
+---
+
+### 考点四：怎么防止 LLM 编造数据域？——白名单安全边界
+
+**面试官怎么问**：LLM 说"我要查广告数据"，但你系统里根本没有广告表，你怎么控制？
+
+**我们的设计**：
+1. **KNOWN_REQS 白名单**：每个部门 Agent 硬编码允许的数据域
+   - operation: {sales_sku, brand_summary, ad, review, inventory}
+   - finance: {profit, cost, revenue, refund, platform_fee}
+   - logistics: {inventory_risk, stock_level, inbound, logistics_cost, delivery}
+2. **plan 阶段过滤**：LLM 输出的数据域不在白名单就丢弃
+3. **retry 阶段二次过滤**：LLM 说"我还缺 XX 数据"，XX 不在白名单就忽略
+4. **FALLBACK_REQ 兜底**：白名单过滤后如果空了，强制用一个默认数据域
+
+**为什么必须白名单**：
+- LLM 会"合理地编造"——用户问销售，LLM 觉得应该查"流量数据"，但你没这张表
+- 不白名单 = LLM 想查什么查什么 = 每次都报"表不存在"错误
+- 白名单是 **安全边界**，比 prompt 里写"不要查不存在的表"可靠得多
+
+**核心一句话**：不要相信 LLM 的输出，用白名单做硬边界过滤——LLM 负责"查什么方向"，代码负责"这个方向到底存不存在"。
+
+---
+
+### 考点五：LLM 容易犯的统计错误——总量对比陷阱
+
+**面试官怎么问**：你让 LLM 分析"最近 90 天销售变化"，它说"销量下降了 65%"，这个结论可能是错的，为什么？
+
+**真实踩坑**：
+- prev 段（前 69 天）总销量 6000 件
+- last21 段（后 21 天）总销量 2000 件
+- LLM 直接比总量：(2000-6000)/6000 = **-66.7%**
+- 但正确算法是日均：prev 日均 87 件/天，last21 日均 95 件/天 = **+9%**（实际是增长）
+
+**怎么解决**：
+1. **数据字典注入**：明确告诉 LLM "prev 约 69 天、last21 约 21 天，天数不同"
+2. **prompt 强制日均口径**：要求 SQL 必须输出 `SUM(x)/COUNT(DISTINCT date)` 作为 daily_x
+3. **分析 prompt 约束**：明确要求"禁止直接比较两段总量，必须换算日均"
+
+**这是 Agent 工程化的核心难点**：
+- LLM 数学能力没问题，但它不知道你的数据分布
+- 必须在 **schema 上下文** 里把"陷阱"提前告诉它
+- 光靠 prompt 说"请仔细计算"不够，要在 SQL 生成阶段就把日均列出来
+
+**核心一句话**：LLM 不是数学不行，是不知道你的数据分布——把业务陷阱写进 schema 上下文，比在 prompt 里说"请认真计算"有效 100 倍。
+
+---
+
+### 考点六：retry 闭环——怎么防止 LLM 死循环烧钱？
+
+**面试官怎么问**：你的 Agent 有 plan→query→analyze→retry 循环，如果 LLM 每次都说"数据不够，再查点别的"，会不会无限循环？
+
+**我们的设计**：
+1. **迭代上限**：`max_iterations = 5`，超过强制结束
+2. **queried 记忆**：已经查过的数据域不重复查
+3. **retry 白名单过滤**：LLM 说缺 X 数据，X 不在 KNOWN_REQS 就忽略
+4. **无可补数据自动 enough=True**：白名单里所有数据域都查过了，就不再 retry
+
+**修复效果**：
+- 修复前：analyze 被调用 8 次（每次都 LLM 说"不够再查"）
+- 修复后：analyze 只调 2 次（第一次查 3 个域，第二次发现够了）
+
+**为什么 retry 要独立成节点而不是合并进 analyze**：
+1. **安全边界不能交给 LLM**：analyze 是 LLM 节点（会编造），retry 是确定性代码（白名单强制裁决）
+2. **单一职责**：analyze 只判断"够不够"，retry 只决定"补什么"
+3. **可观测性**：日志能分开看"LLM 说缺什么"和"代码实际补了什么"
+4. **可测试性**：retry 是纯函数，3 个分支可单测
+
+**核心一句话**：LLM 的判断不可信，必须用确定性代码（白名单+迭代上限）做兜底，防止无限循环烧 token。
+
+---
+
+### 考点七：BaseDepartmentAgent——模板方法设计模式
+
+**面试官怎么问**：operation/finance/logistics 三个 Agent 逻辑几乎一样，只是查的数据不同，你怎么设计避免代码重复？
+
+**演进过程**：
+1. **V1：复制粘贴**——三个 Agent 各写 300 行，改 bug 改三处
+2. **V2：OperationAgent 当父类**——Finance 继承 Operation，但核心逻辑都重写了（名义继承）
+3. **V3：BaseDepartmentAgent 基类**——**模板方法模式**
+
+**V3 的设计**：
+```python
+class BaseDepartmentAgent:
+    # 子类声明配置（模板参数）
+    AGENT_NAME = "operation"
+    KNOWN_REQS = frozenset({...})
+    PRIORITY_TABLES = {...}
+    PLAN_PROMPT = "..."
+    ANALYSIS_PROMPT = "..."
+
+    # 基类实现通用流程（模板方法）
+    def run(self):
+        plan = self._plan()               # 用 self.PLAN_PROMPT
+        results = self._query(plan)       # 通用 SQL 执行
+        analysis = self._analyze(results)  # 用 self.ANALYSIS_PROMPT
+        return self._build_result(analysis)
+
+    # 子类必须实现的差异化点
+    def _load_dictionary(self): ...       # 每个部门的数据字典不同
+```
+
+**为什么用模板方法而不是策略模式**：
+- 三个部门的**流程完全一样**（plan→query→analyze→retry），只是参数不同
+- 模板方法 = "骨架在基类，差异在子类"
+- 策略模式适合"流程本身可以替换"（比如 query 可以是 SQL 也可以是 API 调用），这里不适用
+
+**代码量对比**：
+- Operation: 310 行 → 130 行（只留配置+字典）
+- Finance: 210 行 → 110 行
+- Logistics: 210 行 → 110 行
+- 新增 Product Agent 只需要写 ~80 行配置
+
+**核心一句话**：流程相同、参数不同 → 模板方法模式，基类定骨架子类填参数；流程不同 → 策略模式。
+
+---
+
+### 考点八：跨部门数据交叉验证——多 Agent 的核心价值
+
+**面试官怎么问**：你的 operation 和 finance 都查了"收入/GMV"，两个 Agent 独立查数，结果不一致怎么办？多 Agent 架构的价值到底是什么？
+
+**真实案例**：
+- Operation 查 sales_daily：90 天 GMV = 1,812,419 美元
+- Finance 查 mart_product_profit_daily：90 天收入 = 1,812,419 美元（基本吻合 ✅）
+- 但 Finance 查 revenue_daily：收入 = 1,805,599 美元（差 0.4%）
+- 再查 platform_fee 表：收入 = 1,900,316 美元（差 5.5%）
+
+**Decision Agent 怎么做的**：
+1. **交叉验证**：发现 operation GMV ≈ finance profit 表收入（一致，可信）
+2. **口径告警**：发现 finance 内部多张表查出来的收入差 5.5%（数据质量问题）
+3. **写入 findings**：标注"跨口径差异约 5.5%，采信具体数字时需标注口径"
+4. **建议**：P0 优先级——统一财务口径
+
+**这就是多 Agent 的价值**：
+- 单 Agent 只能看自己的数据域，不知道别的部门怎么算的
+- 多 Agent 各自独立查数 → Decision 做交叉对账 → 发现数据口径不一致
+- 相当于"每个部门各报各的账，最后财务总监对账"
+
+**核心一句话**：多 Agent 不是为了并行快，是为了**独立视角交叉验证**——单一 Agent 看不到的口径冲突，多 Agent 架构天然能暴露。
+
+---
+
+### 考点九：未实现 Agent 优雅降级
+
+**面试官怎么问**：Manager LLM 说要调度 product Agent，但 product 还没开发完，你的系统会崩吗？
+
+**我们的设计**：
+1. router 节点检查 `AVAILABLE_AGENTS` 注册表
+2. product 不在注册表里 → 标记 `skipped_tasks` → 不执行
+3. product 的下游任务（decision）不受影响，decision 照常跑
+4. Decision 在报告里标注"product 数据缺失，跨部门验证不完整"
+
+**为什么重要**：
+- Agent 开发是渐进的，不可能一次全写完
+- 不能因为一个部门没实现，整个系统就跑不了
+- 降级要"诚实"——不编造 product 的分析结果，而是明确说"这个部门没数据"
+
+**核心一句话**：系统要能接受"不完整"——未实现的 Agent 优雅跳过，Decision 诚实标注缺失，而不是报错中断。
+
+---
+
+### 考点十：LLM 输出 JSON 解析容错
+
+**面试官怎么问**：LLM 输出的 JSON 经常带 markdown 代码块、或者有多余文字、或者根本不是 JSON，你怎么稳定解析？
+
+**我们的设计**（`parse_analysis_json`）：
+1. 先 strip，去掉首尾空白
+2. 如果开头是 ```，剥掉 markdown 代码块标记（```json / ```）
+3. 直接 json.loads
+4. 失败就找第一个 `{` 和最后一个 `}`，截取中间部分再试
+5. 再失败就返回 None，上层用降级逻辑
+
+**为什么必须这么做**：
+- LLM 输出不可控：有时包 ```json，有时写"好的，结果如下：{...}"，有时截断
+- 不能假设 LLM 永远输出干净的 JSON
+- 这是 Agent 工程化的基本功：**LLM 输出永远要做容错**
+
+**核心一句话**：把 LLM 当不可靠数据源，输出必须经过"剥离→提取→校验→降级"四层容错。
+
+---
+
+
+---
+
+### 考点十一：retry 空转的三道闸（补充考点六的实现细节）
+
+**面试官怎么追问**：你说用白名单防止 retry 死循环，具体怎么防的？能画一下流程图吗？
+
+**_retry 函数的三道闸**（graph.py 第 98-114 行）：
+
+```python
+for m in state.get("missing") or []:
+    if m not in plan and m not in queried and m in _KNOWN_REQS:
+        plan.append(m)
+        added = True
+if not added:
+    out["enough"] = True   # 没有新需求可补，直接结束
+```
+
+三个条件同时满足才追加：
+1. `m not in plan` — 不在已有计划里（防重复追加同一个）
+2. `m not in queried` — 还没查过（防重复查）
+3. `m in _KNOWN_REQS` — **白名单过滤**：LLM 说缺流量分析但系统没这张表，直接丢弃
+
+**关键行为**：如果 LLM 说缺的全部被三道闸拦下来了，added=False，直接设 enough=True，下次 query 节点直奔 END。
+
+**流程对比**：
+```
+修复前（死循环）：
+  analyze -> 缺广告 -> retry -> query -> analyze -> 缺评论 -> retry -> query ...（8次）
+
+修复后：
+  第1轮 plan=[sales_sku, brand_summary, ad] -> 查完 -> analyze 缺 review
+  retry：review 在白名单且没查过 -> 加入 plan
+  第2轮 查 review -> analyze 够了 -> END（2次）
+
+  如果 analyze 还说缺流量分析：
+  retry：流量分析不在白名单 -> 不加入 -> added=False -> enough=True -> END（2次）
+```
+
+**核心一句话**：retry 节点不是无脑追加 LLM 说的缺失项，而是用不在计划里+没查过+在白名单三道闸过滤，过滤后没有新东西就直接结束。
+
+---
+
+### 考点十二：跨口径差异到底是什么？（补充考点八的具体含义）
+
+**面试官怎么追问**：你说跨部门数据不一致，具体是什么不一致？为什么会不一致？
+
+**具体案例**：同一个指标收入，三张表查出来三个数：
+
+| 查询路径 | 表 | 90天收入 | 差异 |
+|---|---|---|---|
+| Operation 查 GMV | sales_daily | 1,812,419 | 基准 |
+| Finance 查利润表 | mart_product_profit_daily | 1,812,419 | 一致 |
+| Finance 查收入表 | revenue_daily | 1,805,599 | -0.4% |
+| Finance 查平台费 JOIN stores | platform_fees + stores | 1,900,316 | +5.5% |
+
+**为什么会不一致**（口径差异的常见原因）：
+- country 字段位置不同：有的表在主表上，有的在 stores 表上 JOIN 出来，可能多了仓库数据
+- 时间边界不同：有的表 MAX(date) 差一天
+- 退款处理不同：有的表含退款有的不含
+- JOIN 一对多：platform_fees JOIN stores 可能导致行数翻倍，SUM 变大
+
+**统一财务口径是什么意思**：
+- 现在 Operation 说 GMV 181.2 万，Finance 自己查三张表说出三个数
+- 用户问上个月收入多少，Agent 到底报哪个？
+- 统一口径 = 明确规定收入以 mart_product_profit_daily.revenue 为权威字段，以后所有 Agent 都用它
+
+**核心一句话**：多 Agent 各自独立查数，天然会暴露同一个指标不同表算出来不一样的问题，这不是 bug，是数据质量在多视角下的自然显影。
+
+---
+
+### 考点十三：不可能预知所有陷阱怎么办？（对考点五的追问）
+
+**面试官怎么追问**：你说在 schema 上下文里告诉 LLM 陷阱，但你不可能知道所有陷阱，也不可能把全部业务规则都写进 prompt，怎么办？
+
+**我们的三层防护**：
+
+**第一层：注入数据地图，而不是列举陷阱**
+- 我们做的不是告诉 LLM 别踩某个陷阱，而是给它正确的事实：
+  - 品牌有哪些、市场有哪些、时间窗口多长
+  - 哪些表存什么、字段名是什么
+  - 品牌过滤用 JOIN brands 而不是 SKU 匹配
+- LLM 有了正确的事实，自己就能避开大部分坑
+
+**第二层：工具层面自动加防护（不靠 prompt）**
+- 能在代码里解决的，不要靠 prompt 提醒
+- 方向：SQL 生成器自动加 COUNT(DISTINCT date) 和日均列；JOIN 一对多时自动提醒可能行数翻倍；NULLIF 防除零
+- 这部分目前未做，是后续优化方向
+
+**第三层：Decision 交叉验证 + 评估体系回流（发现新陷阱）**
+- 线上总会遇到没想到的陷阱，不可能一开始就全知道
+- Decision 跨部门对账发现口径不一致，报告给用户
+- 用户反馈数字不对，bad case 加入 evaluation_cases
+- 分析 bad case 发现新陷阱，写入数据字典，下次自动避开
+- 这就是评估体系的真正价值：不只是打分，更是陷阱发现-沉淀-预防的闭环
+
+**核心思路**：
+```
+不是预知所有陷阱然后告诉 LLM，而是：
+  1. 给 LLM 正确的数据地图（元数据），避开已知坑
+  2. 在工具层面自动加防护，不靠 LLM 自觉
+  3. 线上发现新坑，沉淀到数据字典，下次不再踩
+```
+
+**核心一句话**：不可能预知所有陷阱，但可以让系统越用越聪明，已知的靠元数据和工具防护挡住，未知的靠评估体系发现并沉淀，形成闭环。
+
+---
+
+### 面试准备 Checklist
+
+被问到"你做了什么 Agent 项目"时，按这个顺序讲：
+
+1. **业务背景**：跨境电商多部门经营分析，自然语言→数据查询→决策建议
+2. **架构**：Manager（规划 DAG）→ Router（动态调度）→ 部门 Agent（plan→query→analyze→retry 子图）→ Decision（交叉验证汇总）
+3. **难点一：动态调度**——为什么不用固定图（考点一）
+4. **难点二：LLM 生成 SQL 的可靠性**——repair 闭环 + 白名单 + schema 注入（考点三、四）
+5. **难点三：统计陷阱**——日均口径问题（考点五）
+6. **难点四：防死循环**——retry 闭环 + 迭代上限（考点六）
+7. **设计模式**：BaseDepartmentAgent 模板方法（考点七）
+8. **多 Agent 价值**：跨部门交叉验证（考点八）
+9. **兜底设计**：未实现 Agent 降级、JSON 容错、环检测（考点二、九、十）
+10. **可扩展**：新增部门 Agent 只需 80 行配置
 
 ---
 
