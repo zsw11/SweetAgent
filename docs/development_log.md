@@ -22,7 +22,12 @@
 | **API `/chat`**（FastAPI 端点 + Pydantic 模型） | ✅ 完成（2026-09-18） |
 | **全链路验证** `verify_pipeline.py`（19.5s 端到端，埋点命中） | ✅ 完成（2026-09-18） |
 | README（架构图 + 状态图 + 推进日志）| ✅ 完成 + 主 Graph 章节 |
-| **Finance / Logistics / Product Agent** | ⏳ 未开始（Phase 3） |
+| **Finance Agent** | ✅ 完成（2026-09-18，继承 BaseDepartmentAgent） |
+| **Logistics Agent** | ✅ 完成（2026-09-18，继承 BaseDepartmentAgent） |
+| **Product Agent** | ⏳ 未开始（Phase 3） |
+| **BaseDepartmentAgent 重构**（三部门共享基类） | ✅ 完成（2026-09-18） |
+| **代码清理**（删除 Operation 单跑入口 + 命令式 for 循环） | ✅ 完成（2026-09-18） |
+| **Schema 注释内联化**（02-schema.sql 行内注释，删除 COMMENT ON 语句） | ✅ 完成（2026-09-18） |
 | **Memory / Checkpoint / Interrupt** | ⏳ 未开始（Phase 6-7） |
 | **Web UI（Streamlit / Next.js）** | ⏳ 未开始（Phase 9） |
 
@@ -253,21 +258,18 @@ graph LR
 
 - **数据库**：`sweetnight_agent`，67 表 + 注释；角色 app_user（写）/ agent_reader（只读）；种子数据 90 天（2026-06-18 ~ 09-15）；Docker 容器 `langgraph-postgres`（端口 5432）
 - **埋点**（验证 Agent 用）：异常 SKU = `SN-Q12-US`（日均销量 -26.4%，GMV -26.35%）；对照组 `SN-K12-US` +15.19%、`NV-Q10-US` +8.98%
-- **Operation Agent**：纯 LLM 模式，双入口（主循环 + SubGraph），批量查询，retry 闭环
+- **部门 Agent**：Operation / Finance / Logistics 三个均已实现，共享 `BaseDepartmentAgent` 基类（`app/agents/base.py`），子类只声明配置（白名单/表映射/关键词/prompt）+ 实现 `_load_dictionary()`
 - **Decision Agent**：纯 LLM 综合分析（强模型），结构化 DecisionOutput（summary/findings/root_causes/recommendations/risks/confidence），JSON 解析容错
 - **Manager Agent**：LLM 任务规划，输出 task_plan（tasks + depends_on DAG），含已知部门过滤、product 自动依赖、decision 强制追加、DAG 环检测
-- **主 Graph**：循环路由模式（manager→router→[department]→router→...→decision→END），未实现 Agent 自动 skipped
+- **主 Graph**：`__start__→manager→router→operation/finance/logistics→router→...→decision→END`，循环路由模式，未实现 Agent 自动 skipped
 - **API**：FastAPI `/health` + `/chat`（POST，Pydantic 模型，返回完整结构化结果）
-- **验证命令**：
+- **验证命令**（统一入口，不再用 verify_operation.py）：
   ```
-  # Operation 单部门调试
-  .venv\Scripts\python scripts\verify_operation.py "分析 SweetNight 品牌美国市场过去90天各SKU的GMV、订单、销量变化，并找出异常SKU"
-  # 全链路（Manager→Operation→Decision）
-  .venv\Scripts\python scripts\verify_pipeline.py "分析 SweetNight 品牌美国市场过去90天各SKU的GMV、订单、销量变化，并找出异常SKU"
+  .venv\Scripts\python scripts\verify_pipeline.py "分析 SweetNight 品牌美国市场过去90天的销售和利润状况"
   ```
-- **全链路验证结果**：19.5s 完成，Manager 规划正确，Operation 命中埋点 SN-Q12-US（-26.35%），Decision 输出 5 发现/3 根因/6 建议/5 风险/置信度 0.55
+- **全链路验证结果**：25.7s 完成（operation+finance→decision），Decision 输出 7 发现/4 根因/6 建议/5 风险/置信度 0.60；三部门串行正常，Decision 跨部门交叉验证生效
 - **日志**：`LOG_LEVEL=DEBUG`（.env 当前值，日常可回 INFO）；关键事件见 README
-- **git**：仓库已初始化（commit f093219 "init"），工作区干净
+- **git**：仓库已初始化（commit f093219 "init"），**工作区有大量未提交改动**（Finance/Logistics Agent + BaseDepartmentAgent 重构 + schema 注释内联 + development_log 更新），用户要求不自动 commit
 
 ---
 
@@ -278,14 +280,14 @@ graph LR
 - [x] ~~3. Manager / Planner~~（2026-09-18 完成）
 - [x] ~~4. 主 Graph 组装~~（2026-09-18 完成，循环路由模式）
 - [x] ~~5. API `/chat`~~（2026-09-18 完成）
-- [ ] **6. Finance Agent**（Phase 3：参照 Operation 模式实现，利润/成本/费用分析）
-- [ ] **7. Logistics Agent**（Phase 3：库存/物流成本/时效分析）
-- [ ] **8. Product Agent**（Phase 3：需跨部门上下文注入，依赖 O/F/L 结果）
-- [ ] 9. 主 Graph 扩展：接入 Finance/Logistics 后验证多部门并行 + Decision 交叉验证
+- [x] ~~6. Finance Agent~~（2026-09-18 完成，继承 BaseDepartmentAgent）
+- [x] ~~7. Logistics Agent~~（2026-09-18 完成，继承 BaseDepartmentAgent）
+- [x] ~~9. 主 Graph 扩展：接入 Finance/Logistics 后验证多部门 + Decision 交叉验证~~（2026-09-18 完成，三部门串行+跨部门交叉验证生效）
+- [ ] **8. Product Agent**（Phase 3：需跨部门上下文注入，依赖 O/F/L 结果；新建 `app/agents/product/` 并注册到 AVAILABLE_AGENTS 和主图）
 - [ ] 10. Checkpoint / PostgresSaver 持久化（Phase 6，支持中断恢复）
 - [ ] 11. Interrupt / Human-in-the-loop（Phase 7，参数不明确时暂停询问）
 - [ ] 12. Web UI（Phase 9，Streamlit MVP 或 Next.js）
-- [ ] **13. Agent 评估体系（重点！决定能否上线）** —— 详见下方「重点待开发：Agent 评估体系」小节
+- [ ] **13. Agent 评估体系（重点！决定能否上线）** —— 详见上方「三点六」小节
 
 ---
 
