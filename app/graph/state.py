@@ -27,6 +27,11 @@ class GlobalState(TypedDict, total=False):
     # 各部门最终结果：{agent_name: department_result}
     department_results: dict[str, Any]
 
+    # 执行追踪（主 Graph 调度用，设计文档 6 节 DAG 执行）
+    completed_tasks: list[str]       # 已完成任务 id 列表
+    skipped_tasks: list[str]         # 因 Agent 未实现而跳过的任务 id
+    current_task: str                # 当前正在执行的任务 id
+
     # Product Agent 跨部门上下文（由 Manager 按依赖 DAG 注入）
     product_context: dict[str, Any]
 

@@ -39,7 +39,7 @@ sweetAgent/
 
 ├── db/                     # SQL 迁移（00-roles / 01-extensions / 02-schema / 03-grants，含表/字段注释）
 
-├── scripts/                # init\_database.py（一键初始化）、seed\_data.py（种子数据）、verify\_operation.py（调试）
+├── scripts/                # init\_database.py（一键初始化）、seed\_data.py（种子数据）、verify\_operation.py（Operation 调试）、verify\_pipeline.py（全链路 Manager→Operation→Decision 调试）
 
 ├── logs/                   # 运行日志输出目录
 
@@ -137,7 +137,7 @@ graph TD
 
 * **4 个部门 Agent**：Operation / Logistics / Finance / Product（当前已实现 Operation）
 
-* **Decision Agent**：汇总各部门证据，输出最终结论（尚未开始）
+* **Decision Agent**：汇总各部门证据，交叉验证、归因分析、输出结构化最终报告（summary / findings / root_causes / recommendations / risks / confidence）
 
 * **SQL 工具体系**：list\_tables → schema\_search → get\_schema → relationship → metric\_definition → validator → read-only executor
 
@@ -270,6 +270,78 @@ RUN_SUBGRAPH = True     # True=同时跑 SubGraph 入口对比；False=只跑主
 | 能力 | 任意问题：LLM 规划 / 生成 SQL / 分析（schema + 数据字典注入防编造） |
 | 白名单 | `_KNOWN_REQS`（sales_sku / brand_summary / ad / review / inventory）约束 LLM 可查数据域 |
 
+## 主 Graph 与全链路（Manager → Operation → Decision）
+
+Phase 1 最小闭环已完整跑通：用户问题 → Manager 规划 DAG → Router 调度部门 Agent → Operation 分析 → Decision 汇总决策 → 结构化报告。
+
+### 主 Graph 结构（app/graph/main_graph.py）
+
+采用**循环路由**模式：
+
+```mermaid
+graph TD
+    S((START)) --> M[manager]
+    M --> R[router]
+    R -->|"current_task=operation_analysis"| OP[operation]
+    OP -->|"完成后回路由"| R
+    R -->|"所有部门完成/跳过 → current_task 为空"| D[decision]
+    D --> E((END))
+```
+
+| 节点 | 职责 | 关键文件 |
+|---|---|---|
+| `manager` | LLM 理解问题 → 输出 task_plan（tasks + depends_on DAG）→ 校验环检测 → 确保 decision 任务存在 | `app/agents/manager/agent.py` |
+| `router` | 找出下一个就绪且可用的部门任务；未实现的 Agent 标记 skipped；全部完成则路由 decision | `app/graph/router.py` |
+| `operation` | 调用 Operation SubGraph，结果写入 department_results | `app/agents/operation/graph.py` |
+| `decision` | 汇总 department_results → 交叉验证 → 归因 → 建议 → 结构化 DecisionOutput | `app/agents/decision/agent.py` |
+
+### Manager 规划输出（task_plan）
+
+```json
+{
+  "intent": "分析 SweetNight 美国市场 SKU 表现并识别异常",
+  "required_agents": ["operation"],
+  "tasks": [
+    {"id": "operation_analysis", "agent": "operation", "depends_on": [], "description": "..."},
+    {"id": "decision_analysis", "agent": "decision", "depends_on": ["operation_analysis"], "description": "..."}
+  ]
+}
+```
+
+- product 任务自动依赖所有已选 operation/finance/logistics（设计文档 6 节）
+- decision 任务始终依赖所有部门任务
+- DAG 环检测：有环则打破非 decision 依赖降级执行
+
+### Decision Agent 输出标准（设计文档 16 节）
+
+```json
+{
+  "summary": "一句话核心结论",
+  "findings": [{"category": "operation", "finding": "..."}],
+  "root_causes": [{"cause": "...", "evidence": "..."}],
+  "recommendations": [{"priority": "P0", "action": "..."}],
+  "risks": [{"risk": "...", "severity": "high"}],
+  "confidence": 0.55
+}
+```
+
+### 全链路验证
+
+```
+.venv\Scripts\python scripts\verify_pipeline.py "分析 SweetNight 品牌美国市场过去90天各SKU的GMV、订单、销量变化，并找出异常SKU"
+```
+
+输出：Manager 规划 → 部门结果摘要 → Decision 结构化报告（含执行耗时、完成/跳过任务）。
+
+### API 端点
+
+| 端点 | 方法 | 说明 |
+|---|---|---|
+| `/health` | GET | 健康检查 |
+| `/chat` | POST | 提交问题，执行完整 Multi-Agent 流程，返回结构化结果 |
+
+`POST /chat` 请求体：`{"question": "...", "thread_id": "可选", "user_id": "可选"}`
+
 ## 数据库
 
 
@@ -342,3 +414,16 @@ RUN_SUBGRAPH = True     # True=同时跑 SubGraph 入口对比；False=只跑主
 * **动机**：用户实际使用 LLM 模式（已配 DeepSeek Key），模板降级路径冗余且写死 SweetNight/US 示例造成困惑
 * **关键文件**：`app/agents/operation/agent.py`、`app/tools/sql/generator.py`、`app/agents/operation/graph.py`、`scripts/verify_operation.py`
 * **验证**：grep 模板引用清零；编译通过；`verify_operation.py` 埋点命中 SN-Q12-US（-26.35%）、SN-K12-US（+15.19%），mode=llm
+
+### 2026-09-18·Phase 1 最小闭环完成：Manager + Decision + 主 Graph + API
+
+* **内容**：
+  * **Decision Agent**：纯 LLM 综合分析（强推理模型），接收 department_results → 事实整合 → 交叉验证 → 冲突检测 → 归因 → 建议（P0/P1/P2）→ 结构化 DecisionOutput；含 JSON 解析容错（markdown 代码块）、字段校验补全、降级报告
+  * **Manager Agent**：LLM 任务规划，输出 task_plan（tasks + depends_on DAG）；校验：已知部门过滤、依赖合法性、product 自动依赖 O/F/L、decision 始终追加、DAG 环检测（有环则降级打破）
+  * **Router + 主 Graph**：循环路由模式（manager → router → [department] → router → ... → decision → END）；未实现 Agent 自动标记 skipped；部门节点工厂 `make_department_node()`，新增部门只需注册 AVAILABLE_AGENTS + 添加条件边映射
+  * **API `/chat`**：FastAPI POST 端点，Pydantic 请求/响应模型，调用 run_question 返回完整结构化结果（含 decision_result / department_results / 执行轨迹）
+  * **verify_pipeline.py**：全链路调试脚本，输出 Manager 规划、部门结果摘要、Decision 结构化报告
+
+* **关键文件**：`app/agents/decision/*`、`app/agents/manager/*`、`app/graph/main_graph.py`、`app/graph/planner.py`、`app/graph/router.py`、`app/graph/state.py`、`app/api/chat.py`、`app/main.py`、`scripts/verify_pipeline.py`
+
+* **验证**：`verify_pipeline.py` 端到端 19.5s 完成，Manager 正确规划 operation→decision DAG，Operation 命中埋点 SN-Q12-US（-26.35%），Decision 输出 5 项发现 / 3 条根因 / 6 条建议 / 5 项风险 / 置信度 0.55（单部门数据合理降低）；FastAPI `/chat` 路由注册成功

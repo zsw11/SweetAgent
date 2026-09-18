@@ -16,8 +16,15 @@
 | Operation Agent（双模式 → **纯 LLM 模式**）| ✅ 完成 |
 | SubGraph（LangGraph：plan→query→analyze→retry）| ✅ 完成 + 批量查询优化 |
 | 调试入口 `verify_operation.py`（问题不写死、双入口）| ✅ 完成 |
-| README（架构图 + 状态图 + 推进日志）| ✅ 完成 |
-| **Decision Agent / Manager / 主 Graph / API** | ⏳ 未开始（明日） |
+| **Decision Agent**（LLM 综合分析 + 结构化 DecisionOutput） | ✅ 完成（2026-09-18） |
+| **Manager / Planner**（LLM 任务规划 + depends_on DAG + 环检测） | ✅ 完成（2026-09-18） |
+| **主 Graph 组装**（循环路由：Manager→Operation→Decision 最小闭环） | ✅ 完成（2026-09-18） |
+| **API `/chat`**（FastAPI 端点 + Pydantic 模型） | ✅ 完成（2026-09-18） |
+| **全链路验证** `verify_pipeline.py`（19.5s 端到端，埋点命中） | ✅ 完成（2026-09-18） |
+| README（架构图 + 状态图 + 推进日志）| ✅ 完成 + 主 Graph 章节 |
+| **Finance / Logistics / Product Agent** | ⏳ 未开始（Phase 3） |
+| **Memory / Checkpoint / Interrupt** | ⏳ 未开始（Phase 6-7） |
+| **Web UI（Streamlit / Next.js）** | ⏳ 未开始（Phase 9） |
 
 ---
 
@@ -124,31 +131,93 @@ graph LR
 | `Edit` 工具对 UTF-8 中文文件反复报 "File has not been read yet" | 改用 Python 补丁脚本（`io.open` UTF-8 + str.replace + 断言） |
 | PowerShell GBK 读 UTF-8 中文 SQL 乱码 | 显式 UTF8 读写 |
 | PowerShell 命令 >15s 自动转后台 | 用 TaskOutput block=true 收结果 |
-| 用户撤销导致文件被还原 | git 版本保护（待初始化） |
+| 用户撤销导致文件被还原 | git 版本保护（已初始化） |
+
+---
+
+## 三点五、2026-09-18 第二次会话：Phase 1 最小闭环核心概念
+
+### 1. Decision Agent 设计要点
+
+- **纯 LLM 综合节点，不查数据**：接收 department_results，做事实整合→交叉验证→冲突检测→归因→建议
+- **使用强推理模型**（`tier="strong"`）：Decision 需要跨领域因果推理
+- **结构化输出 DecisionOutput**：summary / findings / root_causes / recommendations / risks / confidence，与设计文档 16 节一致
+- **_slim_department_results**：丢弃 observations/sql_history 等大体积字段，只传 summary/metrics/anomalies/analysis/confidence，避免上下文爆炸
+- **JSON 解析容错**：与 Operation 的 `_parse_analysis_json` 一致，容忍 markdown 代码块包裹
+- **字段校验补全**：`_ensure_list_of_dicts` 确保各字段是字典列表，缺失键补空；`_clamp_confidence` 限制 0-1
+- **降级报告**：LLM 输出无法解析时返回结构化错误报告（不编造结论），confidence=0
+- **单部门数据时置信度合理降低**：实测仅 operation 数据时 Decision 输出 confidence=0.55，并在 findings 中标注 cross 部门数据缺失
+
+### 2. Manager / Planner 设计要点
+
+- **LLM 输出 task_plan**：intent / required_agents / tasks（每个含 id/agent/depends_on/description）
+- **已知部门白名单**：`_KNOWN_DEPARTMENTS = {operation, finance, logistics, product}`，LLM 输出的未知 agent 被过滤
+- **product 自动依赖**：若 product 在任务中，自动把所有已选 operation/finance/logistics 加入其 depends_on（设计文档 6 节）
+- **decision 强制追加**：无论 LLM 是否输出，最终一定有 decision 任务且依赖所有部门任务
+- **DAG 环检测**：DFS 三色标记；有环则打破所有非 decision 的依赖降级执行（保证可运行）
+- **依赖合法性校验**：depends_on 必须指向存在的任务 id，不存在的移除
+- **降级计划**：LLM 输出无法解析时，回退为单 operation + decision 的最小计划
+
+### 3. 主 Graph 循环路由模式
+
+- **为什么不用固定图**：部门组合由 Manager 动态决定（问题 A 只需 operation，问题 B 需要 O+F+L），固定图无法适配
+- **循环路由结构**：`manager → router → [department] → router → ... → decision → END`
+- **router 节点职责**：
+  1. 找出所有就绪任务（依赖全部完成）
+  2. 跳过未实现的 Agent（记入 skipped_tasks，其下游可继续）
+  3. 找到第一个可用任务设为 current_task
+  4. 全部部门完成/跳过则 current_task 为空（路由到 decision）
+- **条件边 `route_fn`**：读 current_task，返回对应 agent 名（"operation"/"finance"/...）或 "decision"
+- **部门节点工厂 `make_department_node(agent_name)`**：统一封装"取任务描述→调用子图→写入 department_results→标记完成"，新增部门只需一行注册
+- **AVAILABLE_AGENTS 注册表**：`{"operation": run_operation}`，新增部门 Agent 后在此注册即可被 Router 调度
+- **未实现 Agent 自动跳过**：Manager 可能规划 finance，但 finance 未实现 → router 标记 skipped → Decision 在报告中注明数据缺失
+
+### 4. GlobalState 执行追踪字段
+
+新增三个字段支撑循环路由：
+- `completed_tasks: list[str]`：已完成任务 id
+- `skipped_tasks: list[str]`：因 Agent 未实现而跳过的任务 id
+- `current_task: str`：当前正在执行的任务 id（router 设置，部门节点消费后清空）
 
 ---
 
 ## 四、当前系统状态
 
-- **数据库**：`sweetnight_agent`，67 表 + 注释；角色 app_user（写）/ agent_reader（只读）；种子数据 90 天（2026-06-18 ~ 09-15）
+- **数据库**：`sweetnight_agent`，67 表 + 注释；角色 app_user（写）/ agent_reader（只读）；种子数据 90 天（2026-06-18 ~ 09-15）；Docker 容器 `langgraph-postgres`（端口 5432）
 - **埋点**（验证 Agent 用）：异常 SKU = `SN-Q12-US`（日均销量 -26.4%，GMV -26.35%）；对照组 `SN-K12-US` +15.19%、`NV-Q10-US` +8.98%
 - **Operation Agent**：纯 LLM 模式，双入口（主循环 + SubGraph），批量查询，retry 闭环
+- **Decision Agent**：纯 LLM 综合分析（强模型），结构化 DecisionOutput（summary/findings/root_causes/recommendations/risks/confidence），JSON 解析容错
+- **Manager Agent**：LLM 任务规划，输出 task_plan（tasks + depends_on DAG），含已知部门过滤、product 自动依赖、decision 强制追加、DAG 环检测
+- **主 Graph**：循环路由模式（manager→router→[department]→router→...→decision→END），未实现 Agent 自动 skipped
+- **API**：FastAPI `/health` + `/chat`（POST，Pydantic 模型，返回完整结构化结果）
 - **验证命令**：
   ```
+  # Operation 单部门调试
   .venv\Scripts\python scripts\verify_operation.py "分析 SweetNight 品牌美国市场过去90天各SKU的GMV、订单、销量变化，并找出异常SKU"
+  # 全链路（Manager→Operation→Decision）
+  .venv\Scripts\python scripts\verify_pipeline.py "分析 SweetNight 品牌美国市场过去90天各SKU的GMV、订单、销量变化，并找出异常SKU"
   ```
+- **全链路验证结果**：19.5s 完成，Manager 规划正确，Operation 命中埋点 SN-Q12-US（-26.35%），Decision 输出 5 发现/3 根因/6 建议/5 风险/置信度 0.55
 - **日志**：`LOG_LEVEL=DEBUG`（.env 当前值，日常可回 INFO）；关键事件见 README
+- **git**：仓库已初始化（commit f093219 "init"），工作区干净
 
 ---
 
 ## 五、明日待办（按优先级）
 
-- [ ] **1. 初始化 git 并首次提交**（防误操作，强烈建议）
-- [ ] **2. Decision Agent**：汇总 Operation 证据 → 输出最终报告（Phase 1 最小闭环最后一环）
-- [ ] **3. Manager / Planner**：规划子任务、按依赖 DAG 调度部门 Agent
-- [ ] **4. 主 Graph 组装**：Manager → Operation → Decision，Operation 以 SubGraph 嵌入
-- [ ] **5. API `/chat`**：FastAPI 入口（已有 `app/api` 骨架？确认）
-- [ ] 6. 数据字典 / 知识库 / 记忆（Phase 2，可后置）
+- [x] ~~1. 初始化 git 并首次提交~~（已存在，commit f093219）
+- [x] ~~2. Decision Agent~~（2026-09-18 完成）
+- [x] ~~3. Manager / Planner~~（2026-09-18 完成）
+- [x] ~~4. 主 Graph 组装~~（2026-09-18 完成，循环路由模式）
+- [x] ~~5. API `/chat`~~（2026-09-18 完成）
+- [ ] **6. Finance Agent**（Phase 3：参照 Operation 模式实现，利润/成本/费用分析）
+- [ ] **7. Logistics Agent**（Phase 3：库存/物流成本/时效分析）
+- [ ] **8. Product Agent**（Phase 3：需跨部门上下文注入，依赖 O/F/L 结果）
+- [ ] 9. 主 Graph 扩展：接入 Finance/Logistics 后验证多部门并行 + Decision 交叉验证
+- [ ] 10. Checkpoint / PostgresSaver 持久化（Phase 6，支持中断恢复）
+- [ ] 11. Interrupt / Human-in-the-loop（Phase 7，参数不明确时暂停询问）
+- [ ] 12. Web UI（Phase 9，Streamlit MVP 或 Next.js）
+- [ ] 13. Evaluation 测试集（Phase 10，50-100 个真实业务问题）
 
 ---
 
