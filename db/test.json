@@ -1,0 +1,476 @@
+[
+  {
+    'columns': [
+      {
+        'column_comment': None,
+        'column_default': None,
+        'column_name': 'date',
+        'data_type': 'date',
+        'is_nullable': 'NO',
+        'udt_name': 'date'
+      },
+      {
+        'column_comment': None,
+        'column_default': None,
+        'column_name': 'country',
+        'data_type': 'character varying',
+        'is_nullable': 'NO',
+        'udt_name': 'varchar'
+      },
+      {
+        'column_comment': None,
+        'column_default': None,
+        'column_name': 'brand_id',
+        'data_type': 'bigint',
+        'is_nullable': 'YES',
+        'udt_name': 'int8'
+      },
+      {
+        'column_comment': None,
+        'column_default': None,
+        'column_name': 'store_id',
+        'data_type': 'bigint',
+        'is_nullable': 'NO',
+        'udt_name': 'int8'
+      },
+      {
+        'column_comment': None,
+        'column_default': None,
+        'column_name': 'sku_id',
+        'data_type': 'bigint',
+        'is_nullable': 'NO',
+        'udt_name': 'int8'
+      },
+      {
+        'column_comment': None,
+        'column_default': '0',
+        'column_name': 'orders',
+        'data_type': 'integer',
+        'is_nullable': 'NO',
+        'udt_name': 'int4'
+      },
+      {
+        'column_comment': None,
+        'column_default': '0',
+        'column_name': 'units',
+        'data_type': 'integer',
+        'is_nullable': 'NO',
+        'udt_name': 'int4'
+      },
+      {
+        'column_comment': None,
+        'column_default': '0',
+        'column_name': 'gmv',
+        'data_type': 'numeric',
+        'is_nullable': 'NO',
+        'udt_name': 'numeric'
+      },
+      {
+        'column_comment': None,
+        'column_default': '0',
+        'column_name': 'refund_amount',
+        'data_type': 'numeric',
+        'is_nullable': 'NO',
+        'udt_name': 'numeric'
+      }
+    ],
+    'table': 'mart_sales_daily'
+  },
+  {
+    'columns': [
+      {
+        'column_comment': None,
+        'column_default': None,
+        'column_name': 'date',
+        'data_type': 'date',
+        'is_nullable': 'NO',
+        'udt_name': 'date'
+      },
+      {
+        'column_comment': None,
+        'column_default': None,
+        'column_name': 'country',
+        'data_type': 'character varying',
+        'is_nullable': 'NO',
+        'udt_name': 'varchar'
+      },
+      {
+        'column_comment': None,
+        'column_default': None,
+        'column_name': 'brand_id',
+        'data_type': 'bigint',
+        'is_nullable': 'YES',
+        'udt_name': 'int8'
+      },
+      {
+        'column_comment': None,
+        'column_default': None,
+        'column_name': 'store_id',
+        'data_type': 'bigint',
+        'is_nullable': 'NO',
+        'udt_name': 'int8'
+      },
+      {
+        'column_comment': None,
+        'column_default': None,
+        'column_name': 'sku_id',
+        'data_type': 'bigint',
+        'is_nullable': 'NO',
+        'udt_name': 'int8'
+      },
+      {
+        'column_comment': None,
+        'column_default': '0',
+        'column_name': 'orders',
+        'data_type': 'integer',
+        'is_nullable': 'NO',
+        'udt_name': 'int4'
+      },
+      {
+        'column_comment': None,
+        'column_default': '0',
+        'column_name': 'units',
+        'data_type': 'integer',
+        'is_nullable': 'NO',
+        'udt_name': 'int4'
+      },
+      {
+        'column_comment': None,
+        'column_default': '0',
+        'column_name': 'gmv',
+        'data_type': 'numeric',
+        'is_nullable': 'NO',
+        'udt_name': 'numeric'
+      },
+      {
+        'column_comment': None,
+        'column_default': '0',
+        'column_name': 'refund_amount',
+        'data_type': 'numeric',
+        'is_nullable': 'NO',
+        'udt_name': 'numeric'
+      }
+    ],
+    'table': 'sales_daily'
+  },
+  {
+    'columns': [
+      {
+        'column_comment': None,
+        'column_default': 'nextval('
+        product_skus_id_seq
+        '::regclass)',
+        'column_name': 'id',
+        'data_type': 'bigint',
+        'is_nullable': 'NO',
+        'udt_name': 'int8'
+      },
+      {
+        'column_comment': None,
+        'column_default': None,
+        'column_name': 'product_id',
+        'data_type': 'bigint',
+        'is_nullable': 'NO',
+        'udt_name': 'int8'
+      },
+      {
+        'column_comment': None,
+        'column_default': None,
+        'column_name': 'sku_code',
+        'data_type': 'character varying',
+        'is_nullable': 'NO',
+        'udt_name': 'varchar'
+      },
+      {
+        'column_comment': None,
+        'column_default': None,
+        'column_name': 'country_code',
+        'data_type': 'character varying',
+        'is_nullable': 'NO',
+        'udt_name': 'varchar'
+      },
+      {
+        'column_comment': None,
+        'column_default': None,
+        'column_name': 'sale_price',
+        'data_type': 'numeric',
+        'is_nullable': 'NO',
+        'udt_name': 'numeric'
+      },
+      {
+        'column_comment': None,
+        'column_default': None,
+        'column_name': 'cost',
+        'data_type': 'numeric',
+        'is_nullable': 'NO',
+        'udt_name': 'numeric'
+      },
+      {
+        'column_comment': None,
+        'column_default': None,
+        'column_name': 'weight',
+        'data_type': 'numeric',
+        'is_nullable': 'YES',
+        'udt_name': 'numeric'
+      },
+      {
+        'column_comment': None,
+        'column_default': ''
+        active
+        '::character varying',
+        'column_name': 'status',
+        'data_type': 'character varying',
+        'is_nullable': 'NO',
+        'udt_name': 'varchar'
+      },
+      {
+        'column_comment': None,
+        'column_default': 'now()',
+        'column_name': 'created_at',
+        'data_type': 'timestamp with time zone',
+        'is_nullable': 'NO',
+        'udt_name': 'timestamptz'
+      }
+    ],
+    'table': 'product_skus'
+  },
+  {
+    'columns': [
+      {
+        'column_comment': None,
+        'column_default': 'nextval('
+        brands_id_seq
+        '::regclass)',
+        'column_name': 'id',
+        'data_type': 'bigint',
+        'is_nullable': 'NO',
+        'udt_name': 'int8'
+      },
+      {
+        'column_comment': None,
+        'column_default': None,
+        'column_name': 'name',
+        'data_type': 'character varying',
+        'is_nullable': 'NO',
+        'udt_name': 'varchar'
+      },
+      {
+        'column_comment': None,
+        'column_default': None,
+        'column_name': 'description',
+        'data_type': 'text',
+        'is_nullable': 'YES',
+        'udt_name': 'text'
+      },
+      {
+        'column_comment': None,
+        'column_default': ''
+        active
+        '::character varying',
+        'column_name': 'status',
+        'data_type': 'character varying',
+        'is_nullable': 'NO',
+        'udt_name': 'varchar'
+      },
+      {
+        'column_comment': None,
+        'column_default': 'now()',
+        'column_name': 'created_at',
+        'data_type': 'timestamp with time zone',
+        'is_nullable': 'NO',
+        'udt_name': 'timestamptz'
+      },
+      {
+        'column_comment': None,
+        'column_default': 'now()',
+        'column_name': 'updated_at',
+        'data_type': 'timestamp with time zone',
+        'is_nullable': 'NO',
+        'udt_name': 'timestamptz'
+      }
+    ],
+    'table': 'brands'
+  },
+  {
+    'columns': [
+      {
+        'column_comment': None,
+        'column_default': None,
+        'column_name': 'date',
+        'data_type': 'date',
+        'is_nullable': 'NO',
+        'udt_name': 'date'
+      },
+      {
+        'column_comment': None,
+        'column_default': None,
+        'column_name': 'platform',
+        'data_type': 'character varying',
+        'is_nullable': 'NO',
+        'udt_name': 'varchar'
+      },
+      {
+        'column_comment': None,
+        'column_default': None,
+        'column_name': 'store_id',
+        'data_type': 'bigint',
+        'is_nullable': 'NO',
+        'udt_name': 'int8'
+      },
+      {
+        'column_comment': None,
+        'column_default': None,
+        'column_name': 'campaign_id',
+        'data_type': 'bigint',
+        'is_nullable': 'NO',
+        'udt_name': 'int8'
+      },
+      {
+        'column_comment': None,
+        'column_default': None,
+        'column_name': 'sku_id',
+        'data_type': 'bigint',
+        'is_nullable': 'NO',
+        'udt_name': 'int8'
+      },
+      {
+        'column_comment': None,
+        'column_default': '0',
+        'column_name': 'impressions',
+        'data_type': 'bigint',
+        'is_nullable': 'NO',
+        'udt_name': 'int8'
+      },
+      {
+        'column_comment': None,
+        'column_default': '0',
+        'column_name': 'clicks',
+        'data_type': 'integer',
+        'is_nullable': 'NO',
+        'udt_name': 'int4'
+      },
+      {
+        'column_comment': None,
+        'column_default': '0',
+        'column_name': 'spend',
+        'data_type': 'numeric',
+        'is_nullable': 'NO',
+        'udt_name': 'numeric'
+      },
+      {
+        'column_comment': None,
+        'column_default': '0',
+        'column_name': 'conversions',
+        'data_type': 'integer',
+        'is_nullable': 'NO',
+        'udt_name': 'int4'
+      },
+      {
+        'column_comment': None,
+        'column_default': '0',
+        'column_name': 'revenue',
+        'data_type': 'numeric',
+        'is_nullable': 'NO',
+        'udt_name': 'numeric'
+      },
+      {
+        'column_comment': None,
+        'column_default': None,
+        'column_name': 'ctr',
+        'data_type': 'numeric',
+        'is_nullable': 'YES',
+        'udt_name': 'numeric'
+      },
+      {
+        'column_comment': None,
+        'column_default': None,
+        'column_name': 'cvr',
+        'data_type': 'numeric',
+        'is_nullable': 'YES',
+        'udt_name': 'numeric'
+      },
+      {
+        'column_comment': None,
+        'column_default': None,
+        'column_name': 'cpc',
+        'data_type': 'numeric',
+        'is_nullable': 'YES',
+        'udt_name': 'numeric'
+      },
+      {
+        'column_comment': None,
+        'column_default': None,
+        'column_name': 'roas',
+        'data_type': 'numeric',
+        'is_nullable': 'YES',
+        'udt_name': 'numeric'
+      }
+    ],
+    'table': 'ad_performance_daily'
+  },
+  {
+    'columns': [
+      {
+        'column_comment': None,
+        'column_default': 'nextval('
+        inbound_shipments_id_seq
+        '::regclass)',
+        'column_name': 'id',
+        'data_type': 'bigint',
+        'is_nullable': 'NO',
+        'udt_name': 'int8'
+      },
+      {
+        'column_comment': None,
+        'column_default': None,
+        'column_name': 'warehouse_id',
+        'data_type': 'bigint',
+        'is_nullable': 'NO',
+        'udt_name': 'int8'
+      },
+      {
+        'column_comment': None,
+        'column_default': None,
+        'column_name': 'sku_id',
+        'data_type': 'bigint',
+        'is_nullable': 'NO',
+        'udt_name': 'int8'
+      },
+      {
+        'column_comment': None,
+        'column_default': None,
+        'column_name': 'quantity',
+        'data_type': 'integer',
+        'is_nullable': 'NO',
+        'udt_name': 'int4'
+      },
+      {
+        'column_comment': None,
+        'column_default': None,
+        'column_name': 'eta_date',
+        'data_type': 'date',
+        'is_nullable': 'YES',
+        'udt_name': 'date'
+      },
+      {
+        'column_comment': None,
+        'column_default': ''
+        in_transit
+        '::character varying',
+        'column_name': 'status',
+        'data_type': 'character varying',
+        'is_nullable': 'NO',
+        'udt_name': 'varchar'
+      },
+      {
+        'column_comment': None,
+        'column_default': 'now()',
+        'column_name': 'created_at',
+        'data_type': 'timestamp with time zone',
+        'is_nullable': 'NO',
+        'udt_name': 'timestamptz'
+      }
+    ],
+    'table': 'inbound_shipments'
+  }
+]

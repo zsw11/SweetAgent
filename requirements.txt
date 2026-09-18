@@ -1,0 +1,50 @@
+# ============================================================
+# 甜秘密跨境电商 AI Multi-Agent 系统依赖清单
+# 对应设计文档 第 52 节
+# 环境：Python 3.10+（推荐 3.11/3.12，3.14 亦可）
+# ============================================================
+
+# ---------- 核心框架 ----------
+langchain>=0.3.0
+langchain-core>=0.3.0
+langchain-openai>=0.2.0
+langgraph>=0.2.60
+# LangGraph 持久化（PostgresSaver / PostgresStore）
+langgraph-checkpoint-postgres>=2.0.0
+
+# ---------- 数据访问 ----------
+psycopg[binary]>=3.2.0
+pgvector>=0.3.0
+alembic>=1.13.0
+
+# ---------- 配置与校验 ----------
+pydantic>=2.12.0
+pydantic-settings>=2.4.0
+python-dotenv>=1.0.0
+
+# ---------- SQL 安全 ----------
+sqlglot>=25.0.0
+
+# ---------- 稳定性 / 重试 ----------
+tenacity>=8.2.0
+
+# ---------- API 层 ----------
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+httpx>=0.27.0
+
+# ---------- 日志 ----------
+structlog>=24.1.0
+
+# ---------- Web UI（MVP） ----------
+streamlit>=1.38.0
+
+# ---------- 测试 ----------
+pytest>=8.0.0
+pytest-asyncio>=0.24.0
+
+# ---------- 可选企业能力（按需启用） ----------
+# langsmith>=0.1.0
+# opentelemetry-api>=1.26.0
+# opentelemetry-sdk>=1.26.0
+# redis>=5.0.0

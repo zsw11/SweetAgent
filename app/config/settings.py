@@ -1,0 +1,72 @@
+"""全局配置：基于 pydantic-settings，读取 .env 与系统环境变量。"""
+
+from functools import lru_cache
+from pathlib import Path
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# 项目根目录（app/config/settings.py -> 上溯 3 级）
+BASE_DIR = Path(__file__).resolve().parents[2]
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=BASE_DIR / ".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="ignore",
+    )
+
+    # ---------- 应用 ----------
+    APP_ENV: str = "development"
+    APP_DEBUG: bool = True
+    APP_HOST: str = "0.0.0.0"
+    APP_PORT: int = 8000
+    LOG_LEVEL: str = "INFO"
+
+    # ---------- LLM Provider ----------
+    LLM_DEFAULT_PROVIDER: str = "deepseek"
+
+    OPENAI_API_KEY: str = ""
+    OPENAI_BASE_URL: str = "https://api.openai.com/v1"
+    OPENAI_MODEL_STRONG: str = "gpt-4o"
+    OPENAI_MODEL_MEDIUM: str = "gpt-4o-mini"
+    OPENAI_MODEL_SMALL: str = "gpt-4o-mini"
+
+    DEEPSEEK_API_KEY: str = ""
+    DEEPSEEK_BASE_URL: str = "https://api.deepseek.com/v1"
+    DEEPSEEK_MODEL_STRONG: str = "deepseek-chat"
+    DEEPSEEK_MODEL_MEDIUM: str = "deepseek-chat"
+    DEEPSEEK_MODEL_SMALL: str = "deepseek-chat"
+
+    # ---------- PostgreSQL ----------
+    DATABASE_URL: str = "postgresql://app_user:app_password@localhost:5432/sweetnight_agent"
+    AGENT_DATABASE_URL: str = "postgresql://agent_reader:agent_password@localhost:5432/sweetnight_agent"
+
+    # ---------- 向量 / 知识库 ----------
+    EMBEDDING_MODEL: str = "text-embedding-3-small"
+    VECTOR_DIM: int = 1536
+
+    # ---------- Agent 运行限制（设计文档 42 节） ----------
+    MAX_AGENT_ITERATIONS: int = 10
+    MAX_SQL_RETRIES: int = 3
+    MAX_TOOL_RETRIES: int = 3
+    SQL_STATEMENT_TIMEOUT_MS: int = 30_000
+    SQL_MAX_LIMIT: int = 5_000
+
+    # ---------- Redis（可选） ----------
+    REDIS_URL: str = ""
+
+    # ---------- 可观测性（可选） ----------
+    LANGSMITH_TRACING: bool = False
+    LANGSMITH_API_KEY: str = ""
+    LANGSMITH_PROJECT: str = "sweetnight-agent"
+
+
+@lru_cache
+def get_settings() -> Settings:
+    """进程内缓存配置实例。"""
+    return Settings()
+
+
+settings = get_settings()

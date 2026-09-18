@@ -1,0 +1,39 @@
+# ============================================================
+# 甜秘密跨境电商 AI Multi-Agent 系统 - 开发环境编排
+# 对应设计文档 第 53 节
+# 注意：若本机已有容器占用 5432（如 langgraph-postgres），
+# 请先停止或改映射端口，避免端口冲突。
+# ============================================================
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: sweetnight-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: langgraph_user
+      POSTGRES_PASSWORD: "123456"
+      POSTGRES_DB: sweetnight_agent
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      # 首次初始化自动按序执行：00-roles -> 01-extensions -> 02-schema -> 03-grants
+      - ./db:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U langgraph_user -d sweetnight_agent"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # 可选：Redis（缓存 / 限流 / 未来队列）
+  redis:
+    image: redis:7-alpine
+    container_name: sweetnight-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    profiles: ["optional"]
+
+volumes:
+  pg_data:
