@@ -6,8 +6,7 @@
                         |--(需求完成)--> analyze -> decide --(不足且可重试)--> query
                                                           --(足够)--> END
 
-节点逻辑复用 OperationAgent 的单一实现（agent.py），保证命令式与图两种
-调用方式行为一致。编译后的 SubGraph 可嵌入主 Graph（Manager 调度）。
+节点逻辑复用 OperationAgent 的内部方法（agent.py）。编译后的 SubGraph 可嵌入主 Graph（Manager 调度）。
 """
 
 from __future__ import annotations
@@ -52,7 +51,7 @@ def build_operation_agent(agent: Optional[OperationAgent] = None):
         observations = list(state.get("observations") or [])
         sql_history = list(state.get("sql_history") or [])
 
-        # 批量执行所有未查询需求（与主循环 agent.run() 行为一致，避免逐需求多轮图调度）。
+        # 批量执行所有未查询需求（避免逐需求多轮图调度）。
         # 每个需求只查一次：queried 是"已查记忆"，retry 追加的新需求下次进入本节点时才会被查。
         ok_count, fail_count = 0, 0
         for req in plan:

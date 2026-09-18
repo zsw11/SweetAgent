@@ -44,52 +44,7 @@ class OperationAgent:
         self.max_sql_retries = settings.MAX_SQL_RETRIES
 
     # ------------------------------------------------------------------
-    # 对外入口
-    # ------------------------------------------------------------------
-    def run(self, task: str, context: Optional[dict[str, Any]] = None) -> dict[str, Any]:
-        """执行一次运营分析任务，返回 Operation Result（供 Decision Agent 消费）。"""
-        logger.info("operation.run.start", task=task, mode="llm")
-        context = context or {}
-        plan = self._plan(task, context)
-        observations: list[dict[str, Any]] = []
-        sql_history: list[dict[str, Any]] = []
-        analysis: list[str] = []
-        evidence: list[dict[str, Any]] = []
-        queried: set[str] = set()
-
-        for iteration in range(1, self.max_iterations + 1):
-            # 1) 查询所有未完成的数据需求
-            for req in plan:
-                if req in queried:
-                    continue
-                try:
-                    obs = self._query_one(req, task, context)
-                    observations.append(obs)
-                    sql_history.append({"requirement": req, "sql": obs.get("sql"), "ok": True})
-                    queried.add(req)
-                    logger.info("operation.query.ok", requirement=req, row_count=obs.get("row_count"))
-                except Exception as exc:
-                    logger.warning("operation.query.fail", requirement=req, error=str(exc))
-                    sql_history.append({"requirement": req, "ok": False, "error": str(exc)})
-                    queried.add(req)
-
-            # 2) 分析
-            analysis, evidence, enough, missing = self._analyze(task, observations)
-
-            # 3) 判断是否足够：按 enough + missing 决定是否补查
-            if enough or iteration >= self.max_iterations:
-                break
-            new_reqs = [m for m in missing if m not in plan]
-            if not new_reqs:
-                break
-            plan.extend(new_reqs)
-
-        final_result = self._build_result(task, observations, sql_history, analysis, evidence)
-        logger.info("operation.run.done", iterations=iteration, evidence=len(evidence))
-        return final_result
-
-    # ------------------------------------------------------------------
-    # 内部步骤
+    # 内部步骤（供 SubGraph 节点调用）
     # ------------------------------------------------------------------
     def _plan(self, task: str, context: dict[str, Any]) -> list[str]:
         """LLM 规划数据需求：输出过滤到白名单，保证至少含核心数据域 sales_sku。"""

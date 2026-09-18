@@ -39,7 +39,7 @@ sweetAgent/
 
 ├── db/                     # SQL 迁移（00-roles / 01-extensions / 02-schema / 03-grants，含表/字段注释）
 
-├── scripts/                # init\_database.py（一键初始化）、seed\_data.py（种子数据）、verify\_operation.py（Operation 调试）、verify\_pipeline.py（全链路 Manager→Operation→Decision 调试）
+├── scripts/                # init\_database.py（一键初始化）、seed\_data.py（种子数据）、verify\_pipeline.py（全链路 Manager→Operation→Decision 调试）
 
 ├── logs/                   # 运行日志输出目录
 
@@ -81,9 +81,9 @@ docker compose up -d postgres
 
 .venv\Scripts\python scripts\init\_database.py --seed
 
-\# 6. 运行 Operation Agent 调试（问题可自由传入，见下节）
+\# 6. 运行全链路调试（Manager → Operation → Decision，问题可自由传入）
 
-.venv\Scripts\python scripts\verify\_operation.py "你的分析问题"
+.venv\Scripts\python scripts\verify\_pipeline.py "你的分析问题"
 ```
 
 > 开发库运行在 Docker 容器 
@@ -141,31 +141,23 @@ graph TD
 
 * **SQL 工具体系**：list\_tables → schema\_search → get\_schema → relationship → metric\_definition → validator → read-only executor
 
-### Operation Agent：双入口
+### Operation Agent：SubGraph
 
-Operation Agent 是**同一种逻辑的两种调用形态**，共享同一套实现（`_query_one` / `_analyze`）：
+Operation Agent 以 LangGraph StateGraph 形式运行，内部方法（`_plan` / `_query_one` / `_analyze` / `_build_result`）被 SubGraph 节点调用。编译后的 SubGraph 嵌入主 Graph，由 Manager 调度。
 
-
-
-| 入口                    | 形态                   | 状态管理                | 用途                     |
-| --------------------- | -------------------- | ------------------- | ---------------------- |
-| `agent.run(task)`     | 命令式 for 循环           | 本地变量                | 独立运行 / 调试              |
-| `run_operation(task)` | LangGraph StateGraph | OperationState dict | 嵌入主 Graph 供 Manager 调度 |
+便捷入口：`run_operation(task)` → 构造初始 State → `build_operation_agent().invoke(state)` → 返回 `final_result`。
 
 #### SubGraph 状态图（app/agents/operation/graph.py）
 
-
-
 ```mermaid
-graph LR
-    S((START)) --> P[plan]
-    P --> Q[query]
-    Q -->|"enough=true<br/>retry 无可补数据，直接结束"| E((END))
-    Q -->|"enough=false<br/>查完待分析"| A[analyze]
-    A -->|"enough=true 或迭代超限"| E
-    A -->|"enough=false 且可补数据"| R[retry]
-    R -->|"追加新需求"| Q
-    R -->|"无可补数据 → enough=true"| E
+flowchart TD
+    __start__([__start__]) --> plan
+    plan --> query
+    query --> analyze
+    query --> __end__([__end__])
+    analyze --> retry
+    analyze --> __end__
+    retry --> query
 ```
 
 **节点职责**（每个节点是一个接收 state、返回 state 更新的函数）：
@@ -174,7 +166,7 @@ graph LR
 
 | 节点        | 函数         | 作用                                                                        | 写回 state 的字段                                                |
 | --------- | ---------- | ------------------------------------------------------------------------- | ----------------------------------------------------------- |
-| `plan`    | `_plan`    | 规划数据需求列表（LLM 规划或模板关键词推断）                                                  | `plan`, `iteration+1`                                       |
+| `plan`    | `_plan`    | 规划数据需求列表（LLM 规划，白名单过滤）                                                  | `plan`, `iteration+1`                                       |
 | `query`   | `_query`   | 批量执行所有未查询需求（`_query_one`：生成 SQL→校验→只读执行→失败 / 空自动 repair；每个需求只查一次） | `observations`, `sql_history`, `queried`                    |
 | `analyze` | `_analyze` | 分析观测结果，产出结论与 "是否足够 / 缺什么"                                                 | `analysis`, `evidence`, `final_result`, `enough`, `missing` |
 | `retry`   | `_retry`   | **补数据重试**：把 `missing` 中 "已知且未查询过" 的需求追加进 `plan`；无可补数据则标记 `enough=True` 结束 | `plan`, `iteration+1`, `enough`                             |
@@ -215,60 +207,48 @@ START
 
 1. `retry` 是 "分析不足→补数据→重新分析" 的闭环，让 Agent 能自我补全证据（设计文档 11 节内部循环 / 40 节 Retry）
 
-2. `retry` 只追加**已知且未查询过**的需求（白名单 `_REQ_TASKS`/`_KEYWORDS`），防止 LLM 编造数据域
+2. `retry` 只追加**已知且未查询过**的需求（白名单 `_KNOWN_REQS`），防止 LLM 编造数据域
 
 3. 无可补数据时标记 `enough=True` 直接结束 ——**避免 analyze→retry 空转死循环**（曾出现 analyze 被调用 8 次的 bug，已修复为 2 次）
-4. `query` 节点**批量**执行所有未查询需求（与主循环 `agent.run()` 行为一致），减少 LangGraph 图调度轮数；`queried` 记忆保证每个需求只查一次，retry 追加的新需求在下一轮 query 才被查
+4. `query` 节点**批量**执行所有未查询需求，减少 LangGraph 图调度轮数；`queried` 记忆保证每个需求只查一次，retry 追加的新需求在下一轮 query 才被查
 
-## Operation Agent 使用与调试
+## 调试与日志
 
-### 运行（问题不写死，三种方式传入）
-
-
+### 运行全链路（问题不写死，三种方式传入）
 
 ```
 \# 方式 1：命令行参数
 
-.venv\Scripts\python scripts\verify\_operation.py "分析美国市场过去90天 SweetNight 床垫 GMV 变化，找出异常 SKU"
+.venv\Scripts\python scripts\verify\_pipeline.py "分析美国市场过去90天 SweetNight 床垫 GMV 变化，找出异常 SKU"
 
 \# 方式 2：环境变量
 
-set VERIFY\_TASK=你的问题 && .venv\Scripts\python scripts\verify\_operation.py
+set VERIFY\_TASK=你的问题 && .venv\Scripts\python scripts\verify\_pipeline.py
 
 \# 方式 3：交互输入（直接运行后按提示粘贴）
 
-.venv\Scripts\python scripts\verify\_operation.py
+.venv\Scripts\python scripts\verify\_pipeline.py
 ```
 
-### 调试开关（scripts/verify_operation.py 顶部常量）
+### 推荐断点位置
 
-```
-RUN_SUBGRAPH = True     # True=同时跑 SubGraph 入口对比；False=只跑主循环（当前仅 LLM 模式）
-```
+在 VSCode / PyCharm 中直接打断点按 Debug 即可：
 
-在 VSCode / PyCharm 中直接打断点按 Debug 即可，无需传命令行参数。
-
-推荐断点位置：`agent.py` 的 `run()`（内部循环）、`_query_one()`（SQL 生成 / 执行 / 修复）、`_analyze()`（LLM 分析）。
+- `app/graph/main_graph.py` 的 `run_question()`（主入口）
+- `app/agents/manager/agent.py` 的 `ManagerAgent.run()`（任务规划）
+- `app/graph/router.py` 的 `router_node()`（调度路由）
+- `app/agents/operation/agent.py` 的 `_query_one()`（SQL 生成/执行/修复）、`_analyze()`（LLM 分析）
+- `app/agents/decision/agent.py` 的 `DecisionAgent.run()`（综合决策）
 
 ### 日志
-
-
 
 * structlog 结构化日志（`app/observability/logging.py`），开发环境可读格式输出到 stdout
 
 * `LOG_LEVEL` 在 `.env`（`INFO` 日常 / `DEBUG` 细粒度：显示 LLM 生成的 SQL、数据字典、分析原始 JSON）
 
-* 关键事件：`operation.run.start` / `operation.query.ok` / `operation.query.repair` / `operation.analyze.llm` / `operation.run.done`
+* 关键事件：`manager.plan.llm` / `router.dispatch` / `operation.query.sql` / `operation.analyze.llm` / `decision.synthesize.llm`
 
-* 输出到文件示例：`.venv\Scripts\python scripts\verify_operation.py > logs\operation.log 2>&1`
-
-### 模式说明（仅 LLM 模式）
-
-| 项   | 说明 |
-| --- | ------------------------------------------------------------------ |
-| 触发 | 配置 DEEPSEEK_API_KEY（未配置启动即报错，不再降级模板） |
-| 能力 | 任意问题：LLM 规划 / 生成 SQL / 分析（schema + 数据字典注入防编造） |
-| 白名单 | `_KNOWN_REQS`（sales_sku / brand_summary / ad / review / inventory）约束 LLM 可查数据域 |
+* 输出到文件示例：`.venv\Scripts\python scripts\verify_pipeline.py > logs\pipeline.log 2>&1`
 
 ## 主 Graph 与全链路（Manager → Operation → Decision）
 
@@ -279,14 +259,16 @@ Phase 1 最小闭环已完整跑通：用户问题 → Manager 规划 DAG → Ro
 采用**循环路由**模式：
 
 ```mermaid
-graph TD
-    S((START)) --> M[manager]
-    M --> R[router]
-    R -->|"current_task=operation_analysis"| OP[operation]
-    OP -->|"完成后回路由"| R
-    R -->|"所有部门完成/跳过 → current_task 为空"| D[decision]
-    D --> E((END))
+flowchart TD
+    __start__([__start__]) --> manager
+    manager --> router
+    router --> operation
+    operation --> router
+    router --> decision
+    decision --> __end__([__end__])
 ```
+
+`router` 为条件路由：`current_task` 非空时调度对应部门 Agent（当前仅 operation 可用），所有部门完成/跳过后路由到 decision。
 
 | 节点 | 职责 | 关键文件 |
 |---|---|---|
@@ -427,3 +409,14 @@ graph TD
 * **关键文件**：`app/agents/decision/*`、`app/agents/manager/*`、`app/graph/main_graph.py`、`app/graph/planner.py`、`app/graph/router.py`、`app/graph/state.py`、`app/api/chat.py`、`app/main.py`、`scripts/verify_pipeline.py`
 
 * **验证**：`verify_pipeline.py` 端到端 19.5s 完成，Manager 正确规划 operation→decision DAG，Operation 命中埋点 SN-Q12-US（-26.35%），Decision 输出 5 项发现 / 3 条根因 / 6 条建议 / 5 项风险 / 置信度 0.55（单部门数据合理降低）；FastAPI `/chat` 路由注册成功
+
+### 2026-09-18·代码清理：移除命令式循环与单独调试脚本
+
+* **内容**：
+  * 删除 `OperationAgent.run()` 命令式 for 循环方法（仅保留 SubGraph 入口 `run_operation()`）
+  * 删除 `scripts/verify_operation.py` 单独调试脚本（统一使用 `verify_pipeline.py` 全链路调试）
+  * 更新 `graph.py` 注释：移除"与主循环 agent.run() 行为一致"等过时引用
+  * README 重构：Operation Agent 章节从"双入口"改为"SubGraph"单入口；状态图统一为 LangGraph 标准风格（`__start__` → node → `__end__`）；调试章节更新断点位置和关键事件
+* **动机**：降低阅读复杂度，统一运行路径，避免两种调用形态造成理解困惑
+* **关键文件**：`app/agents/operation/agent.py`、`app/agents/operation/graph.py`、`README.md`
+* **验证**：`verify_pipeline.py` 端到端正常运行，主图编译通过，`OperationAgent` 不再有 `run()` 方法

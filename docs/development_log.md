@@ -181,6 +181,74 @@ graph LR
 
 ---
 
+## 三点六、重点待开发：Agent 评估体系（决定能否上线）
+
+> **为什么这是重点**：我们开发完的 Agent 能不能在线上用、用户评价如何，必须靠可度量的评估体系说话。不能靠人肉跑一次 verify_pipeline.py 看感觉。
+> 这是 Agent 从"能跑"到"敢上线"的关键一跃。
+
+### 已有基础设施（DB 层已建好，等接入代码）
+
+数据库已预留 4 张表，业务查询不碰，由系统自身写入：
+
+| 表 | 作用 | 当前状态 |
+|---|---|---|
+| `prompt_versions` | Prompt 版本管理：每次部署落库，记录 agent_name / version / content_hash / is_active | 空表，未接入 |
+| `evaluation_cases` | 评估用例库：固定问题集 + 期望路由 Agent + 期望 SQL 模式 + 期望答案关键词 | 空表，未接入 |
+| `evaluation_runs` | 评估批次：每跑一轮是一条记录（run_id / started_at / finished_at / status） | 空表，未接入 |
+| `evaluation_scores` | 得分明细：每个 case × 每个 metric 的 score + detail JSONB | 空表，未接入 |
+
+### 要做的事（开发时按这个顺序）
+
+**Phase A：建立离线回归测试集**
+1. 整理 50-100 个真实业务问题（覆盖销售异常/广告效率/库存风险/利润下滑/退款暴增等典型场景）
+2. 每条用例人工标注：
+   - `question`：用户原始问题
+   - `expected_agents`：期望调度哪些部门 Agent（JSONB 数组）
+   - `expected_sql_pattern`：期望 SQL 必须命中的表/字段关键词
+   - `expected_answer_key`：期望答案必须包含的要点（如 "SN-Q12-US"、"-26%"、"库存"）
+3. 写入 `evaluation_cases` 表
+
+**Phase B：评估运行脚本**
+4. 新建 `scripts/run_evaluation.py`：
+   - 从 `evaluation_cases` 读全部用例
+   - 逐条调用 `run_question()` 跑主图
+   - 对每条用例自动打分：
+     - `routing_accuracy`：Manager 规划的 agent 集合 vs expected_agents（精确匹配）
+     - `sql_accuracy`：Operation 生成的 SQL 是否命中 expected_sql_pattern 关键词
+     - `answer_accuracy`：Decision 输出是否包含 expected_answer_key 要点（可 LLM judge）
+     - `latency_ms`：端到端耗时
+     - `cost_usd`：token 消耗折算
+   - 每条结果写入 `evaluation_scores`，批次信息写入 `evaluation_runs`
+
+**Phase C：版本对比与回归报告**
+5. 每次改 prompt / 改代码 / 换模型后跑一遍评估
+6. 对比本次 run 与上次 run 的平均分（按 metric 汇总），生成回归报告：
+   - 整体通过率变化
+   - 哪些 case 退化了（上次过这次没过）
+   - 哪些 case 改善了
+   - 平均耗时/成本变化
+7. 退化超阈值（如任一 metric 下降 >5%）则阻止上线
+
+**Phase D：Prompt 版本管理接入**
+8. 部署时对比代码里的 prompt 哈希 vs `prompt_versions` 最新记录
+9. 不一致则插入新版本记录；`is_active` 标记当前生效版本
+10. 评估时记录当时用的 prompt_version_id，便于"哪个 prompt 版本效果最好"的归因
+
+**Phase E：线上反馈闭环（远期）**
+11. 用户在 Web UI 上对 Agent 回复点"有用/没用"或打分
+12. 线上 bad case 自动回流到 `evaluation_cases`（人工审核后加入回归集）
+13. 形成"线上发现 bad case → 加入回归集 → 修复后跑回归 → 上线"的闭环
+
+### 关键设计原则
+
+- **评估要自动化**：不能靠人看结果，必须有可执行的打分脚本
+- **回归先行**：任何改动上线前必须过回归测试，退化即阻断
+- **小步迭代**：先用 20 条用例跑通流程，再逐步扩充到 50-100 条
+- **离线为主，线上为辅**：Phase A-C 都是离线评估，Phase E 才接线上反馈
+- **可归因**：每次评估记录 prompt 版本 + 代码版本 + 模型版本，能回答"为什么这次效果变了"
+
+---
+
 ## 四、当前系统状态
 
 - **数据库**：`sweetnight_agent`，67 表 + 注释；角色 app_user（写）/ agent_reader（只读）；种子数据 90 天（2026-06-18 ~ 09-15）；Docker 容器 `langgraph-postgres`（端口 5432）
@@ -217,7 +285,7 @@ graph LR
 - [ ] 10. Checkpoint / PostgresSaver 持久化（Phase 6，支持中断恢复）
 - [ ] 11. Interrupt / Human-in-the-loop（Phase 7，参数不明确时暂停询问）
 - [ ] 12. Web UI（Phase 9，Streamlit MVP 或 Next.js）
-- [ ] 13. Evaluation 测试集（Phase 10，50-100 个真实业务问题）
+- [ ] **13. Agent 评估体系（重点！决定能否上线）** —— 详见下方「重点待开发：Agent 评估体系」小节
 
 ---
 

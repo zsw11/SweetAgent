@@ -90,7 +90,7 @@ class ManagerAgent:
                 "description": str(t.get("description", "")),
             })
 
-        # 2) 提取部门任务（非 decision）
+        # 2) 提取部门任务（非 decision）,没有任务给个默认任务
         dept_tasks = [t for t in valid_tasks if t["agent"] in _KNOWN_DEPARTMENTS]
         if not dept_tasks:
             logger.warning("manager.plan.no_department", fallback_to="operation")

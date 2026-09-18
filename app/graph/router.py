@@ -33,10 +33,20 @@ def register_department(agent_name: str, runner: Any) -> None:
     AVAILABLE_AGENTS[agent_name] = runner
 
 
-# 延迟导入 operation，避免循环依赖（operation 导入 graph.state）
+# 延迟导入 operation / finance / logistics，避免循环依赖
 def _get_operation_runner():
     from app.agents.operation import run_operation
     return run_operation
+
+
+def _get_finance_runner():
+    from app.agents.finance import run_finance
+    return run_finance
+
+
+def _get_logistics_runner():
+    from app.agents.logistics import run_logistics
+    return run_logistics
 
 
 # ---------------------------------------------------------------------------
@@ -54,9 +64,14 @@ def router_node(state: dict[str, Any]) -> dict[str, Any]:
     completed = set(state.get("completed_tasks") or [])
     skipped = set(state.get("skipped_tasks") or [])
 
-    # 确保 operation 已注册（延迟注册，避免模块加载时循环导入）
-    if "operation" not in AVAILABLE_AGENTS:
-        register_department("operation", _get_operation_runner())
+    # 确保所有部门 Agent 已注册（延迟注册，避免模块加载时循环导入）
+    for name, getter in [
+        ("operation", _get_operation_runner),
+        ("finance", _get_finance_runner),
+        ("logistics", _get_logistics_runner),
+    ]:
+        if name not in AVAILABLE_AGENTS:
+            register_department(name, getter())
 
     # 循环找可用任务：可能连续跳过多个未实现的 Agent
     guard = 0

@@ -68,8 +68,10 @@ def build_main_graph(
                 "current_stage": "error",
             }
 
-    # 部门节点（Phase 1 仅 operation；新增部门后在此注册节点）
+    # 部门节点（operation / finance / logistics 已实现；product 待 Phase 3）
     operation_node = make_department_node("operation")
+    finance_node = make_department_node("finance")
+    logistics_node = make_department_node("logistics")
 
     def _decision(state: dict[str, Any]) -> dict[str, Any]:
         """Decision 节点：汇总各部门结果 -> 结构化最终报告。"""
@@ -106,29 +108,31 @@ def build_main_graph(
     builder.add_node("manager", _manager)
     builder.add_node("router", router_node)
     builder.add_node("operation", operation_node)
+    builder.add_node("finance", finance_node)
+    builder.add_node("logistics", logistics_node)
     builder.add_node("decision", _decision)
 
     builder.add_edge(START, "manager")
     builder.add_edge("manager", "router")
 
     # 路由条件边：current_task 非空 -> 对应部门节点；为空 -> decision
-    # Phase 1 仅 operation 可用；后续接入 finance/logistics/product 时在此扩展映射。
     builder.add_conditional_edges(
         "router",
         route_fn,
         {
             "operation": "operation",
+            "finance": "finance",
+            "logistics": "logistics",
             "decision": "decision",
-            # 未实现的部门不会到达这里（router_node 已跳过），
-            # 但保留映射占位以防 route_fn 返回其他值时 LangGraph 报错。
-            "finance": "decision",
-            "logistics": "decision",
+            # product 未实现，router_node 会自动跳过，映射到 decision 兜底
             "product": "decision",
         },
     )
 
     # 部门执行完回到 router，继续调度下一个任务
     builder.add_edge("operation", "router")
+    builder.add_edge("finance", "router")
+    builder.add_edge("logistics", "router")
     # decision 是终点
     builder.add_edge("decision", END)
 
