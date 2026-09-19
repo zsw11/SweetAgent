@@ -7,14 +7,21 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Optional
 
-from app.agents.operation.tools import get_operation_tool_map
 from app.config.settings import settings
 from app.llm import get_chat_model, llm_available
 from app.observability.logging import get_logger
 
 logger = get_logger("base_agent")
+
+
+def _get_tool_map() -> dict[str, Any]:
+    """延迟获取 SQL 工具映射，避免模块加载时循环导入
+    （base -> operation.tools -> operation/__init__ -> operation.agent -> base）。"""
+    from app.agents.operation.tools import get_operation_tool_map
+    return get_operation_tool_map()
 
 
 # ---------------------------------------------------------------------------
@@ -60,6 +67,43 @@ def collect_anomalies(evidence) -> list[dict[str, Any]]:
     return sorted(out, key=lambda a: a.get("change_pct") or 0)
 
 
+def _context_text(context: Optional[dict[str, Any]]) -> str:
+    """把跨部门上下文（如 Operation/Finance/Logistics 结果）转成提示文本。
+
+    无上下文返回空串；有上下文时序列化为 JSON 文本注入 prompt。
+    Product Agent 通过 {context} 占位使用；无 {context} 占位的 prompt 不受影响
+    （str.format 忽略多余关键字参数）。
+    """
+    if not context:
+        return ""
+    return json.dumps(context, ensure_ascii=False, default=str)[:2000]
+
+
+# 行首剥离：空白 / markdown 列表符（- * • ·）/ 数字序号（1. 2. 3.）
+_BULLET_RE = re.compile(r"^[\s\-*•·\d.]+")
+# 一行内多数据域分隔符：英文逗号 / 中文逗号 / 顿号 / 分号 / 句号 / 空白
+_PLAN_SPLIT_RE = re.compile(r"[,，、;；。.！!？?\s]+")
+
+
+def _extract_plan(text: str, known: frozenset[str]) -> list[str]:
+    """从 LLM 输出中提取数据域计划（容错：markdown 列表 / 序号 / 多分隔符 / 解释文字）。
+
+    - 每行剥离行首的 "-" / "*" / "1." 等装饰符
+    - 支持一行多个数据域（逗号 / 顿号 / 分号 / 空格分隔）
+    - 仅保留白名单内的数据域并去重；解释性杂词自然被白名单丢弃
+    """
+    plan: list[str] = []
+    for ln in text.splitlines():
+        ln = _BULLET_RE.sub("", ln).strip()
+        if not ln:
+            continue
+        for part in _PLAN_SPLIT_RE.split(ln):
+            p = part.strip().lower()
+            if p in known and p not in plan:
+                plan.append(p)
+    return plan
+
+
 # ---------------------------------------------------------------------------
 # 基类
 # ---------------------------------------------------------------------------
@@ -99,7 +143,7 @@ class BaseDepartmentAgent:
             )
         self.llm_ready = True
         self.model = model if model is not None else get_chat_model(tier="medium")
-        self.tools = get_operation_tool_map()
+        self.tools = _get_tool_map()
         self.executor = executor or self.tools["execute_readonly_sql"]
         self.max_iterations = settings.MAX_AGENT_ITERATIONS
         self.max_sql_retries = settings.MAX_SQL_RETRIES
@@ -108,15 +152,18 @@ class BaseDepartmentAgent:
     # 通用：规划数据域
     # ------------------------------------------------------------------
     def _plan(self, task: str, context: dict[str, Any]) -> list[str]:
-        """LLM 规划数据需求，白名单过滤，保证至少含 FALLBACK_REQ。"""
+        """LLM 规划数据需求，白名单过滤，保证至少含 FALLBACK_REQ。
+
+        context 可通过 PLAN_PROMPT 中的 {context} 占位注入
+        （如 Product Agent 的跨部门结论，避免重复查询其他部门数据域）。
+        """
         try:
             from langchain_core.messages import HumanMessage, SystemMessage
             resp = self.model.invoke([
                 SystemMessage(content=self.PLAN_SYSTEM),
-                HumanMessage(content=self.PLAN_PROMPT.format(task=task)),
+                HumanMessage(content=self.PLAN_PROMPT.format(task=task, context=_context_text(context))),
             ])
-            plan = [ln.strip().lower() for ln in str(resp.content).splitlines() if ln.strip()]
-            plan = [p for p in plan if p in self.KNOWN_REQS]
+            plan = _extract_plan(str(resp.content), self.KNOWN_REQS)
             if self.FALLBACK_REQ not in plan:
                 plan.insert(0, self.FALLBACK_REQ)
             return plan
@@ -198,8 +245,12 @@ class BaseDepartmentAgent:
     # ------------------------------------------------------------------
     # 通用：LLM 分析
     # ------------------------------------------------------------------
-    def _analyze(self, task: str, observations: list[dict[str, Any]]):
-        """LLM 分析观测结果，返回 (analysis, evidence, enough, missing)。"""
+    def _analyze(self, task: str, observations: list[dict[str, Any]], context: Optional[dict[str, Any]] = None):
+        """LLM 分析观测结果，返回 (analysis, evidence, enough, missing)。
+
+        context 可通过 ANALYSIS_PROMPT 中的 {context} 占位注入
+        （如 Product Agent 的跨部门结论，供交叉参考）。
+        """
         raw = ""
         try:
             from langchain_core.messages import HumanMessage, SystemMessage
@@ -208,13 +259,22 @@ class BaseDepartmentAgent:
                 HumanMessage(content=self.ANALYSIS_PROMPT.format(
                     task=task,
                     result_json=json.dumps(observations, ensure_ascii=False, default=str),
+                    context=_context_text(context),
                 )),
             ])
             raw = str(resp.content)
             logger.debug(f"{self.AGENT_NAME}.analyze.llm", raw=raw[:2000])
             parsed = parse_analysis_json(raw)
             if parsed:
-                analysis = [parsed.get("summary", "")]
+                # LLM 有时会把整个 JSON 塞进 summary 字段（嵌套 JSON），做二次提取
+                summary = parsed.get("summary", "")
+                if isinstance(summary, dict):
+                    summary = summary.get("summary") or ""
+                elif isinstance(summary, str) and summary.strip().startswith("{"):
+                    inner = parse_analysis_json(summary)
+                    if inner and inner.get("summary"):
+                        summary = inner["summary"]
+                analysis = [summary if isinstance(summary, str) else str(summary)]
                 evidence = [{"type": "analysis", **parsed}]
                 for m in parsed.get("metrics") or []:
                     if isinstance(m, dict):

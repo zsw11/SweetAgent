@@ -1,4 +1,4 @@
-# 开发日志与问题总结（2026-09-17 / 09-18 会话）
+# 开发日志与问题总结（2026-09-17 / 09-18 / 09-19 会话）
 
 > 本文档记录本次开发会话的进展、核心概念、遇到的问题与解决方案，以及明日待办。
 > 供下次继续开发时快速恢复上下文。进度总览另见 `README.md`「开发推进日志」。
@@ -24,7 +24,7 @@
 | README（架构图 + 状态图 + 推进日志）| ✅ 完成 + 主 Graph 章节 |
 | **Finance Agent** | ✅ 完成（2026-09-18，继承 BaseDepartmentAgent） |
 | **Logistics Agent** | ✅ 完成（2026-09-18，继承 BaseDepartmentAgent） |
-| **Product Agent** | ⏳ 未开始（Phase 3） |
+| **Product Agent** | ✅ 完成（2026-09-19，跨部门上下文注入 + 知识库检索） |
 | **BaseDepartmentAgent 重构**（三部门共享基类） | ✅ 完成（2026-09-18） |
 | **代码清理**（删除 Operation 单跑入口 + 命令式 for 循环） | ✅ 完成（2026-09-18） |
 | **Schema 注释内联化**（02-schema.sql 行内注释，删除 COMMENT ON 语句） | ✅ 完成（2026-09-18） |
@@ -142,6 +142,16 @@ graph LR
 
 ## 三点五、2026-09-18 第二次会话：Phase 1 最小闭环核心概念
 
+### 0. 2026-09-19 第三次会话补充（Product Agent 完成）
+
+- Product Agent（`app/agents/product/*`）完成：数据域白名单 `{product, lifecycle, development, consumer, market}`，映射 products/product_skus/product_lifecycle/product_development_projects/reviews/knowledge_chunks 等真实表
+- **跨部门上下文注入**：`make_department_node` 新增 `context_builder` 参数，Product 节点执行前把 O/F/L 结论摘要注入 `cross_context`；基类 `_plan`/`_analyze` 支持 `{context}` 占位（str.format 忽略多余参数，O/F/L 零影响）
+- **知识库检索**：market 数据域用确定性过滤查 knowledge_chunks（种子向量随机，勿用相似度）
+- **主图集成**：router 注册 product，条件边 product→product，回边 product→router；四部门闭环验证通过（产品问题五部门链路 + 回归销售问题 + 轻量 SOP 问答）
+- **修复**：base.py 循环导入（延迟导入 `_get_tool_map()`）；LLM 嵌套 JSON 防御（summary 二次提取）；**plan 解析容错**（`_extract_plan` 剥离 markdown 列表符/序号/多分隔符/句号，见考点十七）
+- **主 Graph 并行化**（2026-09-19）：route_fn 返回就绪 agent 列表 → O/F/L 并行 fan-out、部门完成后 fan-in 回 router、Product 依赖 O/F/L 串行（DAG 天然保证）；废弃 current_task 单任务调度，部门节点自定位任务；GlobalState 加 Annotated reducer（_add_unique/_merge_dict）防并行写覆盖；实测串行估算 77s → 并行 56.9s
+- 详细面试点见下方「三点七」考点十四/十五/十六/十七/十八
+
 ### 1. Decision Agent 设计要点
 
 - **纯 LLM 综合节点，不查数据**：接收 department_results，做事实整合→交叉验证→冲突检测→归因→建议
@@ -258,7 +268,7 @@ graph LR
 
 - **数据库**：`sweetnight_agent`，67 表 + 注释；角色 app_user（写）/ agent_reader（只读）；种子数据 90 天（2026-06-18 ~ 09-15）；Docker 容器 `langgraph-postgres`（端口 5432）
 - **埋点**（验证 Agent 用）：异常 SKU = `SN-Q12-US`（日均销量 -26.4%，GMV -26.35%）；对照组 `SN-K12-US` +15.19%、`NV-Q10-US` +8.98%
-- **部门 Agent**：Operation / Finance / Logistics 三个均已实现，共享 `BaseDepartmentAgent` 基类（`app/agents/base.py`），子类只声明配置（白名单/表映射/关键词/prompt）+ 实现 `_load_dictionary()`
+- **部门 Agent**：Operation / Finance / Logistics / Product 四个均已实现，共享 `BaseDepartmentAgent` 基类（`app/agents/base.py`），子类只声明配置（白名单/表映射/关键词/prompt）+ 实现 `_load_dictionary()`；Product 额外支持跨部门上下文注入（`cross_context`）
 - **Decision Agent**：纯 LLM 综合分析（强模型），结构化 DecisionOutput（summary/findings/root_causes/recommendations/risks/confidence），JSON 解析容错
 - **Manager Agent**：LLM 任务规划，输出 task_plan（tasks + depends_on DAG），含已知部门过滤、product 自动依赖、decision 强制追加、DAG 环检测
 - **主 Graph**：`__start__→manager→router→operation/finance/logistics→router→...→decision→END`，循环路由模式，未实现 Agent 自动 skipped
@@ -266,10 +276,11 @@ graph LR
 - **验证命令**（统一入口，不再用 verify_operation.py）：
   ```
   .venv\Scripts\python scripts\verify_pipeline.py "分析 SweetNight 品牌美国市场过去90天的销售和利润状况"
+  .venv\Scripts\python scripts\verify_pipeline.py "下一季度美国市场应该开发什么样的床垫？"   # 五部门 O/F/L/P/D
   ```
-- **全链路验证结果**：25.7s 完成（operation+finance→decision），Decision 输出 7 发现/4 根因/6 建议/5 风险/置信度 0.60；三部门串行正常，Decision 跨部门交叉验证生效
+- **全链路验证结果**：销售问题埋点命中（SN-Q12-US -26.35%）；产品问题五部门链路 25-45s 完成，Product 命中知识库与在研项目，Decision 交叉验证发现"物流 SKU-1 未标注编码 vs 爆款集中"冲突，置信度 0.82；SOP 问答场景 Manager 规划四部门+decision，Product 正确提取七阶段流程
 - **日志**：`LOG_LEVEL=DEBUG`（.env 当前值，日常可回 INFO）；关键事件见 README
-- **git**：仓库已初始化（commit f093219 "init"），**工作区有大量未提交改动**（Finance/Logistics Agent + BaseDepartmentAgent 重构 + schema 注释内联 + development_log 更新），用户要求不自动 commit
+- **git**：仓库已初始化，已有提交 f093219（init）/ f20e4a8（Phase 1 最小闭环）/ 7223de6、43e00b3（Finance/Logistics/BaseDepartmentAgent 重构）/ e5d11bc（面试点总结）；本次会话新增 Product Agent 改动未提交，用户要求不自动 commit
 
 ---
 
@@ -283,7 +294,7 @@ graph LR
 - [x] ~~6. Finance Agent~~（2026-09-18 完成，继承 BaseDepartmentAgent）
 - [x] ~~7. Logistics Agent~~（2026-09-18 完成，继承 BaseDepartmentAgent）
 - [x] ~~9. 主 Graph 扩展：接入 Finance/Logistics 后验证多部门 + Decision 交叉验证~~（2026-09-18 完成，三部门串行+跨部门交叉验证生效）
-- [ ] **8. Product Agent**（Phase 3：需跨部门上下文注入，依赖 O/F/L 结果；新建 `app/agents/product/` 并注册到 AVAILABLE_AGENTS 和主图）
+- [x] ~~8. Product Agent~~（2026-09-19 完成，四部门闭环 + 跨部门上下文注入 + 知识库检索）
 - [ ] 10. Checkpoint / PostgresSaver 持久化（Phase 6，支持中断恢复）
 - [ ] 11. Interrupt / Human-in-the-loop（Phase 7，参数不明确时暂停询问）
 - [ ] 12. Web UI（Phase 9，Streamlit MVP 或 Next.js）
@@ -667,6 +678,178 @@ if not added:
 ```
 
 **核心一句话**：不可能预知所有陷阱，但可以让系统越用越聪明，已知的靠元数据和工具防护挡住，未知的靠评估体系发现并沉淀，形成闭环。
+
+---
+
+### 考点十四：Product Agent 怎么拿到其他部门的数据？——跨部门上下文注入（设计文档 6 节）
+
+**面试官怎么问**：你的 Product Agent 要做产品建议，需要运营的销售数据、财务的利润数据、物流的库存数据，你让它怎么拿？直接调用 Finance Agent 的接口行不行？
+
+**为什么不能自由调用**：
+- Product → Finance → Logistics → Operation 互相调 = 调用关系不可追踪、State 污染、无限循环风险
+- 设计文档 5.1 节明确禁止部门 Agent 自由互调
+
+**我们的设计**（两层配合）：
+```
+第一层：Manager 规划阶段
+  问题含产品维度 → Manager 自动给 product 任务追加 depends_on=[operation, finance, logistics]
+  → Router 保证 O/F/L 先执行完，Product 才轮到
+
+第二层：Product 节点执行阶段（context_builder）
+  make_department_node("product", context_builder=...)
+  → 执行前从 department_results 提取 O/F/L 的 summary/metrics/anomalies/confidence
+  → 作为 cross_context 传给 run_product(task, context)
+  → 基类 _plan/_analyze 的 {context} 占位注入 prompt
+  → 数据字典 _load_dictionary 也追加"跨部门结论（勿重复查询）"
+```
+
+**关键细节**：
+1. **context_builder 是注入点**：router 的 `make_department_node` 加可选参数，product 节点注入，O/F/L 节点不注入（它们互不依赖）
+2. **{context} 占位 + str.format 忽略多余参数**：基类统一给 format 传 context，O/F/L 的 prompt 没有占位就不受影响，Product 的 prompt 有占位就生效——**零侵入**扩展
+3. **白名单不含销售/利润/库存**：Product 的 KNOWN_REQS = {product, lifecycle, development, consumer, market}，强制"不重复查其他部门的数据域"，避免 token 浪费和口径冲突
+
+**会不会数据不一致**：不会。跨部门数据以 O/F/L 的**结论摘要**（非原始 SQL）注入，Product 只查自己的产品域；真正的一致性校验在 Decision 层做（考点八）。
+
+**核心一句话**：部门间数据传递走"Manager 规划依赖 + 节点注入上下文"两个确定性通道，Product 只查自己的域、消费别人的结论，禁止 Agent 互调。
+
+---
+
+### 考点十五：循环导入——为什么 Product 一接入就炸了？延迟导入怎么断环？（指的是Python import 循环）
+
+**面试官怎么问**：你加了个新模块，一运行报 "ImportError: cannot import name 'X' from partially initialized module"，怎么排查和解决？
+
+**真实场景**（本次踩坑）：
+```
+导入链：product.agent → base → operation.tools → operation/__init__ → operation.agent → base
+```
+base.py 顶部 `from app.agents.operation.tools import get_operation_tool_map` 是元凶：
+- 正常路径（先导入 operation）：operation 已在 sys.modules，tools 子模块独立加载，不重新执行 __init__ → 不构成环
+- Product 路径（先导入 product）：base 触发 operation 包导入 → operation/__init__ 导入 operation.agent → operation.agent 再导入 base（**base 只执行到第 12 行，类还没定义**）→ ImportError
+
+**解决**：把 base.py 顶部的模块级导入改成**函数内延迟导入**：
+```python
+def _get_tool_map():
+    from app.agents.operation.tools import get_operation_tool_map
+    return get_operation_tool_map()
+```
+模块加载时不触发 operation 导入，调用 __init__ 时才导入（此时依赖已就绪）。
+
+**为什么延迟导入能断环**：
+- 环的本质是"模块 A 顶层导入 B，B 顶层导入 A"的**加载期**依赖
+- 延迟到**调用期**（函数运行时）导入，环上的模块早已加载完成
+- 顶层导入 = 强耦合 + 加载期执行；函数内导入 = 弱耦合 + 运行期执行
+
+**排查方法论**：
+1. 看报错链最外层是谁先触发的（本次是 product 先触发 base）
+2. 找到环的"必经节点"（base 是必经，因为所有部门都继承它）
+3. 把必经节点的依赖改成延迟导入，而非到处打补丁
+
+**核心一句话**：循环导入的本质是模块加载期的环形依赖，把环上必经节点的顶层导入改成函数内延迟导入即可断环；先触发方不同，环就显形。
+
+---
+
+### 考点十六：LLM 把整个 JSON 塞进 summary 字段——嵌套输出防御
+
+**面试官怎么问**：你让 LLM 输出 {summary, metrics, findings}，它把整个结果又套了一层 JSON 塞进 summary，你怎么保证 summary 是干净的摘要文本？
+
+**真实现象**：`summary: { "summary": "...", "metrics": [...] }` —— LLM 对"总结"理解偏差，把完整 JSON 塞进 summary 字段（两次运行行为不同，偶发）。
+
+**解决**（基类 `_analyze` 二次提取）：
+```python
+summary = parsed.get("summary", "")
+if isinstance(summary, dict):              # summary 是对象 → 取内层 summary
+    summary = summary.get("summary") or ""
+elif isinstance(summary, str) and summary.strip().startswith("{"):  # summary 是 JSON 字符串 → 解析再取
+    inner = parse_analysis_json(summary)
+    if inner and inner.get("summary"):
+        summary = inner["summary"]
+```
+
+**为什么放在基类**：
+- Operation/Finance/Logistics/Product 都可能遇到（LLM 输出不可控，不是产品专属问题）
+- 基类修一处，四个部门同时受益
+- 与考点十（JSON 解析容错）同一哲学：**LLM 输出永远做防御性清洗**
+
+**核心一句话**：LLM 输出嵌套/自引用是常态不是意外，解析层要"提取→再提取"两层防御，且防御逻辑放在公共基类而不是各部门重复写。
+
+---
+
+### 考点十七：LLM 不守输出格式怎么办？——plan 解析层的防御性清洗
+
+**面试官怎么问**：LLM 输出数据域列表时带了 markdown 符号、序号或者逗号分隔，你的解析全部丢了怎么办？
+
+**真实现象**（本次踩坑）：基类 `_plan` 用"整行精确匹配白名单"解析：
+```python
+plan = [ln.strip().lower() for ln in str(resp.content).splitlines() if ln.strip()]
+plan = [p for p in plan if p in self.KNOWN_REQS]
+```
+只要 LLM 输出 `- product`、`1. product`、`product, lifecycle`、`consumer。`，整行匹配失败 → 全部被白名单过滤 → 只剩 FALLBACK_REQ 兜底，Product 的 5 个域丢了 4 个（生命周期/在研/评论/知识库全没查）。
+
+**为什么 Product 风险最高**：
+1. **依赖度最高**：产品策略结论 = 主档+生命周期+在研+评论+知识库五域组合，丢一个分析就瘸腿（丢了 consumer 就看不到塌陷客诉）
+2. **prompt 最长**：PLAN_PROMPT 含 {context} 跨部门上下文段，prompt 越长 LLM 越容易格式漂移
+
+**解决**（基类 `_extract_plan`，四部门同时受益）：
+```python
+_BULLET_RE = re.compile(r"^[\s\-*•·\d.]+")            # 行首剥离 markdown 列表符/序号
+_PLAN_SPLIT_RE = re.compile(r"[,，、;；。.！!？?\s]+")   # 兼容一行多个数据域
+
+def _extract_plan(text, known):
+    plan = []
+    for ln in text.splitlines():
+        ln = _BULLET_RE.sub("", ln).strip()
+        if not ln:
+            continue
+        for part in _PLAN_SPLIT_RE.split(ln):
+            p = part.strip().lower()
+            if p in known and p not in plan:
+                plan.append(p)
+    return plan
+```
+
+**验证**：7 种输出形态模拟（正常/markdown/序号/逗号/解释文字/空行/混合）全部 PASS；端到端回归产品问题五部门链路正常、summary 干净。
+
+**核心一句话**：LLM 输出格式永远可能漂移，解析层要把"按行精确匹配"升级为"装饰符剥离 + 多分隔符容错"，再用白名单兜底安全性——与考点十/十六同一哲学：LLM 输出做防御性清洗，不做天真假设。
+
+---
+
+### 考点十八：LangGraph 并行调度——无依赖 Agent 怎么并行？并行写 State 怎么不丢数据？
+
+**面试官怎么问**：你的 Operation/Finance/Logistics 三个 Agent 没有依赖，为什么串行跑？LangGraph 怎么实现并行 fan-out/fan-in？并行节点同时写同一个 State 会不会互相覆盖？
+
+**为什么串行是浪费**：router 循环一次只调度一个部门，O/F/L 无依赖却排队执行，总耗时 = O+F+L 之和；并行后 = max(O,F,L)。实测串行估算约 77s → 并行 56.9s。
+
+**LangGraph 并行三件套**：
+
+1. **fan-out（并行分发）**：条件边函数返回 list[str]（不返回单个节点名）：
+```python
+def route_fn(state) -> list[str]:
+    agents = [就绪且可用的 agent...]
+    return agents if agents else ["decision"]
+```
+LangGraph 会把返回的多个目标节点在同一 superstep 并行执行（同一时刻同时 start）。
+
+2. **fan-in（并行聚合，天然 barrier）**：多个部门节点完成后都连回 router（`add_edge("operation"/"finance"/"logistics", "router")`），LangGraph 等待本批所有并行分支全部完成后再执行 router。Product 依赖 O/F/L，只在它们全部完成后的批次才就绪——**DAG 依赖 + fan-in 共同保证 product 串行**。
+
+3. **Annotated reducer（并行写安全）**：并行节点基于同一状态快照写回，last-write-wins 会互相覆盖（后写覆盖先写，丢数据）。给共享字段加合并 reducer：
+```python
+def _add_unique(left, right): ...   # completed_tasks 去重合并
+def _merge_dict(left, right): ...   # department_results 按 key 合并
+
+class GlobalState(TypedDict, total=False):
+    completed_tasks: Annotated[list[str], _add_unique]
+    department_results: Annotated[dict[str, Any], _merge_dict]
+```
+
+**配套改造**：
+- 废弃 `current_task` 单任务字段（承载不了并行），部门节点**自定位**：找"agent==自己 && 未完成未跳过"的任务，无任务返回 `{}`（幂等保护，防重复 fan-out 重复执行）
+- 部门节点返回**增量**（`{"department_results": {自己: result}, "completed_tasks": [自己id]}`）而非全量快照，靠 reducer 合并
+
+**验证**：日志显示三个 `department.node.start` 同秒出现（并行生效），product 在 O/F/L 全部 done 后启动（串行依赖生效），decision 收到四部门结果齐全（reducer 合并正确）；回归销售问题单部门调度正常。
+
+**核心一句话**：LangGraph 并行 = 条件边返回多目标（fan-out）+ 多入边统一 fan-in（天然 barrier）+ Annotated reducer 合并并行写；DAG 依赖让 product 自然落在 O/F/L 完成后的批次，无需额外逻辑。
+
+
 
 ---
 

@@ -98,6 +98,7 @@ CREATE TABLE IF NOT EXISTS stores (
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()       -- 创建时间
 );
 
+
 -- 店铺第三方平台账号（Token 仅存密文，Agent 不持有明文）
 CREATE TABLE IF NOT EXISTS store_accounts (
     id                BIGSERIAL PRIMARY KEY,           -- 主键ID

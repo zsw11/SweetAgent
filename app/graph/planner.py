@@ -39,13 +39,22 @@ def topological_sort(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return list(tasks)
     return [task_map[tid] for tid in sorted_ids]
 
-
+# "tasks": [
+#   {"id": "operation_analysis", "agent": "operation", "depends_on": []},
+#   {"id": "finance_analysis",   "agent": "finance",   "depends_on": []},
+#   {"id": "logistics_analysis", "agent": "logistics", "depends_on": []},
+#   {"id": "product_analysis",   "agent": "product",
+#    "depends_on": ["operation_analysis", "finance_analysis", "logistics_analysis"]},
+#   {"id": "decision_analysis",  "agent": "decision",
+#    "depends_on": ["operation_analysis", "finance_analysis", "logistics_analysis", "product_analysis"]}
+# ]
 def get_ready_tasks(
     tasks: list[dict[str, Any]],
     completed_ids: set[str],
     skipped_ids: Optional[set[str]] = None,
 ) -> list[dict[str, Any]]:
-    """返回所有"就绪"任务：依赖全部完成（或被跳过）且自身未完成/未跳过。
+    """ 找"依赖全完成且自己没做"的任务
+    返回所有"就绪"任务：依赖全部完成（或被跳过）且自身未完成/未跳过。
 
     被跳过的任务视为已完成（其下游可以继续执行）。
     """
@@ -56,7 +65,12 @@ def get_ready_tasks(
         if t["id"] in completed_ids or t["id"] in skipped_ids:
             continue
         deps = t.get("depends_on", [])
+        # all([True, True])  # True   —— 全是真
+        # all([True, False])  # False  —— 有一个假
+        # all([])  # True   —— 里面一个元素都没有
+        #第一轮 deps = []   all(d in done for d in [])  → all(空序列) = True
         if all(d in done for d in deps):
+            #`get_ready_tasks` 现在返回 `{P任务}`（O/F/L 在 completed 里，P 的依赖全满足）
             ready.append(t)
     return ready
 

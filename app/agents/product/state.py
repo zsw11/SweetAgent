@@ -17,3 +17,9 @@ class ProductState(DepartmentState):
     competitor_context: dict[str, Any]
     cross_department_context: dict[str, Any]
     product_plan: dict[str, Any]
+
+    # SubGraph 内部流转字段（plan->query->analyze->retry）
+    plan: list[str]
+    queried: set[str]
+    enough: bool
+    missing: list[str]

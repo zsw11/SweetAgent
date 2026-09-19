@@ -4,7 +4,23 @@ GlobalState 只保存跨部门必须共享的最小信息（公司会议室）�
 部门级 State 各自独立（各部门工作台），仅向 GlobalState 回传最终结果、关键证据、关键指标、置信度。
 """
 
-from typing import Any, TypedDict
+from typing import Annotated, Any, TypedDict
+
+
+def _add_unique(left: list, right: list) -> list:
+    """reducer：列表去重合并（并行节点写 completed/skipped_tasks 不互相覆盖）。"""
+    merged = list(left or [])
+    for x in right or []:
+        if x not in merged:
+            merged.append(x)
+    return merged
+
+
+def _merge_dict(left: dict, right: dict) -> dict:
+    """reducer：dict 合并（并行节点写 department_results 不同 key 不互相覆盖）。"""
+    out = dict(left or {})
+    out.update(right or {})
+    return out
 
 
 class GlobalState(TypedDict, total=False):
@@ -25,12 +41,13 @@ class GlobalState(TypedDict, total=False):
     current_stage: str
 
     # 各部门最终结果：{agent_name: department_result}
-    department_results: dict[str, Any]
+    # Annotated reducer：Operation/Finance/Logistics 并行写各自 key，合并不覆盖
+    department_results: Annotated[dict[str, Any], _merge_dict]
 
     # 执行追踪（主 Graph 调度用，设计文档 6 节 DAG 执行）
-    completed_tasks: list[str]       # 已完成任务 id 列表
-    skipped_tasks: list[str]         # 因 Agent 未实现而跳过的任务 id
-    current_task: str                # 当前正在执行的任务 id
+    completed_tasks: Annotated[list[str], _add_unique]   # 已完成任务 id 列表
+    skipped_tasks: Annotated[list[str], _add_unique]     # 因 Agent 未实现而跳过的任务 id
+    current_task: str                                    # 遗留字段（并行路由后不再使用，保留兼容）
 
     # Product Agent 跨部门上下文（由 Manager 按依赖 DAG 注入）
     product_context: dict[str, Any]
