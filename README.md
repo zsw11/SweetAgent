@@ -462,3 +462,35 @@ flowchart TD
   * **router_node 简化**：只负责"就绪但未实现的 Agent 全部标记 skipped"副作用（while 循环直到稳定），调度决策全交给 route_fn
 * **关键文件**：`app/graph/router.py`、`app/graph/state.py`、`app/graph/main_graph.py`
 * **验证**：产品问题五部门链路，日志显示 `department.node.start` 三个节点同秒并行启动（finance 24s / logistics 14s / operation 7s 各自完成），product 在全部完成后的 fan-in 批次才启动（串行依赖生效）；decision 收到四部门结果齐全（reducer 合并正确）；回归销售问题单部门调度正常、埋点命中；串行估算约 77s → 并行实测 56.9s（LLM 波动下仍明显提速）
+
+### 2026-09-19·Checkpoint / PostgresSaver 持久化（设计文档 33 节）
+
+* **内容**：
+  * `app/memory/checkpoint.py`：实现 `get_checkpointer()`——psycopg_pool.ConnectionPool 单例（max_size=10，延迟打开，`kwargs={"autocommit": True}`）+ PostgresSaver + `setup()` 幂等建表（checkpoints / checkpoint_writes / checkpoint_migrations）；atexit 注册 `_close_pool()` 消除解释器退出时 ConnectionPool 清理噪音
+  * `app/graph/main_graph.py`：`build_main_graph(checkpointer=None)` 传入 `compile(checkpointer=...)`；`run_question()` 默认自动获取 checkpointer，`invoke` 时传 `config={"configurable": {"thread_id": thread_id}}`
+  * `app/config/settings.py`：新增 `CHECKPOINTER_TABLE` / `STORE_TABLE_PREFIX` 字段（.env 已有值；langgraph-checkpoint-postgres 表名硬编码为 checkpoints）
+  * API 层零改动：`app/api/chat.py` 本就传 thread_id（不传则 uuid4），自动获得持久化
+* **修复的坑**：`PostgresSaver.setup()` 抛 `ActiveSqlTransaction: CREATE INDEX CONCURRENTLY cannot run inside a transaction block`——MIGRATIONS 含 CONCURRENTLY 索引，PG 禁止事务块内执行；psycopg 默认隐式事务开启事务块。修复：连接池加 `autocommit=True`（与官方 `from_conn_string(autocommit=True)` 同构）；另 atexit 关池消除 `ConnectionPool.__del__` 的 `PythonFinalizationError` 退出噪音
+* **关键文件**：`app/memory/checkpoint.py`、`app/graph/main_graph.py`、`app/config/settings.py`
+* **验证**：
+  * `verify_pipeline.py "公司新品开发流程是什么？"` 端到端通过（EXIT=0），checkpoints 表 33 行 / checkpoint_writes 183 行落库（主图 loop + 子图 checkpoint_ns 隔离）
+  * `app.get_state({"configurable": {"thread_id": "verify-pipeline"}})` 读回完整状态（12 个 key，stage=done，department_results 齐全）——中断恢复 / time travel 基础成立
+  * 回归多部门问题（O/F/L/P/D 五部门）11.8s 并行完成，checkpointer 不影响并行调度与上下文注入
+
+### 2026-09-19·长期记忆：结构化三表 + user_memories + 分层注入（设计文档 34-35 节）
+
+* **内容**：
+  * **结构化**（`app/memory/profile.py`）：user_profiles（画像）/ user_preferences（偏好）/ business_preferences（业务规则，scope=global/部门）三表读写，latest-wins upsert
+  * **非结构化**（`app/memory/semantic.py`）：新增 `user_memories` 表（memory_type/content/metadata/confidence/evidence/embedding/superseded_at），diff 式写入（同主题 max(余弦, n-gram Jaccard)≥0.7 更新旧条不新增）、部门粗筛 + 向量 top-k 检索、软删
+  * **模拟向量**（`app/memory/embeddings.py`）：确定性哈希伪向量（字符 3-gram+词双特征 → L2 归一化），相同文本向量相同、重叠文本向量接近；`reindex_knowledge_embeddings.py` 重灌 knowledge_chunks
+  * **提取触发**（`app/memory/extractor.py`）：两级——规则预筛（"我负责/以后都用…"命中才调 LLM）+ 历史 token>16K 兜底；会话关闭走 `POST /memory/extract` 强制提取；profiles 需 confidence≥0.8 且 evidence 引用原话，preferences latest-wins，memories 去重写入
+  * **分层注入**（`app/memory/injection.py`）：Manager 只注入用户级（画像+偏好+通用记忆）；部门节点注入部门级（business_preferences scope 匹配 + user_memories department 匹配），O/F/L prompt 补 {context} 占位
+  * **API**（`app/api/memory.py`）：GET /memory（查看）、DELETE /memory/{id}（软删）、POST /memory/extract（会话关闭提取）
+  * **修复**：verify_pipeline 每次用唯一 thread_id——带 checkpointer 后同 thread 状态跨轮次延续（reducer 合并旧结果），固定 thread_id 会污染验证
+* **关键文件**：`app/memory/*`、`app/graph/main_graph.py`、`app/agents/manager/*`、`app/agents/{operation,finance,logistics}/prompts.py`、`app/api/memory.py`、`db/02-schema.sql`、`scripts/verify_pipeline.py`、`scripts/reindex_knowledge_embeddings.py`
+* **验证**：
+  * 自测：模拟向量相同文本相似度 1.0；同主题去重更新（sim 0.76）；部门粗筛只返回本部门+通用记忆；意图预判正常
+  * 端到端（"我负责美国市场运营，帮我看看…"）：规则命中触发提取 → user_profiles 写入 market_scope=美国市场、user_memories 写入 fact（dept=operation、evidence=原话）；二次运行时 Manager 注入 profiles=1、operation 注入 rules=3+memories=1；低置信画像（0.75<0.8）被正确拦截
+  * API：GET/DELETE /memory、POST /memory/extract 全部 200/404 符合预期
+  * 结构化字段优化（2026-09-20）：user_profiles + confidence/evidence/created_at、user_preferences + evidence/created_at（均不存 superseded_at，历史走变更日志待办）；GET /memory 返回结构化详情
+  * user_memories 拆 department 独立列（2026-09-20）：从 metadata JSONB 提升为列（检索第一道闸门），注入记忆带类型标注（（偏好）/（事实）/（历史结论）/（规则））

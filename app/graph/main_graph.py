@@ -9,6 +9,7 @@ Phase 1 最小闭环：Manager -> Operation -> Decision（设计文档 58 节）
 
 from __future__ import annotations
 
+import json
 from typing import Any, Optional
 
 from langgraph.graph import END, START, StateGraph
@@ -17,6 +18,7 @@ from app.agents.decision import DecisionAgent
 from app.agents.manager import ManagerAgent
 from app.graph.router import make_department_node, route_fn, router_node
 from app.graph.state import GlobalState
+from app.memory.injection import build_department_memory, build_manager_memory
 from app.observability.logging import get_logger
 
 logger = get_logger("main_graph")
@@ -25,12 +27,15 @@ logger = get_logger("main_graph")
 def build_main_graph(
     manager_agent: Optional[ManagerAgent] = None,
     decision_agent: Optional[DecisionAgent] = None,
+    checkpointer: Any = None,
 ):
     """构建并编译主 Graph。
 
     Args:
         manager_agent: 可注入自定义 ManagerAgent（测试用）。
         decision_agent: 可注入自定义 DecisionAgent（测试用）。
+        checkpointer: LangGraph checkpointer（设计文档 33 节，PostgresSaver）；
+            传入后编译图支持中断恢复 / 故障重试 / time travel。
 
     Returns:
         编译后的 StateGraph（invoke 传入 GlobalState 字典）。
@@ -45,9 +50,15 @@ def build_main_graph(
     def _manager(state: dict[str, Any]) -> dict[str, Any]:
         """Manager 节点：理解问题 -> 任务拆解 -> 依赖 DAG。"""
         user_question = state.get("user_question", "")
+        user_id = state.get("user_id", "default")
         logger.info("main.manager.start", question=user_question[:100])
         try:
-            task_plan = mgr.run(user_question)
+            # 长期记忆注入（用户级：画像 + 偏好 + 通用非结构化 top-k，设计文档 34-35 节）
+            memory = build_manager_memory(user_id, user_question)
+            task_plan = mgr.run(
+                user_question,
+                memory=json.dumps(memory, ensure_ascii=False) if memory else None,
+            )
             logger.info(
                 "main.manager.done",
                 intent=task_plan.get("intent"),
@@ -68,14 +79,24 @@ def build_main_graph(
                 "current_stage": "error",
             }
 
+    # 部门记忆注入（设计文档 34-35 节：分层注入——部门执行时给部门上下文）
+    def _dept_memory_builder(agent_name: str):
+        def builder(state: dict[str, Any]) -> Optional[dict[str, Any]]:
+            return build_department_memory(
+                state.get("user_id", "default"),
+                agent_name,
+                state.get("user_question", ""),
+            ) or None
+        return builder
+
     # 部门节点（operation / finance / logistics / product 均已实现）
-    operation_node = make_department_node("operation")
-    finance_node = make_department_node("finance")
-    logistics_node = make_department_node("logistics")
+    operation_node = make_department_node("operation", context_builder=_dept_memory_builder("operation"))
+    finance_node = make_department_node("finance", context_builder=_dept_memory_builder("finance"))
+    logistics_node = make_department_node("logistics", context_builder=_dept_memory_builder("logistics"))
 
     # Product 节点：注入跨部门上下文（Operation/Finance/Logistics 结论摘要，设计文档 6 节）
     def _product_context_builder(state: dict[str, Any]) -> Optional[dict[str, Any]]:
-        """从 department_results 提取上游部门结论，作为 Product 的跨部门上下文。"""
+        """Product 上下文 = 跨部门结论（O/F/L）+ 部门记忆/业务规则（分层注入）。"""
         dept = state.get("department_results") or {}
         ctx: dict[str, Any] = {}
         for name in ("operation", "finance", "logistics"):
@@ -87,6 +108,11 @@ def build_main_graph(
                     "anomalies": (r.get("anomalies") or [])[:5],
                     "confidence": r.get("confidence", 0.0),
                 }
+        mem = build_department_memory(
+            state.get("user_id", "default"), "product", state.get("user_question", "")
+        )
+        if mem:
+            ctx.update(mem)
         return ctx or None
 
     product_node = make_department_node("product", context_builder=_product_context_builder)
@@ -156,26 +182,31 @@ def build_main_graph(
     # decision 是终点
     builder.add_edge("decision", END)
 
-    return builder.compile()
+    return builder.compile(checkpointer=checkpointer)
 
 
 def run_question(
     question: str,
     thread_id: str = "default",
     user_id: str = "default",
+    checkpointer: Any = None,
 ) -> dict[str, Any]:
     """执行一次用户问题（主入口）。
 
     Args:
         question: 用户自然语言问题。
-        thread_id: 会话 ID（用于 checkpoint / 记忆）。
+        thread_id: 会话 ID（checkpoint / 记忆的 key）。
         user_id: 用户 ID。
+        checkpointer: 可注入 checkpointer（默认自动获取 PostgresSaver 单例）。
 
     Returns:
         包含 final_answer / decision_result / department_results 的完整状态字典。
     """
     logger.info("run_question.start", thread_id=thread_id, question=question[:100])
-    app = build_main_graph()
+    if checkpointer is None:
+        from app.memory.checkpoint import get_checkpointer
+        checkpointer = get_checkpointer()
+    app = build_main_graph(checkpointer=checkpointer)
     initial_state: GlobalState = {
         "thread_id": thread_id,
         "user_id": user_id,
@@ -186,11 +217,32 @@ def run_question(
         "skipped_tasks": [],
         "current_task": "",
     }
-    result = app.invoke(initial_state)
+    result = app.invoke(
+        initial_state,
+        config={"configurable": {"thread_id": thread_id}},
+    )
     logger.info(
         "run_question.done",
         thread_id=thread_id,
         stage=result.get("current_stage"),
         confidence=result.get("decision_result", {}).get("confidence"),
     )
+
+    # 长期记忆提取钩子（两级触发：规则命中 / 历史阈值；写入失败不影响主流程）
+    try:
+        from app.memory.extractor import maybe_extract_memories
+
+        answer = " ".join(filter(None, [
+            result.get("final_answer", ""),
+            str((result.get("decision_result") or {}).get("summary", "")),
+        ]))
+        maybe_extract_memories(
+            user_id=user_id,
+            thread_id=thread_id,
+            user_question=question,
+            final_answer=answer,
+        )
+    except Exception as exc:
+        logger.warning("run_question.memory_extract.fail", error=str(exc))
+
     return result

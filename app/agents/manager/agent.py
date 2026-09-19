@@ -38,10 +38,13 @@ class ManagerAgent:
     # ------------------------------------------------------------------
     # 对外入口
     # ------------------------------------------------------------------
-    def run(self, user_question: str) -> dict[str, Any]:
-        """执行一次任务规划，返回 task_plan（含 tasks / required_agents / intent）。"""
+    def run(self, user_question: str, memory: Optional[str] = None) -> dict[str, Any]:
+        """执行一次任务规划，返回 task_plan（含 tasks / required_agents / intent）。
+
+        memory: 用户长期记忆文本（画像/偏好/通用记忆，注入规划 prompt）。
+        """
         logger.info("manager.run.start", question=user_question[:100])
-        raw = self._plan(user_question)
+        raw = self._plan(user_question, memory=memory)
         plan = self._parse_and_validate(raw, user_question)
         logger.info(
             "manager.run.done",
@@ -54,13 +57,16 @@ class ManagerAgent:
     # ------------------------------------------------------------------
     # 内部步骤
     # ------------------------------------------------------------------
-    def _plan(self, user_question: str) -> str:
+    def _plan(self, user_question: str, memory: Optional[str] = None) -> str:
         """调用 LLM 生成任务 DAG（原始文本）。"""
         from langchain_core.messages import HumanMessage, SystemMessage
 
         resp = self.model.invoke([
             SystemMessage(content=MANAGER_SYSTEM_PROMPT),
-            HumanMessage(content=MANAGER_PLAN_PROMPT.format(user_question=user_question)),
+            HumanMessage(content=MANAGER_PLAN_PROMPT.format(
+                user_question=user_question,
+                memory=memory or "（无）",
+            )),
         ])
         raw = str(resp.content)
         logger.debug("manager.plan.llm", raw=raw[:2000])

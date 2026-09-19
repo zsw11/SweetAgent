@@ -126,7 +126,10 @@ def main() -> None:
     t0 = time.time()
     print("\n🚀 开始执行主 Graph（Manager -> Operation -> Decision）...")
 
-    result = run_question(question, thread_id="verify-pipeline", user_id="dev")
+    # 每次运行用唯一 thread_id：带 checkpointer 后同 thread 状态会跨轮次延续
+    # （reducer 合并旧 department_results / completed_tasks），固定 thread_id 会污染验证结果
+    thread_id = f"verify-{int(time.time() * 1000)}"
+    result = run_question(question, thread_id=thread_id, user_id="dev")
 
     elapsed = time.time() - t0
     print(f"\n⏱️  总耗时: {elapsed:.1f}s")

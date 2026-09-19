@@ -152,6 +152,28 @@ graph LR
 - **主 Graph 并行化**（2026-09-19）：route_fn 返回就绪 agent 列表 → O/F/L 并行 fan-out、部门完成后 fan-in 回 router、Product 依赖 O/F/L 串行（DAG 天然保证）；废弃 current_task 单任务调度，部门节点自定位任务；GlobalState 加 Annotated reducer（_add_unique/_merge_dict）防并行写覆盖；实测串行估算 77s → 并行 56.9s
 - 详细面试点见下方「三点七」考点十四/十五/十六/十七/十八
 
+### 0b. 2026-09-19 第四次会话补充（Checkpoint / PostgresSaver 持久化，设计文档 33 节）
+
+- **get_checkpointer()**（`app/memory/checkpoint.py`）：psycopg_pool.ConnectionPool 单例（max_size=10、延迟打开、`kwargs={"autocommit": True}`）+ PostgresSaver + `setup()` 幂等建表；atexit 注册 `_close_pool()`
+- **主图接入**：`build_main_graph(checkpointer=None)` → `compile(checkpointer=...)`；`run_question()` 默认自动获取，`invoke` 传 `config={"configurable": {"thread_id": thread_id}}`；API 层零改动（chat.py 本就传 thread_id）
+- **踩坑与修复**：`setup()` 抛 `ActiveSqlTransaction: CREATE INDEX CONCURRENTLY cannot run inside a transaction block`（psycopg 默认隐式事务 vs PG 禁止事务块内 CONCURRENTLY）→ 连接池加 `autocommit=True`；`ConnectionPool.__del__` 退出噪音 → atexit 显式 close
+- **验证**：轻量问题端到端 EXIT=0，checkpoints 33 行 / checkpoint_writes 183 行落库；`app.get_state()` 读回完整状态（中断恢复基础）；五部门并行回归 11.8s 不受影响
+- 面试点见下方「三点七」考点十九
+
+### 0c. 2026-09-19 第五次会话补充（长期记忆：结构化 + 非结构化 + 分层注入）
+
+- **结构化三表**：user_profiles（画像）/ user_preferences（偏好）/ business_preferences（业务规则，scope=global/部门）key-value 读写，latest-wins
+- **非结构化 user_memories**（新表）：memory_type（preference/fact/conclusion/rule）+ department 标签 + evidence + confidence + superseded_at（软删）；diff 式写入（同主题 max(余弦, n-gram Jaccard)≥0.7 更新旧条）；部门粗筛 + 向量 top-k
+- **模拟向量**：无真实 embedding 模型 → 确定性哈希伪向量（相同文本=相同向量、重叠文本=接近），knowledge_chunks 已重灌；将来换真模型零改动
+- **两级提取触发**：规则预筛（关键词命中才调 LLM）+ 历史 token>16K 兜底 + 会话关闭强制（POST /memory/extract）；profiles 需 confidence≥0.8 且 evidence 引用原话
+- **分层注入**：Manager 用户级（画像+偏好+通用记忆）/ 部门部门级（business_preferences scope + user_memories department）；O/F/L prompt 补 {context}
+- **API**：GET /memory、DELETE /memory/{id}、POST /memory/extract
+- **checkpoint 语义发现**：同 thread 带 checkpointer 后状态跨轮次延续（reducer 合并旧 department_results/completed_tasks）——多轮会话的基础，但 verify 脚本固定 thread_id 会污染，已改为每次唯一 thread_id
+- 面试点见下方「三点七」考点二十
+
+- **结构化字段优化（2026-09-20 二次会话确认）**：user_profiles + confidence/evidence/created_at；user_preferences + evidence/created_at（不存 confidence）；均不存 superseded_at（历史追溯走变更日志，列入待办）。见考点二十补充
+- **user_memories 拆 department 独立列（2026-09-20）**：department 原存 metadata JSONB，因是检索第一道闸门（部门粗筛），拆为独立列 VARCHAR(50)（空=通用记忆），索引改普通列索引；注入记忆带类型标注（（偏好）/（事实）/（历史结论）/（规则））。见考点二十追问四
+
 ### 1. Decision Agent 设计要点
 
 - **纯 LLM 综合节点，不查数据**：接收 department_results，做事实整合→交叉验证→冲突检测→归因→建议
@@ -273,6 +295,8 @@ graph LR
 - **Manager Agent**：LLM 任务规划，输出 task_plan（tasks + depends_on DAG），含已知部门过滤、product 自动依赖、decision 强制追加、DAG 环检测
 - **主 Graph**：`__start__→manager→router→operation/finance/logistics→router→...→decision→END`，循环路由模式，未实现 Agent 自动 skipped
 - **API**：FastAPI `/health` + `/chat`（POST，Pydantic 模型，返回完整结构化结果）
+- **Checkpoint**：`app/memory/checkpoint.py` 已实现 PostgresSaver 持久化（主图 compile(checkpointer) + thread_id config），checkpoints / checkpoint_writes 落库验证通过，`get_state` 可恢复（为第 11 项 Interrupt 打基础）
+- **长期记忆**：`app/memory/*` 已实现——结构化三表（画像/偏好/业务规则）+ user_memories（非结构化向量记忆）+ 两级触发提取 + 分层注入（Manager 用户级 / 部门部门级）+ 记忆管理 API（GET/DELETE /memory、POST /memory/extract）；模拟向量（确定性哈希伪向量），knowledge_chunks 已重灌
 - **验证命令**（统一入口，不再用 verify_operation.py）：
   ```
   .venv\Scripts\python scripts\verify_pipeline.py "分析 SweetNight 品牌美国市场过去90天的销售和利润状况"
@@ -295,11 +319,14 @@ graph LR
 - [x] ~~7. Logistics Agent~~（2026-09-18 完成，继承 BaseDepartmentAgent）
 - [x] ~~9. 主 Graph 扩展：接入 Finance/Logistics 后验证多部门 + Decision 交叉验证~~（2026-09-18 完成，三部门串行+跨部门交叉验证生效）
 - [x] ~~8. Product Agent~~（2026-09-19 完成，四部门闭环 + 跨部门上下文注入 + 知识库检索）
-- [ ] 10. Checkpoint / PostgresSaver 持久化（Phase 6，支持中断恢复）
+- [x] ~~10. Checkpoint / PostgresSaver 持久化（Phase 6，支持中断恢复）~~（2026-09-19 完成，端到端验证通过）
+- [x] ~~10a. 长期记忆（结构化 user_profiles/preferences/business_preferences + 非结构化 user_memories + 分层注入）~~（2026-09-19 完成，设计文档 34-35 节）
 - [ ] 11. Interrupt / Human-in-the-loop（Phase 7，参数不明确时暂停询问）
 - [ ] 12. Web UI（Phase 9，Streamlit MVP 或 Next.js）
 - [ ] **13. Agent 评估体系（重点！决定能否上线）** —— 详见上方「三点六」小节
 - [ ] **14. LangSmith 接入（Agent trace 可视化 + Prompt 版本管理 + 评估）** —— 替代 agent_steps/agent_tool_calls/agent_errors 手动记录；保留 agent_runs/agent_results 业务表
+- [ ] 15. 记忆去重阈值优化（2026-09-20 讨论确认方案 B+C 未实现）——按 memory_type 差异化阈值（preference 0.5 / fact·rule 0.6 / conclusion 0.7）+ 替代前比较新旧 confidence（高才覆盖）；见考点二十一
+- [ ] 16. 记忆变更日志表（memory_change_log: user_id/table/key/old_value/new_value/changed_at）——结构化 key-value 被覆盖的旧值不保留，历史追溯需独立审计表
 
 ---
 
@@ -848,6 +875,141 @@ class GlobalState(TypedDict, total=False):
 **验证**：日志显示三个 `department.node.start` 同秒出现（并行生效），product 在 O/F/L 全部 done 后启动（串行依赖生效），decision 收到四部门结果齐全（reducer 合并正确）；回归销售问题单部门调度正常。
 
 **核心一句话**：LangGraph 并行 = 条件边返回多目标（fan-out）+ 多入边统一 fan-in（天然 barrier）+ Annotated reducer 合并并行写；DAG 依赖让 product 自然落在 O/F/L 完成后的批次，无需额外逻辑。
+
+
+---
+
+### 考点十九：LangGraph Checkpoint 持久化——进程崩了怎么恢复？PostgresSaver 建表为什么踩事务坑？
+
+**面试官怎么问**：你的 Agent 跑一半进程崩了，怎么续跑？"中断恢复 / 故障重试 / time travel"怎么实现？LangGraph 的 checkpointer 原理是什么？用 Postgres 做持久化时踩过什么坑？
+
+**设计（本项目真实实现）**：
+
+1. **选型**：`langgraph-checkpoint-postgres` 的 `PostgresSaver`（设计文档 33 节），State 快照落 PostgreSQL 三张表：`checkpoints`（每步完整 channel_values 快照）、`checkpoint_writes`（节点中间 writes，支持超长状态外置 blob）、`checkpoint_migrations`（版本迁移记录）
+2. **接入形态**：`builder.compile(checkpointer=cp)` + `app.invoke(input, config={"configurable": {"thread_id": "..."}})`——thread_id 是 checkpoint 的 key，同一会话按线程隔离；`app.get_state(config)` / `get_state_history(config)` 可读回任意历史快照（time travel / 审计）
+3. **连接形态**：psycopg_pool.ConnectionPool 单例（max_size=10）+ PostgresSaver(pool)，`kwargs={"autocommit": True}`
+4. **嵌套图自动继承**：子图（部门 SubGraph）不传 checkpointer 也会以 `checkpoint_ns=部门:节点id` 参与父图 checkpoint，主图节点执行后整体落库
+
+**踩的坑（ActiveSqlTransaction）**：`PostgresSaver.setup()` 的 MIGRATIONS 里有 `CREATE INDEX CONCURRENTLY IF NOT EXISTS checkpoints_thread_id_idx`——**PostgreSQL 禁止 CONCURRENTLY 索引在事务块内执行**；而 psycopg 连接默认 autocommit=False，第一条 execute 就开启隐式事务，于是 setup 直接抛 `ActiveSqlTransaction`。官方 `PostgresSaver.from_conn_string()` 之所以能跑，是因为它内部用 `autocommit=True, prepare_threshold=0, row_factory=dict_row` 的连接。修复：连接池 `kwargs={"autocommit": True}` 与官方形态同构。
+
+**为什么这样设计**：
+
+- **快照 + 增量**：LangGraph 每执行一个节点就写一个 checkpoint（节点级持久化），恢复时从最近 checkpoint 续跑，进程崩溃最多丢一个节点的计算，不用重跑整图
+- **thread_id 分区**：不同会话互不干扰，同会话历史可回放（time travel 就是"从历史 checkpoint 分支出去再跑"）
+- **为什么连接池**：FastAPI 多线程下并发 invoke，checkpointer 必须线程安全；单连接（官方 from_conn_string 形态）只适合演示
+- **为什么 atexit 关池**：ConnectionPool.__del__ 在解释器 shutdown 阶段 join 线程会抛 `PythonFinalizationError`（已知无害噪音），atexit 显式 close 提前清理，避免脚本退出码被污染
+
+**备选方案**：a) SQLiteSaver（轻量但单机、不支持并发写）；b) 自建"中间结果落库"（要自己实现版本/回放，LangGraph 已内置没必要）；c) 不持久化靠重跑（LLM 调用费钱且结果非确定，长链路不可接受）。
+
+**核心一句话**：LangGraph Checkpoint = 每节点执行后把 State 快照按 thread_id 写库，中断恢复 / time travel 全从快照来；Postgres 落地的关键坑是 setup() 里的 `CREATE INDEX CONCURRENTLY` 不能在事务块内执行——连接必须 `autocommit=True`，再用连接池保证并发安全。
+
+
+---
+
+### 考点二十：多 Agent 长期记忆——用户画像/偏好/非结构化记忆怎么设计？怎么防污染？
+
+**面试官怎么问**：多 Agent 系统的"长期记忆"怎么设计？用户画像和偏好存哪？用户说过的话、历史结论（非结构化）怎么存怎么检索？什么时候触发记忆提取？怎么防止记忆重复、过时、错误？
+
+**设计（本项目真实实现，设计文档 34-35 节）**：
+
+1. **四层记忆分层**：
+   - 短期：checkpoint（会话状态，考点十九）
+   - 结构化长期：`user_profiles`（画像 key-value）/ `user_preferences`（偏好 key-value）/ `business_preferences`（业务规则，scope=global/部门，全员共享）
+   - 非结构化长期：`user_memories`（自由文本 + 向量 + memory_type + department 标签 + evidence + confidence + superseded_at）
+
+2. **分层注入**（关键架构）：
+   - Manager（规划）只注入用户级：画像 + 偏好全量 + 无部门标签的通用记忆 top-k
+   - 部门子 Agent（执行）注入部门级：business_preferences（scope=本部门∪global）+ user_memories（department=本部门）top-k + 知识库 + 跨部门结论
+   - 为什么：规划不需要部门专业记忆，执行才需要——省 token、防串台
+
+3. **提取触发（两级 + 会话关闭）**：规则预筛（"我负责/以后都用/更关注"等关键词命中才调 LLM，零成本跳过）→ 历史 token > 16K 兜底 → 会话关闭强制 `POST /memory/extract`
+
+4. **写入决策（防污染三件套）**：
+   - profiles：LLM 自评 confidence ≥ 0.8 **且** evidence 必须引用用户原话（抄不出来不写）——实测 0.75 被拦截
+   - preferences：latest-wins 覆盖（key-value 覆盖成本低）
+   - memories：相似度去重（max(余弦, 字符 n-gram Jaccard) ≥ 0.7 视为同主题 → 更新旧条不新增）；superseded_at 软删保留历史
+
+5. **检索（两级过滤）**：部门粗筛（department 标签 ∈ 问题意图部门 ∪ 无标签通用）→ 向量 top-k（token 预算 1.5K）
+
+6. **模拟向量**：无真实 embedding 模型 → 确定性哈希伪向量（字符 3-gram + 词双特征哈希桶 → L2 归一化），相同文本=相同向量、重叠文本=接近；`reindex_knowledge_embeddings.py` 重灌 knowledge_chunks；将来换真模型只换 `mock_embedding` 实现，表结构/检索零改动
+
+**为什么这样设计**：
+
+- **分层注入 vs 全量灌**：用户记忆会累积到几十上百条，全量灌 Manager 会爆 token 且信噪比下降；按层级/部门过滤让每个节点只看到自己需要的
+- **两级触发 vs 每轮提取**：每轮调 LLM 提取 = 每轮多一次调用费，且大多轮次无新信息；规则预筛让显式偏好第一轮就提取，历史阈值兜底隐式信息
+- **confidence + evidence**：LLM 自评分数不可信（习惯给 0.95），强制引用原话约束——拿不出依据的画像宁缺毋滥，防止错误画像固化
+- **为什么去重要 max(余弦, Jaccard)**：模拟向量对"包含关系"文本（A 是 B 的子串扩展）余弦可能偏低，n-gram Jaccard 直接度量文本重叠，互补更稳
+- **部门标签 + superseded**：检索按任务过滤的前提是写入时打好标签；软删保历史可追溯（用户"忘掉这条"= 软删）
+
+**备选方案**：a) langgraph 官方 PostgresStore（namespace key-value + 语义检索，与 LangGraph 深度集成，但表结构抽象、与已建业务表双轨）；b) 每轮全量提取（记忆更全但成本高、噪声大）；c) 真向量模型（OpenAI text-embedding-3-small，有 key 后替换 mock_embedding 即可）。
+
+**核心一句话**：长期记忆 = 结构化 key-value（画像/偏好/业务规则）+ 非结构化向量表（user_memories），写入靠"两级触发 + evidence 证据约束 + 相似度去重"防污染，读取靠"按层级/部门过滤 + top-k"防膨胀；模拟向量先跑通全链路，换真模型只换一个函数。
+
+
+**追问一：怎么判断一条记忆是结构化还是非结构化？"我爱英语"存哪？**
+
+- 分水岭 = **能否映射成固定 key-value**。能 → 结构化（key 是列、value 是单元格，可精确查询/覆盖/注入）；不能（开放语义自由文本）→ 非结构化（user_memories，向量检索 top-k）
+- "我爱英语" → `user_profiles: language=英语`（key 命中画像枚举 [role/industry/market_scope/language]）；"以后用美元" → `user_preferences: default_currency=美元`；"SKU1 库存/利润/退款三重风险"（历史结论）→ user_memories conclusion
+- 提取器 prompt 里写死两套 key 枚举，判定确定而非模型自由发挥
+
+**追问二：user_profiles 和 user_preferences 建议合并吗？**
+
+- 不合并。两者是**不同生命周期**的数据：画像=描述性事实（低频变化，写前高置信+evidence）；偏好=用户要求（高频变化，latest-wins 覆盖）。合并后更新策略只能统一——画像被低质覆盖，或偏好写入被高门槛卡住
+- 合并的唯一好处是少一张表；工程上可做（一张 key-value 表 + type 列），代价是两种语义混在一起
+
+**追问三：结构化表要不要像 user_memories 一样存 confidence / superseded_at？**
+
+- **confidence 只给 profiles**：画像写入门槛高（≥0.8+evidence），存下来①审计溯源②未来同 key 冲突检测（新提取置信度显著更高才覆盖）。preferences 不存——latest-wins 每次都是最新值，旧 confidence 随覆盖消失，没有比较对象；且偏好语义是"用户最新要求优先"，存了也不该拿它拦覆盖
+- **superseded_at 三张表都不加**：key-value 本质"每 key 一行、覆盖即事实"；加了要么永远 NULL（没意义）、要么改插新行标记旧行（那就不是 key-value 了）。真要看历史 → 单独变更日志表（memory_change_log: user_id/table/key/old_value/new_value/changed_at），列入待办
+- **evidence 全加、created_at 全加**：evidence 是防污染的根源（存用户原话、注入可展示依据）；created_at 保留首次确认时间（覆盖时保留、updated_at 刷新），与 user_memories 语义对齐。实测：覆盖后 created_at 不变、updated_at 刷新
+
+
+**追问四：user_memories 的 department 该放 JSONB 还是独立列？memory_type 有用吗？**
+
+- 初版把 department 塞在 metadata JSONB（`metadata->>'department'` + 表达式索引），"省一次 ALTER"——但部门粗筛是检索第一道闸门，核心检索维度藏 JSONB 里：表结构看不到、查询不直观。后拆为独立列 `department VARCHAR(50)`（空=通用记忆），查询 `department = ANY(%s) OR department IS NULL`，普通列索引，metadata 只留 topic 等扩展标签（单一事实来源）
+- 原则：**检索维度和约束字段用列，扩展标签用 JSONB**。列=结构化查询/索引/聚合友好；JSONB=低频标签、加键不迁移
+- memory_type 有用：区分**约束强度**——preference/rule（用户要求/业务规则，强，该被遵守）vs fact/conclusion（事实/历史结论，弱，供参考）。写入时 LLM 分类，注入时带类型标注（`（偏好）用户要求用美元结算`），LLM 读到就知道哪些是硬约束哪些是参考；API 可按类型过滤
+
+
+---
+
+### 考点二十一：记忆去重——怎么判断"这条记忆和库里的同主题"？该不该替代旧条？
+
+**面试官怎么问**：用户历史说过类似的话，你的记忆系统怎么去重？怎么判断两条记忆是不是同一个意思？会不会误删/误覆盖？阈值怎么定？
+
+**设计（本项目真实实现 + 实测暴露的困境）**：
+
+1. **判定机制**（add_memory 写入时）：
+   - 取该用户**最近 50 条未取代记忆**（性能取舍，不全文扫描）
+   - 逐条算 `text_similarity = max(向量余弦, 字符3-gram Jaccard)`
+   - `best_sim ≥ 阈值` → 同主题 → **覆盖旧条**（content/department/metadata/confidence/evidence 全量 latest-wins，created_at 保留、updated_at 刷新）
+   - `< 阈值` → 新增一条
+2. **为什么双度量取 max**：模拟向量（字符 3-gram 哈希）对"包含关系"文本（A 是 B 的子串扩展）余弦偏低；Jaccard 直接度量字符重叠率，互补更稳
+3. **实测数据**（0.7 阈值，2026-09-20）：
+   | 场景 | 综合相似度 | 0.7 判定 |
+   |---|---|---|
+   | 完全重复 | 1.0 | 替代 ✓ |
+   | 同主题改写（"喜欢看中文报告"→"更喜欢"） | 0.625 | 新增 ⚠️ |
+   | 包含关系（"美国市场运营"→"+关注利润率"） | 0.444 | 新增 |
+   | 否定句（"喜欢英语"→"不喜欢"） | 0.400 | 新增 |
+   | 不同主题（"英语"→"数学"） | 0.000 | 新增 ✓ |
+4. **暴露的阈值困境**：
+   - 阈值 0.7 太高 → 同主题改写 0.625 不去重，**记忆重复膨胀**（去重失效）
+   - 降到 0.5 → "同模板不同值"（"以后都看退款率报告"vs"以后都看利润率报告"≈0.6）**误替代**，且当前覆盖是**直接覆盖、旧内容不保留**——误判即永久丢失
+5. **确认的方案（未实现，待办 15）**：
+   - B：按 memory_type 差异化阈值——preference（用户反复表述高频）0.5 / fact·rule 0.6 / conclusion（结论本就随轮次变化）0.7
+   - C：替代前比较新旧 confidence——新提取置信度显著更高才覆盖，低则保留旧条（防"新提取质量差覆盖好记忆"）
+   - 历史兜底：待办 16 变更日志表（结构化/非结构化被覆盖的旧值可追溯）
+
+**为什么这样设计**：
+- **为什么不是 memory_type 相同就算同主题**：type 是约束强度分类（偏好/事实/结论），"两个 fact"可能是完全不同的事实——同主题必须看内容语义
+- **为什么不用真向量也敢上线**：模拟向量是确定性哈希，相同文本=相同向量、重叠文本=接近——对"重复表达"场景够用；真模型只换 mock_embedding 一个函数
+- **为什么替代要保 created_at 不保旧内容**：created_at（首建时间）是低成本高价值（审计"这条多久了"）；旧内容保留 = 版本表，成本高，走独立变更日志更干净
+- **为什么否定句要小心**：Jaccard 度量字符重叠，不度量语义对立——"喜欢"vs"不喜欢"重叠高，真模型也未必分得清，宁可并存（各存一条）不冒险覆盖
+
+**备选方案**：a) 单一低阈值（简单但误覆盖风险）；b) 向量库自带的 upsert 语义（如 pgvector 的 <#> 距离 + 阈值，本质相同）；c) 冲突时人工确认（Interrupt，待办 11）——最适合高价值记忆。
+
+**核心一句话**：记忆去重 = "最近 50 条 + max(余弦, n-gram Jaccard) ≥ 阈值"判定同主题，替代是全量覆盖；核心矛盾是**阈值两难**（高则去重失效、低则误覆盖）——解法是**按 memory_type 差异化阈值 + 替代前比置信度 + 变更日志兜底历史**。
 
 
 

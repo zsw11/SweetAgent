@@ -654,7 +654,10 @@ CREATE TABLE IF NOT EXISTS user_profiles (
     user_id    BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,  -- 用户ID
     key        VARCHAR(100) NOT NULL,           -- 属性键
     value      TEXT,                            -- 属性值
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),  -- 更新时间
+    confidence REAL,                            -- 置信度（LLM 自评，写入前已按阈值过滤；存留供审计/未来冲突检测）
+    evidence   TEXT,                            -- 依据（用户原话/来源）
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),  -- 首次确认时间（覆盖时保留）
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),  -- 最近更新时间
     UNIQUE (user_id, key)                       -- 联合唯一约束
 );
 
@@ -664,7 +667,9 @@ CREATE TABLE IF NOT EXISTS user_preferences (
     user_id    BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,  -- 用户ID
     key        VARCHAR(100) NOT NULL,           -- 偏好键（default_market/currency/time_range）
     value      TEXT,                            -- 偏好值
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),  -- 更新时间
+    evidence   TEXT,                            -- 依据（用户原话/来源）
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),  -- 首次确认时间（覆盖时保留）
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),  -- 最近更新时间
     UNIQUE (user_id, key)                       -- 联合唯一约束
 );
 
@@ -678,11 +683,31 @@ CREATE TABLE IF NOT EXISTS business_preferences (
     UNIQUE (key, scope)                         -- 联合唯一约束
 );
 
+-- 用户非结构化记忆（设计文档 35 节：语义长期记忆）
+-- 存：偏好语义 / 事实 / 历史结论 / 业务规则（自由文本 + 向量），用户私有
+-- department 标签用于"检索按任务过滤"（无标签 = 通用记忆，不参与粗筛淘汰）
+CREATE TABLE IF NOT EXISTS user_memories (
+    id            BIGSERIAL PRIMARY KEY,           -- 主键ID
+    user_id       BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,  -- 用户ID
+    memory_type   VARCHAR(20) NOT NULL DEFAULT 'preference',  -- 类型（preference/fact/conclusion/rule）
+    content       TEXT NOT NULL,                   -- 记忆内容（自由文本）
+    department    VARCHAR(50),                     -- 部门标签（operation/finance/logistics/product；空=通用记忆，不参与粗筛淘汰）
+    metadata      JSONB,                           -- 元数据（topic 等扩展标签；department 已拆列，不再存这里）
+    confidence    REAL,                            -- 置信度（LLM 自评 + evidence 约束）
+    evidence      TEXT,                            -- 依据（用户原话/来源）
+    embedding     vector(1536),                    -- 向量（当前为模拟向量，见 app/memory/embeddings.py）
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),  -- 创建时间
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),  -- 更新时间（同主题覆盖时刷新）
+    superseded_at TIMESTAMPTZ                       -- 取代时间（冲突取代/软删除，保留历史）
+);
+CREATE INDEX IF NOT EXISTS user_memories_user_idx ON user_memories(user_id);
+CREATE INDEX IF NOT EXISTS user_memories_dept_idx ON user_memories(department);
+
 -- ============================================================
 -- 35-38. 知识库（PGVector）
 -- ============================================================
 
--- 知识文档（SOP/报告/产品规格/FAQ，按部门）
+-- 知识文档（SOP/报告/产品规格/FAQ，按部门） 一个文档一行
 CREATE TABLE IF NOT EXISTS knowledge_documents (
     id           BIGSERIAL PRIMARY KEY,           -- 主键ID
     title        VARCHAR(300) NOT NULL,            -- 文档标题
@@ -695,7 +720,7 @@ CREATE TABLE IF NOT EXISTS knowledge_documents (
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now()       -- 创建时间
 );
 
--- 知识分块（含 embedding 向量，用于语义检索）
+-- 知识分块（含 embedding 向量，用于语义检索）   一个文档切 N 块、N 行,导入时切块（按段落 / 字数）→ 每块生成向量一并写入。**查询主力表**
 CREATE TABLE IF NOT EXISTS knowledge_chunks (
     id          BIGSERIAL PRIMARY KEY,           -- 主键ID
     document_id BIGINT NOT NULL REFERENCES knowledge_documents(id) ON DELETE CASCADE,  -- 文档ID
@@ -706,7 +731,7 @@ CREATE TABLE IF NOT EXISTS knowledge_chunks (
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()       -- 创建时间
 );
 
--- 知识向量（按模型/维度分开存储）
+-- 知识向量（按模型/维度分开存储）  嵌入时写入。**用途：同一文本可存多模型向量**，模型升级 / 换模型时可对比、可追溯，不用动 chunks
 CREATE TABLE IF NOT EXISTS knowledge_embeddings (
     id         BIGSERIAL PRIMARY KEY,           -- 主键ID
     chunk_id   BIGINT NOT NULL REFERENCES knowledge_chunks(id) ON DELETE CASCADE,  -- 分块ID
@@ -831,7 +856,7 @@ CREATE TABLE IF NOT EXISTS mart_product_profit_daily (
     profit_margin      NUMERIC(10,4),                  -- 利润率
     PRIMARY KEY (date, store_id, sku_id)        -- 联合主键
 );
-select  * from mart_product_profit_daily
+select  * from mart_product_profit_daily;
 -- 广告效果宽表（花费/ROAS/CTR/CVR）
 CREATE TABLE IF NOT EXISTS mart_ad_performance_daily (
     date         DATE NOT NULL,                   -- 日期

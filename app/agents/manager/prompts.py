@@ -46,6 +46,9 @@ MANAGER_PLAN_PROMPT = """请分析以下用户问题，规划任务 DAG。
 
 用户问题：{user_question}
 
+已知用户信息（画像/偏好/长期记忆，规划时参考，不要编造）：
+{memory}
+
 规划要求：
 1. 判断需要哪些部门 Agent（operation / finance / logistics / product）；
 2. 每个部门一个任务，id 为 `{{agent}}_analysis`；

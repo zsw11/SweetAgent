@@ -43,6 +43,18 @@ class Settings(BaseSettings):
     DATABASE_URL: str = "postgresql://app_user:app_password@localhost:5432/sweetnight_agent"
     AGENT_DATABASE_URL: str = "postgresql://agent_reader:agent_password@localhost:5432/sweetnight_agent"
 
+    # ---------- LangGraph Checkpoint / Memory（设计文档 33-34 节） ----------
+    # langgraph-checkpoint-postgres 的表名硬编码为 checkpoints，此处声明以便配置可见
+    CHECKPOINTER_TABLE: str = "checkpoints"
+    STORE_TABLE_PREFIX: str = "langgraph_store"
+
+    # ---------- 长期记忆（设计文档 34-35 节） ----------
+    MEMORY_EXTRACT_THRESHOLD: int = 16_000      # 历史 token 超此值触发记忆提取（隐式信息兜底）
+    HISTORY_COMPRESSION_THRESHOLD: int = 35_000  # 历史 token 超此值触发上下文压缩（预留，多轮会话时启用）
+    COMPRESSION_KEEP_RECENT: int = 3             # 压缩时保留最近 N 轮原文
+    MEMORY_RECALL_TOP_K: int = 5                 # 记忆向量检索 top-k 条数
+    MEMORY_INJECT_TOKEN_BUDGET: int = 1_500      # 注入 Manager/部门的记忆 token 上限
+
     # ---------- 向量 / 知识库 ----------
     EMBEDDING_MODEL: str = "text-embedding-3-small"
     VECTOR_DIM: int = 1536
