@@ -30,7 +30,7 @@ Prompt 版本：{PROMPT_VERSION}
 """
 
 PLAN_PROMPT = """你是运营分析 Agent 的规划器。给定任务，列出需要查询的数据域（只输出数据域名称列表，每行一个）：
-可选：gmv/订单/销量、广告投放、评论反馈、库存。
+可选：sales_sku（销售/SKU）、brand_summary（品牌汇总）、ad（广告投放）、review（评论反馈）、inventory（库存）、knowledge（知识库规则）。
 
 任务：{task}
 

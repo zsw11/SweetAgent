@@ -20,8 +20,9 @@ logger = get_logger("product_agent")
 
 # 已知数据域白名单（供 graph.py retry 过滤用）。
 # 注意：销售/利润/库存由 Operation/Finance/Logistics 查询，跨部门上下文注入，
-# Product 不重复查询这些数据域（设计文档 6 节）。
-_KNOWN_REQS: frozenset[str] = frozenset({"product", "lifecycle", "development", "consumer", "market"})
+# Product 不重复查询这些数据域（设计文档 6 节）。market = 知识库文档清单；
+# knowledge = RAG 向量检索（知识库内容），两者职责分离。
+_KNOWN_REQS: frozenset[str] = frozenset({"product", "lifecycle", "development", "consumer", "market", "knowledge"})
 
 
 class ProductAgent(BaseDepartmentAgent):
@@ -32,6 +33,7 @@ class ProductAgent(BaseDepartmentAgent):
     FALLBACK_REQ = "product"
     PLAN_PROMPT = PLAN_PROMPT
     ANALYSIS_PROMPT = ANALYSIS_PROMPT
+    KNOWLEDGE_DEPARTMENT = "product"
 
     PRIORITY_TABLES: dict[str, list[str]] = {
         "product": ["products", "product_skus", "product_categories", "product_prices"],
@@ -39,6 +41,7 @@ class ProductAgent(BaseDepartmentAgent):
         "development": ["product_development_projects", "brands"],
         "consumer": ["reviews", "review_aspects", "customer_feedback", "return_reasons"],
         "market": ["knowledge_documents", "knowledge_chunks"],
+        "knowledge": ["knowledge_documents", "knowledge_chunks"],
     }
 
     KEYWORD_MAP: dict[str, str] = {
@@ -47,6 +50,7 @@ class ProductAgent(BaseDepartmentAgent):
         "development": "development_project",
         "consumer": "review",
         "market": "knowledge",
+        "knowledge": "knowledge",
     }
 
     def __init__(self, model=None, executor=None, cross_context: Optional[dict[str, Any]] = None):
@@ -115,8 +119,8 @@ class ProductAgent(BaseDepartmentAgent):
             )
         lines.append(
             "查询提示: ①品牌过滤用 JOIN brands 按 name 匹配；"
-            "②knowledge_chunks 是产品知识（行业趋势/竞品/规格/SOP），检索用确定性过滤 "
-            "WHERE department='product' AND content ILIKE '%关键词%'（种子向量为随机值，勿用向量相似度）；"
+            "②知识库内容检索请使用 knowledge 数据域（RAG 向量检索，自动返回最相关片段，"
+            "覆盖行业趋势/竞品/规格/SOP）；market 域仅查询文档清单 knowledge_documents.title；"
             "③评论按 SKU 聚合评分与情感（review_aspects 有 aspect/sentiment），SN-Q12-US 有塌陷类负面评论埋点；"
             "④新品建议参考开发项目 product_development_projects 与知识库 SOP（目标毛利率不低于 35%）；"
             "⑤售价/成本来自 product_skus，毛利率=(sale_price-cost)/sale_price。"

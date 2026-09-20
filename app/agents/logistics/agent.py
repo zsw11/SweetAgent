@@ -15,7 +15,7 @@ from app.observability.logging import get_logger
 
 logger = get_logger("logistics_agent")
 
-_KNOWN_REQS: frozenset[str] = frozenset({"inventory_risk", "stock_level", "inbound", "logistics_cost", "delivery"})
+_KNOWN_REQS: frozenset[str] = frozenset({"inventory_risk", "stock_level", "inbound", "logistics_cost", "delivery", "knowledge"})
 
 
 class LogisticsAgent(BaseDepartmentAgent):
@@ -26,6 +26,7 @@ class LogisticsAgent(BaseDepartmentAgent):
     FALLBACK_REQ = "inventory_risk"
     PLAN_PROMPT = PLAN_PROMPT
     ANALYSIS_PROMPT = ANALYSIS_PROMPT
+    KNOWLEDGE_DEPARTMENT = "logistics"
 
     PRIORITY_TABLES: dict[str, list[str]] = {
         "inventory_risk": ["mart_inventory_risk", "inventory_daily", "product_skus", "brands"],
@@ -33,6 +34,7 @@ class LogisticsAgent(BaseDepartmentAgent):
         "inbound": ["inbound_shipments", "warehouses", "product_skus"],
         "logistics_cost": ["logistics_cost", "carriers", "orders"],
         "delivery": ["logistics_orders", "tracking_events", "carriers"],
+        "knowledge": ["knowledge_documents", "knowledge_chunks"],
     }
 
     KEYWORD_MAP: dict[str, str] = {
@@ -41,6 +43,7 @@ class LogisticsAgent(BaseDepartmentAgent):
         "inbound": "inbound",
         "logistics_cost": "cost",
         "delivery": "tracking",
+        "knowledge": "knowledge",
     }
 
     def _load_dictionary(self) -> str:
@@ -71,7 +74,8 @@ class LogisticsAgent(BaseDepartmentAgent):
             "查询提示: ①品牌过滤用 JOIN brands 按 name 匹配；"
             "②库存风险宽表 mart_inventory_risk 已含 stock_days/forecast_demand/risk_level，优先用此表；"
             "③stock_days < 12 为高风险；④实时库存查 inventory 表，历史趋势查 inventory_daily；"
-            "⑤在途补货查 inbound_shipments（status=in_transit）。"
+            "⑤在途补货查 inbound_shipments（status=in_transit）；"
+            "⑥物流规则（SLA/库存阈值/补货）用 knowledge 数据域（RAG 向量检索）。"
         )
         text = "\n".join(lines)
         logger.debug("logistics.dictionary", text=text[:1500])

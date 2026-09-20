@@ -684,7 +684,7 @@ CREATE TABLE IF NOT EXISTS business_preferences (
 );
 
 -- 用户非结构化记忆（设计文档 35 节：语义长期记忆）
--- 存：偏好语义 / 事实 / 历史结论 / 业务规则（自由文本 + 向量），用户私有
+-- 存：偏好语义 / 事实 / 历史结论 / 业务规则（自由文本 + 向量），用户私有，检索优先选向量相近且执行度高的记忆top5
 -- department 标签用于"检索按任务过滤"（无标签 = 通用记忆，不参与粗筛淘汰）
 CREATE TABLE IF NOT EXISTS user_memories (
     id            BIGSERIAL PRIMARY KEY,           -- 主键ID
@@ -704,7 +704,7 @@ CREATE INDEX IF NOT EXISTS user_memories_user_idx ON user_memories(user_id);
 CREATE INDEX IF NOT EXISTS user_memories_dept_idx ON user_memories(department);
 
 -- ============================================================
--- 35-38. 知识库（PGVector）
+-- 35-38. 知识库（PGVector）向量召回 - 多个关键词兜底（混合检索）
 -- ============================================================
 
 -- 知识文档（SOP/报告/产品规格/FAQ，按部门） 一个文档一行
@@ -715,11 +715,12 @@ CREATE TABLE IF NOT EXISTS knowledge_documents (
     department   VARCHAR(50) NOT NULL,            -- 所属部门（operation/logistics/finance/product）
     brand        VARCHAR(100),                    -- 关联品牌
     market       VARCHAR(50),                     -- 关联市场
-    version      VARCHAR(50),                     -- 文档版本
+    version      VARCHAR(50),                     -- 文档版本（当前仅展示元数据，未参与唯一键/检索；演进B：同title不同版本并存、检索取最新，见 development_log 待办18）
+    content_hash VARCHAR(64),                     -- 全文 SHA-256 内容指纹（变更检测：同 title 同哈希跳过重建）
     status       VARCHAR(20) NOT NULL DEFAULT 'active',  -- 状态
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now()       -- 创建时间
 );
-
+select  * from knowledge_chunks where document_id = '8';
 -- 知识分块（含 embedding 向量，用于语义检索）   一个文档切 N 块、N 行,导入时切块（按段落 / 字数）→ 每块生成向量一并写入。**查询主力表**
 CREATE TABLE IF NOT EXISTS knowledge_chunks (
     id          BIGSERIAL PRIMARY KEY,           -- 主键ID
@@ -730,7 +731,7 @@ CREATE TABLE IF NOT EXISTS knowledge_chunks (
     embedding   vector(1536),                    -- 向量嵌入（text-embedding-3-small）
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()       -- 创建时间
 );
-
+select * from knowledge_chunks;
 -- 知识向量（按模型/维度分开存储）  嵌入时写入。**用途：同一文本可存多模型向量**，模型升级 / 换模型时可对比、可追溯，不用动 chunks
 CREATE TABLE IF NOT EXISTS knowledge_embeddings (
     id         BIGSERIAL PRIMARY KEY,           -- 主键ID
@@ -740,7 +741,7 @@ CREATE TABLE IF NOT EXISTS knowledge_embeddings (
     embedding  vector(1536) NOT NULL,           -- 向量值
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()       -- 创建时间
 );
-
+select * from knowledge_embeddings;
 -- ============================================================
 -- 22. Agent 元数据（口径 / 业务规则）
 -- ============================================================

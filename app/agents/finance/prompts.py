@@ -25,7 +25,7 @@ Prompt 版本：{PROMPT_VERSION}
 """
 
 PLAN_PROMPT = """你是财务分析 Agent 的规划器。给定任务，列出需要查询的数据域（只输出数据域名称列表，每行一个）：
-可选：profit/cost/revenue/refund/platform_fee。
+可选：profit（利润）/cost（成本）/revenue（收入）/refund（退款）/platform_fee（平台费）/knowledge（财务规则口径）。
 
 任务：{task}
 

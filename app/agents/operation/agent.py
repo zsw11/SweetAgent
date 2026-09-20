@@ -22,7 +22,7 @@ from app.observability.logging import get_logger
 logger = get_logger("operation_agent")
 
 # 已知数据域白名单（供 graph.py retry 过滤用）
-_KNOWN_REQS: frozenset[str] = frozenset({"sales_sku", "brand_summary", "ad", "review", "inventory"})
+_KNOWN_REQS: frozenset[str] = frozenset({"sales_sku", "brand_summary", "ad", "review", "inventory", "knowledge"})
 
 
 class OperationAgent(BaseDepartmentAgent):
@@ -33,6 +33,7 @@ class OperationAgent(BaseDepartmentAgent):
     FALLBACK_REQ = "sales_sku"
     PLAN_PROMPT = PLAN_PROMPT
     ANALYSIS_PROMPT = ANALYSIS_PROMPT
+    KNOWLEDGE_DEPARTMENT = "operation"
 
     PRIORITY_TABLES: dict[str, list[str]] = {
         "sales_sku": ["mart_sales_daily", "sales_daily", "product_skus", "brands"],
@@ -40,6 +41,7 @@ class OperationAgent(BaseDepartmentAgent):
         "ad": ["ad_performance_daily", "ad_campaigns", "product_skus", "brands"],
         "review": ["reviews", "product_skus", "brands"],
         "inventory": ["inventory_daily", "product_skus", "brands"],
+        "knowledge": ["knowledge_documents", "knowledge_chunks"],
     }
 
     KEYWORD_MAP: dict[str, str] = {
@@ -48,6 +50,7 @@ class OperationAgent(BaseDepartmentAgent):
         "ad": "campaign",
         "review": "review",
         "inventory": "inventory",
+        "knowledge": "knowledge",
     }
 
     def _load_dictionary(self) -> str:
@@ -79,7 +82,8 @@ class OperationAgent(BaseDepartmentAgent):
             "不要用 sku_code 匹配品牌名；②时间分段用 date > (SELECT MAX(date) - 21 FROM 主表) 区分 last21/prev；"
             "③prev 段约 69 天、last21 段约 21 天，天数不同——对比必须换算为日均"
             "（如 SUM(units)/COUNT(DISTINCT date) 输出 daily_units），禁止直接比较两段总量；"
-            "④聚合查询应能返回行，若过滤过严返回空请放宽条件。"
+            "④聚合查询应能返回行，若过滤过严返回空请放宽条件；"
+            "⑤知识库（运营规则/广告红线）用 knowledge 数据域（RAG 向量检索，自动返回最相关片段）。"
         )
         text = "\n".join(lines)
         logger.debug("operation.dictionary", text=text[:1500])

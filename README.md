@@ -443,7 +443,7 @@ flowchart TD
 * **内容**：
   * **ProductAgent**（`app/agents/product/*`）：继承 `BaseDepartmentAgent`，数据域白名单 `product/lifecycle/development/consumer/market`（映射 products/product_skus/product_lifecycle/product_development_projects/reviews/review_aspects/customer_feedback/return_reasons/knowledge_documents/knowledge_chunks 等真实表）；数据字典注入品牌/商品与SKU（含毛利率）/生命周期/在研项目/知识库文档清单
   * **跨部门上下文注入**（设计文档 6 节）：`make_department_node` 支持 `context_builder`，Product 节点执行前从 `department_results` 提取 O/F/L 结论摘要（summary/metrics/anomalies/confidence）注入；基类 `_plan`/`_analyze` 支持 `{context}` 占位（无占位的 prompt 不受影响）；Product 不重复查询销售/利润/库存
-  * **知识库检索**：`market` 数据域用确定性过滤（`department='product'` + `content ILIKE`）查 knowledge_chunks，SOP/行业报告/竞品/规格直接进分析（种子向量为随机值，勿用相似度）
+  * **知识库检索**：`market` 数据域查知识库文档清单（knowledge_documents.title）；`knowledge` 数据域走 **RAG 向量检索**（department 过滤 + PGVector 余弦距离 top-k + 关键词兜底），SOP/行业报告/竞品/规格直接进分析（2026-09-20 升级为真 RAG，见下方 RAG 闭环条目）
   * **主图集成**：router 注册 `product` runner，条件边 `"product"→product`，`product→router` 回边
   * **修复基类循环导入**：`base.py` 顶部直接导入 `operation.tools` 在 Product 先触发 base 时构成循环（base→operation.tools→operation/__init__→operation.agent→base），改为延迟导入 `_get_tool_map()`
   * **嵌套 JSON 防御**：LLM 偶尔把整个 JSON 塞进 `summary` 字段，基类 `_analyze` 二次提取（dict/JSON 字符串 → summary 文本）
@@ -494,3 +494,23 @@ flowchart TD
   * API：GET/DELETE /memory、POST /memory/extract 全部 200/404 符合预期
   * 结构化字段优化（2026-09-20）：user_profiles + confidence/evidence/created_at、user_preferences + evidence/created_at（均不存 superseded_at，历史走变更日志待办）；GET /memory 返回结构化详情
   * user_memories 拆 department 独立列（2026-09-20）：从 metadata JSONB 提升为列（检索第一道闸门），注入记忆带类型标注（（偏好）/（事实）/（历史结论）/（规则））
+  * 记忆写入改 LLM 裁判（2026-09-20）：相似度只召回 top-5，LLM 判 ADD/NONE/UPDATE/MERGE，UPDATE/MERGE 走 superseded 版本链（metadata.superseded_by_id）不覆盖；规则前置（完全相同→NONE 刷新）+ 召回门槛 0.25 + 无 LLM 降级（综合相似度 0.7 版本化）
+
+### 2026-09-20·企业知识库 RAG 真闭环（设计文档 35-38 节）
+把私域文档切成块 → 向量化入库 → 提问时按语义召回相关块 → 注入 LLM 生成答案。
+* **内容**：
+  * **chunker**（`app/knowledge/chunker.py`）：两级切分——段落优先（空行分隔，天然语义单元），超长段落按固定窗口（500 字）+ 重叠（50 字），避免知识点被拦腰截断导致召回上下文残缺
+  * **embedder**（`app/knowledge/embedder.py`）：统一向量化接口——Key 有效用真实 embedding 模型（text-embedding-3-small，1536 维，与表结构一致）；占位/无效 Key 或真实调用失败自动降级 mock_embedding（进程内缓存降级，失败一次后零成本）；模型名/维度写库可追溯
+  * **retriever**（`app/knowledge/retriever.py`）：PGVector 余弦距离（`embedding <=> %s::vector`，相似度=1-距离）+ metadata 过滤（department/brand/market/document_type，JOIN documents 权威字段，SQL 层压缩 top-k）+ 混合检索——向量最高分 < min_score(0.20) 触发关键词兜底（英文连续词 + 中文 2-gram 提取，按命中词数降序）
+  * **证据置信度分级**（2026-09-20 增量，retriever._evidence_confidence/_stamp_confidence + base._query_knowledge/_analyze）：每条命中打 high/medium/low（vector 按相似度 ≥0.60/0.30，keyword 按命中词数 ≥3/2）；**双通道都不可信（向量 top1<0.20 且关键词 0 命中）→ 显式返回空**（log knowledge.retrieve.none），_query_knowledge 透传整体 confidence（空=none），_analyze 在 confidence=none 时自动追加「知识库未收录相关内容，必须如实说明，禁止编造」系统规则——把"无合适检索/弃权"做成系统级信号，防幻觉最后一道闸；关键词提取加固：含虚词 2-gram 过滤（货与/与预等跨界垃圾不占名额）+ 名额 5→8
+  * **ingest**（`app/knowledge/ingest.py` + `scripts/ingest_knowledge.py`）：文档 → 切分 → 向量化 → 写 documents/chunks/embeddings，**按 title + content_hash 幂等**（documents 表新增 content_hash=SHA-256 全文指纹：同 title 同哈希 → 跳过重建零成本；同 title 不同哈希 → 先删后建 CASCADE 清旧 chunk；实测重跑 0 重建 / 11 跳过）；种子 11 篇 33 chunks（O/F/L/P/company 五域：广告 SOP/平台规则/财务口径/退款规则/物流 SLA/库存预警/行业报告/开发 SOP/规格书/竞品洞察/经营红线），关键数字与数据埋点对齐
+  * **部门接入**：基类新增 `KNOWLEDGE_DEPARTMENT` + `_query_knowledge()`，四部门数据域白名单加 `knowledge`（O/F/L/P），plan 阶段 LLM 自主决定是否查知识库，knowledge 域走 RAG 而非 SQL 生成；Product 的 market 域（文档清单）与 knowledge 域（内容检索）职责分离
+* **修复的坑**：
+  * `\w` 在 Python 匹配中文 → 整句中文被当做一个词做 ILIKE 必然落空 → 中文按 2-gram 提取检索关键词
+  * 关键词兜底 `ORDER BY c.id` 不按相关度 → 部分匹配旧文档排前 → 改为 `ORDER BY 命中词数 DESC, id`
+  * 部门 `self.executor` 是 SQL 生成工具函数（输入 sql 字符串，非执行器实例）→ RAG 检索器自建只读执行器（agent_reader）
+  * 真实 embedding 调用 401（.env 占位 key）→ 启发式判定无效 Key 直接走 mock + 失败降级缓存
+* **关键文件**：`app/knowledge/*`、`app/agents/base.py`、`app/agents/{operation,finance,logistics,product}/{agent,prompts}.py`、`scripts/ingest_knowledge.py`、`scripts/verify_rag.py`
+* **验证**：
+  * `scripts/verify_rag.py` 8/8 通过：跨部门检索命中（市场趋势/开发 SOP/ROAS 红线/毛利口径/退款预警/库存阈值/履约 SLA/经营红线）、部门过滤无泄漏、关键词兜底生效
+  * 全链路回归 3 次通过：`"公司新品开发流程是什么？"`（四部门 46.4s，conf 0.82）、`"广告投放的ROAS红线是多少？"`（29.4s，conf 0.82）、`"公司规定的库存补货与预警规则是什么？"`——logistics 引用知识库规则（安全库存 15 天 / 库存天数<12 天预警 / <7 天缺货需 24h 锁方案）并与 mart_inventory_risk 实际数据交叉，发现"中风险记录库存 5.2 天却标 medium"的规则执行不一致；原有 SQL 链路与埋点全部未退化

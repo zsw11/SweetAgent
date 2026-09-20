@@ -31,7 +31,7 @@ Prompt 版本：{PROMPT_VERSION}
 """
 
 PLAN_PROMPT = """你是产品策略分析 Agent 的规划器。给定任务，列出需要查询的数据域（只输出数据域名称列表，每行一个）：
-可选：product/lifecycle/development/consumer/market。
+可选：product（产品主档）/lifecycle（生命周期）/development（在研项目）/consumer（用户反馈）/market（知识库文档清单）/knowledge（知识库内容RAG检索）。
 
 跨部门上下文（Operation/Finance/Logistics 已查询销售/利润/库存，无需重复查询这些数据域）：
 {context}

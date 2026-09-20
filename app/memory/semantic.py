@@ -4,9 +4,16 @@
 department 为独立列（operation/finance/logistics/product；空=通用记忆，不参与粗筛淘汰），
 memory_type 区分约束强度：preference/rule（用户要求/业务规则，强）vs fact/conclusion（事实/历史结论，弱）。
 
-写入策略（diff 式）：
-- 与已有记忆相似度 > 0.7（max(mock 余弦, n-gram Jaccard)）→ 视为同主题，更新旧条（覆盖 + updated_at），不新增
-- 否则新增一条；superseded_at 预留（冲突取代 / 手动删除时软删）
+写入策略（两阶段，参考 Mem0 / LangMem 的 ADD/UPDATE/NONE 决策模式，2026-09-20 重构）：
+1. 召回：相似度只负责召回候选（top-5），不负责决策
+2. 裁判：最高相似度 > 0.5 才调 LLM（judge.py）判断语义关系 →
+   - unrelated → ADD（新增）
+   - duplicate → NONE（只刷新旧条 evidence/confidence，不新增）
+   - supplement → MERGE（旧条 superseded + 插入合并后新条）
+   - conflict/negation → UPDATE（新置信度足够则旧条 superseded + 插入新条）或 NONE
+3. 版本化：UPDATE/MERGE 不原地覆盖——旧条 superseded_at=now()、metadata.superseded_by_id=新id、
+   新条插入（版本链 m1→m2→m3，历史可追溯）；决策痕迹记 metadata（decision_reason/decided_by）
+4. 降级：LLM 不可用/解析失败 → 最高相似度 ≥ 0.7 版本化更新，否则新增
 
 检索策略（两级过滤）：
 1. 部门粗筛：department ∈ 问题意图部门 ∪ 无标签通用记忆
@@ -26,11 +33,15 @@ from app.memory.embeddings import (
     vector_from_sql,
     vector_to_sql,
 )
+from app.memory.judge import judge_memory
 from app.observability.logging import get_logger
 
 logger = get_logger("memory_semantic")
 
-_SIMILARITY_DEDUP = 0.7  # 同主题判定阈值（综合 max(余弦, n-gram Jaccard)，高于此值视为重复/更新而非新增）
+_RECALL_THRESHOLD = 0.25  # 召回门槛：最高相似度高于此值才调 LLM 裁判（成本控制，明显无关不问）。
+# 0.25 依据：语义变更"用户负责美国市场运营"→"不再负责…转负责欧洲市场" sim≈0.30 需进裁判；完全无关 sim≈0 跳过
+_FALLBACK_THRESHOLD = 0.7  # 降级阈值（无 LLM）：最高相似度高于此值版本化更新，否则新增
+_RECALL_TOP_K = 5          # 召回候选数（一次 LLM 调用处理全部候选）
 
 
 # ---------------------------------------------------------------------------
@@ -46,62 +57,157 @@ def add_memory(
     confidence: Optional[float] = None,
     evidence: Optional[str] = None,
 ) -> int:
-    """写入一条非结构化记忆（diff 式：同主题更新旧条，否则新增）。
+    """写入一条非结构化记忆（召回 → LLM 裁判 → 版本化执行）。
 
-    department 写独立列（空=通用记忆）；metadata 只存扩展标签（topic 等）。
-    返回记忆 id。
+    department 写独立列（空=通用记忆）；metadata 存扩展标签 + 决策痕迹。
+    返回记忆 id（新增返回新 id；duplicate 返回被刷新的旧条 id；UPDATE/MERGE 返回新条 id）。
     """
     uid = resolve_user_id(user_id)
     content = (content or "").strip()
     if not content:
         return -1
     vec = mock_embedding(content)
-    meta = dict(metadata or {})  # 扩展标签；department 不再放这里
+    meta = dict(metadata or {})
 
     with connect() as conn:
-        # 1) 同主题检测：取该用户最近 50 条未取代记忆，算文本相似度
+        # 1) 召回：未取代记忆按相似度排序取 top-5（相似度只用于召回）
         rows = conn.execute(
             """
-            SELECT id, content FROM user_memories
+            SELECT id, memory_type, content, confidence, embedding FROM user_memories
             WHERE user_id = %s AND superseded_at IS NULL
-            ORDER BY updated_at DESC LIMIT 50
             """,
             (uid,),
         ).fetchall()
-        best_id, best_sim = None, 0.0
-        for mid, old_content in rows:
-            sim = text_similarity(content, old_content)
-            if sim > best_sim:
-                best_id, best_sim = mid, sim
+        scored = [(cosine_similarity(vec, vector_from_sql(r[4])), r) for r in rows]
+        scored.sort(key=lambda x: x[0], reverse=True)
+        top = scored[:_RECALL_TOP_K]
+        best_sim = top[0][0] if top else 0.0
 
-        if best_id is not None and best_sim >= _SIMILARITY_DEDUP:
-            # 同主题：更新旧条（latest-wins 覆盖内容/标签/置信度）
-            conn.execute(
-                """
-                UPDATE user_memories
-                SET content = %s, department = %s, metadata = %s, confidence = %s, evidence = %s,
-                    updated_at = now()
-                WHERE id = %s
-                """,
-                (content, department, json.dumps(meta, ensure_ascii=False), confidence, evidence, best_id),
+        # 2) 门槛：明显无关 → 直接新增（零 LLM 成本）
+        if best_sim <= _RECALL_THRESHOLD:
+            return _insert(conn, uid, memory_type, content, department, meta, confidence, evidence, vec)
+
+        # 3) 规则前置：内容完全相同 → 直接 NONE 刷新（确定性，不调 LLM；LLM 对多候选可能不稳定）
+        candidates = [
+            {"id": r[0], "memory_type": r[1], "content": r[2], "confidence": r[3]}
+            for _, r in top
+        ]
+        exact = [cand for cand in candidates if cand["content"] == content]
+        if exact:
+            meta["decision_reason"] = "exact_duplicate"
+            meta["decided_by"] = "rule"
+            return _refresh_old(conn, uid, exact[0]["id"], meta, confidence, evidence)
+
+        # 4) LLM 裁判
+        decision = judge_memory(content, memory_type, candidates, new_confidence=confidence)
+
+        # 5) 降级：LLM 不可用/解析失败 → 简单阈值版本化
+        if decision is None:
+            logger.info(
+                "memory.judge.fallback", user_id=uid, best_sim=round(best_sim, 3),
+                mtype=memory_type, reason="llm_unavailable_or_parse_fail",
             )
-            logger.info("memory.updated", user_id=user_id, memory_id=best_id, sim=round(best_sim, 3), mtype=memory_type)
-            return best_id
+            # 降级用综合文本相似度（余弦偏低时 Jaccard 兜底，如"包含关系"场景）
+            fallback_sim = text_similarity(content, top[0][1][2]) if top else 0.0
+            if fallback_sim >= _FALLBACK_THRESHOLD:
+                return _versioned_replace(conn, uid, top[0][1], memory_type, content, department, meta, confidence, evidence, vec)
+            return _insert(conn, uid, memory_type, content, department, meta, confidence, evidence, vec)
 
-        # 2) 新增
-        cur = conn.execute(
-            """
-            INSERT INTO user_memories
-                (user_id, memory_type, content, department, metadata, confidence, evidence, embedding, created_at, updated_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, now(), now())
-            RETURNING id
-            """,
-            (uid, memory_type, content, department, json.dumps(meta, ensure_ascii=False),
-             confidence, evidence, vector_to_sql(vec)),
-        )
-        mid = cur.fetchone()[0]
-        logger.info("memory.added", user_id=user_id, memory_id=mid, mtype=memory_type, department=department)
-        return mid
+        event = decision.get("event") or "ADD"
+        relation = decision.get("relation") or "unrelated"
+        reason = decision.get("reason") or ""
+        target_id = decision.get("target_id")
+        valid_ids = {c["id"] for c in candidates}
+        meta["decision_reason"] = reason
+        meta["decided_by"] = "llm"
+
+        # ADD / unrelated：新增
+        if event == "ADD" or relation == "unrelated":
+            return _insert(conn, uid, memory_type, content, department, meta, confidence, evidence, vec)
+
+        # NONE / duplicate：只刷新旧条（不新增、不覆盖内容）
+        if event == "NONE":
+            if target_id in valid_ids:
+                return _refresh_old(conn, uid, target_id, meta, confidence, evidence)
+            return _insert(conn, uid, memory_type, content, department, meta, confidence, evidence, vec)
+
+        # UPDATE / MERGE：版本化（旧条 superseded + 插入新条）
+        if target_id in valid_ids:
+            new_content = (decision.get("new_content") or "").strip() or content
+            return _versioned_replace(conn, uid, next(r for _, r in top if r[0] == target_id),
+                                      memory_type, new_content, department, meta, confidence, evidence, vec)
+
+        # target_id 非法：保守新增
+        logger.warning("memory.judge.bad_target", user_id=uid, target_id=target_id, mtype=memory_type)
+        return _insert(conn, uid, memory_type, content, department, meta, confidence, evidence, vec)
+
+
+def _insert(conn, uid: int, mtype: str, content: str, department: Optional[str],
+            meta: dict, confidence: Optional[float], evidence: Optional[str], vec: list[float]) -> int:
+    """插入新记忆（memory.added）。"""
+    cur = conn.execute(
+        """
+        INSERT INTO user_memories
+            (user_id, memory_type, content, department, metadata, confidence, evidence, embedding, created_at, updated_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, now(), now())
+        RETURNING id
+        """,
+        (uid, mtype, content, department, json.dumps(meta, ensure_ascii=False),
+         confidence, evidence, vector_to_sql(vec)),
+    )
+    mid = cur.fetchone()[0]
+    logger.info("memory.added", user_id=uid, memory_id=mid, mtype=mtype, department=department)
+    return mid
+
+
+def _refresh_old(conn, uid: int, mid: int, meta: dict,
+                 confidence: Optional[float], evidence: Optional[str]) -> int:
+    """duplicate：不新增、不覆盖内容，只刷新旧条 evidence/confidence/决策痕迹。"""
+    conn.execute(
+        """
+        UPDATE user_memories
+        SET confidence = COALESCE(%s, confidence),
+            evidence = COALESCE(%s, evidence),
+            metadata = metadata || %s::jsonb,
+            updated_at = now()
+        WHERE id = %s
+        """,
+        (confidence, evidence, json.dumps(meta, ensure_ascii=False), mid),
+    )
+    logger.info("memory.refreshed", user_id=uid, memory_id=mid, evidence=bool(evidence), confidence=confidence)
+    return mid
+
+
+def _versioned_replace(conn, uid: int, old_row, mtype: str, new_content: str, department: Optional[str],
+                       meta: dict, confidence: Optional[float], evidence: Optional[str], vec: list[float]) -> int:
+    """UPDATE/MERGE：旧条 superseded（版本链），插入新条。不物理删除、不原地覆盖。"""
+    old_id, old_content = old_row[0], old_row[2]
+    # 先插新条，拿到新 id 写回旧条的 superseded_by_id
+    cur = conn.execute(
+        """
+        INSERT INTO user_memories
+            (user_id, memory_type, content, department, metadata, confidence, evidence, embedding, created_at, updated_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, now(), now())
+        RETURNING id
+        """,
+        (uid, mtype, new_content, department, json.dumps(meta, ensure_ascii=False),
+         confidence, evidence, vector_to_sql(vec)),
+    )
+    new_id = cur.fetchone()[0]
+    conn.execute(
+        """
+        UPDATE user_memories
+        SET superseded_at = now(),
+            metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{superseded_by_id}', %s::jsonb)
+        WHERE id = %s
+        """,
+        (str(new_id), old_id),
+    )
+    logger.info(
+        "memory.superseded", user_id=uid, old_id=old_id, new_id=new_id,
+        mtype=mtype, old=old_content[:40], new=new_content[:40],
+    )
+    return new_id
 
 
 # ---------------------------------------------------------------------------
@@ -161,7 +267,7 @@ def list_memories(user_id: str, memory_type: Optional[str] = None) -> list[dict[
     uid = resolve_user_id(user_id)
     with connect() as conn:
         sql = (
-            "SELECT id, memory_type, content, department, confidence, evidence, created_at, updated_at "
+            "SELECT id, memory_type, content, department, confidence, evidence, created_at, updated_at, metadata "
             "FROM user_memories WHERE user_id = %s AND superseded_at IS NULL ORDER BY updated_at DESC"
         )
         params: list[Any] = [uid]
@@ -179,6 +285,7 @@ def list_memories(user_id: str, memory_type: Optional[str] = None) -> list[dict[
             "evidence": r[5],
             "created_at": str(r[6]),
             "updated_at": str(r[7]),
+            "metadata": r[8] or {},
         }
         for r in rows
     ]

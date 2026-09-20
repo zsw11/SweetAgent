@@ -297,6 +297,7 @@ graph LR
 - **API**：FastAPI `/health` + `/chat`（POST，Pydantic 模型，返回完整结构化结果）
 - **Checkpoint**：`app/memory/checkpoint.py` 已实现 PostgresSaver 持久化（主图 compile(checkpointer) + thread_id config），checkpoints / checkpoint_writes 落库验证通过，`get_state` 可恢复（为第 11 项 Interrupt 打基础）
 - **长期记忆**：`app/memory/*` 已实现——结构化三表（画像/偏好/业务规则）+ user_memories（非结构化向量记忆）+ 两级触发提取 + 分层注入（Manager 用户级 / 部门部门级）+ 记忆管理 API（GET/DELETE /memory、POST /memory/extract）；模拟向量（确定性哈希伪向量），knowledge_chunks 已重灌
+- **企业知识库 RAG**（2026-09-20 真闭环）：`app/knowledge/*` 四件套——chunker（段落优先+窗口重叠）/ embedder（真实模型与 mock 一键切换+失败自动降级）/ retriever（PGVector 余弦 top-k + metadata 过滤 + 关键词兜底混合检索）/ ingest（title 幂等先删后建）；四部门数据域白名单新增 `knowledge`（RAG 检索，不生成 SQL）；种子 11 篇 33 chunks（O/F/L/P/company 五域），关键数字与数据埋点对齐
 - **验证命令**（统一入口，不再用 verify_operation.py）：
   ```
   .venv\Scripts\python scripts\verify_pipeline.py "分析 SweetNight 品牌美国市场过去90天的销售和利润状况"
@@ -321,12 +322,14 @@ graph LR
 - [x] ~~8. Product Agent~~（2026-09-19 完成，四部门闭环 + 跨部门上下文注入 + 知识库检索）
 - [x] ~~10. Checkpoint / PostgresSaver 持久化（Phase 6，支持中断恢复）~~（2026-09-19 完成，端到端验证通过）
 - [x] ~~10a. 长期记忆（结构化 user_profiles/preferences/business_preferences + 非结构化 user_memories + 分层注入）~~（2026-09-19 完成，设计文档 34-35 节）
-- [ ] 11. Interrupt / Human-in-the-loop（Phase 7，参数不明确时暂停询问）
+- [ ] 11. Interrupt / Human-in-the-loop（Phase 7，参数不明确时暂停询问）--暂时不做
 - [ ] 12. Web UI（Phase 9，Streamlit MVP 或 Next.js）
 - [ ] **13. Agent 评估体系（重点！决定能否上线）** —— 详见上方「三点六」小节
 - [ ] **14. LangSmith 接入（Agent trace 可视化 + Prompt 版本管理 + 评估）** —— 替代 agent_steps/agent_tool_calls/agent_errors 手动记录；保留 agent_runs/agent_results 业务表
-- [ ] 15. 记忆去重阈值优化（2026-09-20 讨论确认方案 B+C 未实现）——按 memory_type 差异化阈值（preference 0.5 / fact·rule 0.6 / conclusion 0.7）+ 替代前比较新旧 confidence（高才覆盖）；见考点二十一
+- [x] ~~15. 记忆去重阈值优化~~（2026-09-20 完成）——方案 B+C（差异化阈值+置信度门控）实现后被**LLM 裁判模式**取代（相似度只召回、LLM 决策 ADD/NONE/UPDATE/MERGE、版本化 superseded），见考点二十一、二十二
 - [ ] 16. 记忆变更日志表（memory_change_log: user_id/table/key/old_value/new_value/changed_at）——结构化 key-value 被覆盖的旧值不保留，历史追溯需独立审计表
+- [x] ~~17. 企业知识库 RAG 真闭环（chunker/embedder/retriever/ingest + 四部门 knowledge 域接入 + 种子文档）~~（2026-09-20 完成，设计文档 35-38 节）- [x] ~~17a. 摄入幂等升级：content_hash 变更检测~~（2026-09-21 完成——documents 加 content_hash 列，同 title 同哈希跳过重建、不同哈希才重建；实测重跑 0 重建 / 11 跳过，verify_rag 8/8 无退化）
+- [ ] **18. 知识库版本键并存（演进 B，暂不做，已记录）**：唯一键从 title 改为 (title, department, brand, market, version)，同 title 不同版本并存、历史可查（审计"当时规定是什么"）；检索 ORDER BY version DESC LIMIT 1 取最新；version 字段当前仍是预留（只展示、无逻辑）。content_hash 变更检测已实现，此演进与其互补：同 title 同哈希跳过、不同哈希按 version 并存而非覆盖
 
 ---
 
@@ -976,41 +979,178 @@ class GlobalState(TypedDict, total=False):
 ### 考点二十一：记忆去重——怎么判断"这条记忆和库里的同主题"？该不该替代旧条？
 
 **面试官怎么问**：用户历史说过类似的话，你的记忆系统怎么去重？怎么判断两条记忆是不是同一个意思？会不会误删/误覆盖？阈值怎么定？
+**实现方案 看这个**:
+写入 → 召回 top-5（余弦相似度）
+     → 最高 sim ≤ 0.5 → 直接 ADD（不调 LLM）
+     → sim > 0.5 → LLM 裁判输出 event：
+          ADD（无关）/ NONE（重复，只刷新旧条 evidence）/ UPDATE（冲突且新置信度高）
+          / MERGE（补充，合并文本）
+     → UPDATE/MERGE = 旧条 superseded_at=now() + metadata 记 superseded_by_id + 插入新条
+     → 无 LLM 降级：sim ≥ 0.7 版本化更新，否则 ADD
 
-**设计（本项目真实实现 + 实测暴露的困境）**：
+**~~设计（本项目真实实现 + 实测暴露的困境）~~**：
 
-1. **判定机制**（add_memory 写入时）：
-   - 取该用户**最近 50 条未取代记忆**（性能取舍，不全文扫描）
-   - 逐条算 `text_similarity = max(向量余弦, 字符3-gram Jaccard)`
-   - `best_sim ≥ 阈值` → 同主题 → **覆盖旧条**（content/department/metadata/confidence/evidence 全量 latest-wins，created_at 保留、updated_at 刷新）
-   - `< 阈值` → 新增一条
-2. **为什么双度量取 max**：模拟向量（字符 3-gram 哈希）对"包含关系"文本（A 是 B 的子串扩展）余弦偏低；Jaccard 直接度量字符重叠率，互补更稳
-3. **实测数据**（0.7 阈值，2026-09-20）：
-   | 场景 | 综合相似度 | 0.7 判定 |
-   |---|---|---|
-   | 完全重复 | 1.0 | 替代 ✓ |
-   | 同主题改写（"喜欢看中文报告"→"更喜欢"） | 0.625 | 新增 ⚠️ |
-   | 包含关系（"美国市场运营"→"+关注利润率"） | 0.444 | 新增 |
-   | 否定句（"喜欢英语"→"不喜欢"） | 0.400 | 新增 |
-   | 不同主题（"英语"→"数学"） | 0.000 | 新增 ✓ |
-4. **暴露的阈值困境**：
-   - 阈值 0.7 太高 → 同主题改写 0.625 不去重，**记忆重复膨胀**（去重失效）
-   - 降到 0.5 → "同模板不同值"（"以后都看退款率报告"vs"以后都看利润率报告"≈0.6）**误替代**，且当前覆盖是**直接覆盖、旧内容不保留**——误判即永久丢失
-5. **确认的方案（未实现，待办 15）**：
-   - B：按 memory_type 差异化阈值——preference（用户反复表述高频）0.5 / fact·rule 0.6 / conclusion（结论本就随轮次变化）0.7
-   - C：替代前比较新旧 confidence——新提取置信度显著更高才覆盖，低则保留旧条（防"新提取质量差覆盖好记忆"）
-   - 历史兜底：待办 16 变更日志表（结构化/非结构化被覆盖的旧值可追溯）
+    1. **判定机制**（add_memory 写入时）：
+       - 取该用户**最近 50 条未取代记忆**（性能取舍，不全文扫描）
+       - 逐条算 `text_similarity = max(向量余弦, 字符3-gram Jaccard)`
+       - `best_sim ≥ 阈值` → 同主题 → **覆盖旧条**（content/department/metadata/confidence/evidence 全量 latest-wins，created_at 保留、updated_at 刷新）
+       - `< 阈值` → 新增一条
+       2. **为什么双度量取 max**：模拟向量（字符 3-gram 哈希）对"包含关系"文本（A 是 B 的子串扩展）余弦偏低；Jaccard 直接度量字符重叠率，互补更稳
+       3. **实测数据**（0.7 阈值，2026-09-20）：
+       | 场景 | 综合相似度 | 0.7 判定 |
+       |---|---|---|
+       | 完全重复 | 1.0 | 替代 ✓ |
+       | 同主题改写（"喜欢看中文报告"→"更喜欢"） | 0.625 | 新增 ⚠️ |
+       | 包含关系（"美国市场运营"→"+关注利润率"） | 0.444 | 新增 |
+       | 否定句（"喜欢英语"→"不喜欢"） | 0.400 | 新增 |
+       | 不同主题（"英语"→"数学"） | 0.000 | 新增 ✓ |
+       4. **暴露的阈值困境**：
+       - 阈值 0.7 太高 → 同主题改写 0.625 不去重，**记忆重复膨胀**（去重失效）
+       - 降到 0.5 → "同模板不同值"（"以后都看退款率报告"vs"以后都看利润率报告"≈0.6）**误替代**，且当前覆盖是**直接覆盖、旧内容不保留**——误判即永久丢失
+       5. **确认的方案（未实现，待办 15）**：
+       - B：按 memory_type 差异化阈值——preference（用户反复表述高频）0.5 / fact·rule 0.6 / conclusion（结论本就随轮次变化）0.7
+       - C：替代前比较新旧 confidence——新提取置信度显著更高才覆盖，低则保留旧条（防"新提取质量差覆盖好记忆"）
+       - 历史兜底：待办 16 变更日志表（结构化/非结构化被覆盖的旧值可追溯）
+    
+    **为什么这样设计**：
+    - **为什么不是 memory_type 相同就算同主题**：type 是约束强度分类（偏好/事实/结论），"两个 fact"可能是完全不同的事实——同主题必须看内容语义
+      - **为什么不用真向量也敢上线**：模拟向量是确定性哈希，相同文本=相同向量、重叠文本=接近——对"重复表达"场景够用；真模型只换 mock_embedding 一个函数
+      - **为什么替代要保 created_at 不保旧内容**：created_at（首建时间）是低成本高价值（审计"这条多久了"）；旧内容保留 = 版本表，成本高，走独立变更日志更干净
+      - **为什么否定句要小心**：Jaccard 度量字符重叠，不度量语义对立——"喜欢"vs"不喜欢"重叠高，真模型也未必分得清，宁可并存（各存一条）不冒险覆盖
+    
+    **备选方案**：a) 单一低阈值（简单但误覆盖风险）；b) 向量库自带的 upsert 语义（如 pgvector 的 <#> 距离 + 阈值，本质相同）；c) 冲突时人工确认（Interrupt，待办 11）——最适合高价值记忆。
+    
+    **核心一句话**：记忆去重 = "最近 50 条 + max(余弦, n-gram Jaccard) ≥ 阈值"判定同主题，替代是全量覆盖；核心矛盾是**阈值两难**（高则去重失效、低则误覆盖）——解法是**按 memory_type 差异化阈值 + 替代前比置信度 + 变更日志兜底历史**。
+
+
+---
+
+### 考点二十二：为什么放弃"阈值决策"，改用 LLM 裁判？——相似度只召回、决策交给 LLM
+
+**面试官怎么问**：记忆去重阈值怎么定？0.5 还是 0.7？误覆盖怎么办？线上产品（Mem0/LangMem/ChatGPT Memory）怎么做的？
+
+**设计（本项目 2026-09-20 重构，真实实现）**：
+
+1. **核心原则**（参考 Mem0 / LangMem / Zep）：**相似度只负责召回候选，是否替代由 LLM 判断语义关系**。阈值只当"召回门槛"，不当"生死线"——拍 0.5 还是 0.7 的困境直接消失
+2. **写入流程**（add_memory）：
+   ```
+   新记忆 → 余弦相似度召回 top-5 未取代记忆
+        → 规则前置：内容完全相同 → NONE 刷新（不调 LLM，确定性）
+        → 召回门槛：最高 sim ≤ 0.25 → 直接 ADD（零 LLM 成本）
+        → LLM 裁判（top-5 一次调用）输出 relation/event：
+             unrelated → ADD / duplicate → NONE（只刷新旧条 evidence）
+             supplement → MERGE（合并文本） / conflict·negation → UPDATE 或 NONE
+        → 版本化执行：UPDATE/MERGE 不原地覆盖——
+           旧条 superseded_at=now() + metadata.superseded_by_id=新id + 插入新条（版本链 m1→m2→m3）
+        → 决策痕迹写 metadata（decision_reason/decided_by）
+   ```
+
+3. **降级**：LLM 不可用/解析失败 → 综合相似度（max 余弦, n-gram Jaccard）≥ 0.7 版本化更新，否则 ADD——无 LLM 也能跑
+4. **成本控制**：sim ≤ 0.25 不问（明显无关）；top-5 一次调用（不逐条问）；规则前置零成本；deepseek-chat 小模型裁判
 
 **为什么这样设计**：
-- **为什么不是 memory_type 相同就算同主题**：type 是约束强度分类（偏好/事实/结论），"两个 fact"可能是完全不同的事实——同主题必须看内容语义
-- **为什么不用真向量也敢上线**：模拟向量是确定性哈希，相同文本=相同向量、重叠文本=接近——对"重复表达"场景够用；真模型只换 mock_embedding 一个函数
-- **为什么替代要保 created_at 不保旧内容**：created_at（首建时间）是低成本高价值（审计"这条多久了"）；旧内容保留 = 版本表，成本高，走独立变更日志更干净
-- **为什么否定句要小心**：Jaccard 度量字符重叠，不度量语义对立——"喜欢"vs"不喜欢"重叠高，真模型也未必分得清，宁可并存（各存一条）不冒险覆盖
+- **阈值两难无解**：实测同主题改写 0.615、包含关系 0.44、否定句 0.40——任何单一阈值都会误判（0.7 不去重、0.5 误覆盖）。LLM 判断的是**语义关系**（"更喜欢 X" 是 duplicate、"不再负责 X" 是 conflict），不是字符重叠
+- **为什么先上规则再上 LLM**：完全相同文本 100% 是 duplicate，规则判定零成本且稳定；LLM 对多候选偶尔不稳定（实测完全相同文本被误判 ADD 一次）——**规则优先、LLM 兜底**，最便宜最稳的先跑
+- **为什么版本化而不是覆盖**：旧值不物理删除（superseded_at），版本链可追溯——误判可回滚，这也是"线上不丢数据"原则；superseded_by_id 放 metadata（零表结构改动，最小方案）
+- **召回门槛 0.25 的依据**：语义变更"负责美国市场运营"→"不再负责…转负责欧洲市场" 余弦只有 0.30——门槛太高会漏掉语义变更（进不了裁判就永远 ADD）；完全无关文本 sim≈0 不会误触发
+- **降级为什么用 max(余弦, Jaccard)**：召回排序用余弦（向量语义），但"包含关系"文本（A 是 B 子串扩展）余弦偏低（0.38）、Jaccard 高（0.75）——降级判断两者取 max，避免无 LLM 时把同主题当成新增
 
-**备选方案**：a) 单一低阈值（简单但误覆盖风险）；b) 向量库自带的 upsert 语义（如 pgvector 的 <#> 距离 + 阈值，本质相同）；c) 冲突时人工确认（Interrupt，待办 11）——最适合高价值记忆。
+**踩过的坑（面试加分）**：
+- candidates 构建索引 bug：`r[1]` 是 memory_type **字符串**，再 `[0]/[1]/[2]` 变成字符切片（content='c'），导致规则前置永不命中、LLM 收到乱码候选——排查方法：手动重现召回逻辑打印候选，发现 content='c'
+- 召回用余弦 vs 降级用综合：两者不一致会导致降级路径行为偏离（余弦 0.38 < 0.7 误判新增）
 
-**核心一句话**：记忆去重 = "最近 50 条 + max(余弦, n-gram Jaccard) ≥ 阈值"判定同主题，替代是全量覆盖；核心矛盾是**阈值两难**（高则去重失效、低则误覆盖）——解法是**按 memory_type 差异化阈值 + 替代前比置信度 + 变更日志兜底历史**。
+**备选方案**：a) memory_events 决策日志表（审计/回滚/调参，本项目因"最小改动"暂缓，痕迹记 metadata）；b) slot_key/polarity 结构化槽位（能抽槽的走结构化、抽不出的走 LLM 裁判）；c) 真向量模型（替换 mock_embedding 一个函数，召回质量提升——语义变更检测依赖它）
 
+**核心一句话**：记忆去重不做"阈值生死判决"——**相似度只召回 top-5，LLM 判 ADD/NONE/UPDATE/MERGE，替代走 superseded 版本链不覆盖**；规则前置（完全相同）零成本兜底，无 LLM 降级到综合相似度；表结构零改动（决策痕迹和版本链放 metadata）。
+
+
+
+---
+
+### 考点二十二：RAG 检索——embedding 是什么？企业知识库 RAG 怎么做真闭环？（2026-09-20 新增）
+
+**面试官怎么问**：
+- embedding 是什么？为什么文本能算相似度？
+- RAG 全链路有哪些环节？你们系统怎么落地？
+- 向量检索和关键词检索怎么选？混合检索怎么做？
+- 没配 embedding 模型 Key 时怎么保证全链路可跑？
+
+**我们怎么设计**（`app/knowledge/` 四件套 + 部门接入）：
+- **chunker**：段落优先（空行分隔=天然语义单元），超长段落固定窗口 500 字 + 重叠 50 字——避免知识点被拦腰截断导致召回上下文残缺
+- **embedder**：统一接口 `embed_batch(texts)`——Key 有效用真实模型（text-embedding-3-small，1536 维与表结构一致），占位/无效 Key 或真实调用失败自动降级 mock_embedding（确定性哈希伪向量，同文本=同向量）；降级状态进程内缓存，失败一次后零成本
+- **retriever**：PGVector 余弦距离（`embedding <=> %s::vector`，相似度=1-距离）+ metadata 过滤（department/brand/market/document_type，JOIN documents 权威字段，SQL 层压缩 top-k）+ 混合检索——向量最高分 < min_score(0.20) 触发关键词兜底（英文连续词 + 中文 2-gram 提取，按命中词数降序）
+- **ingest**：文档 → 切分 → 向量化 → 写 documents/chunks/embeddings（model/dimension 写库可追溯），按 title 幂等先删后建（CASCADE 清旧）；种子 11 篇 33 chunks 覆盖 O/F/L/P/company 五域
+- **部门接入**：基类 `KNOWLEDGE_DEPARTMENT` + `_query_knowledge()`，数据域白名单加 `knowledge`（四部门），plan 阶段 LLM 自主决定是否查知识库，knowledge 域走 RAG 而非 SQL 生成；Product 的 market 域（文档清单）与 knowledge 域（内容检索）职责分离
+
+**为什么这么做**：
+- **embedding 的本质**：把文本映射成数字向量，语义相近 → 向量距离近；让"检索"从字符匹配升级为语义匹配（"床垫市场"和"床垫行业趋势"能互相召回）
+- **为什么段落优先 + 窗口重叠**：段落是语义单元（召回质量高），窗口保证长度可控（token 成本），重叠兜住跨段知识点
+- **为什么 JOIN documents 过滤而不是 chunks.metadata**：department/brand/market 在 documents 是权威字段（单一事实来源），metadata 只是冗余快照
+- **为什么混合检索**：mock/弱向量对无关文本也可能有哈希碰撞噪声分，向量不可信时关键词兜底保证"知识库里明明有却召不回"不漏检
+- **为什么幂等按 title 先删后建**：种子脚本反复跑结果一致；embeddings 表与 chunks 解耦，模型升级可对比、可重灌
+
+**踩过的坑**：
+- `\w` 在 Python 匹配中文 → 整句中文被当成一个词 ILIKE 必然落空 → 中文按 2-gram 提取检索关键词
+- 关键词兜底 `ORDER BY id` 不按相关度 → 部分匹配旧文档排前 → 改为按命中词数降序
+- 部门 `self.executor` 是 SQL 生成工具函数（输入 sql 字符串）非执行器实例 → RAG 检索器自建只读执行器
+- 真实 embedding 调用 401（.env 占位 key）→ 启发式判定无效 Key + 失败降级缓存
+
+**核心一句话**：RAG = 把非结构化知识切成 chunk 向量化入库，提问时把问题向量化做余弦 top-k 召回，再把命中的原文片段注入 prompt——本质是给 LLM 装"外挂记忆"；落地关键是 embedding 接口可降级（无 Key 也能跑）+ 混合检索兜底（向量不可信时关键词补位）+ metadata 过滤（部门/市场隔离）。
+
+**增量·证据置信度分级与"无合适检索"出口（2026-09-20）**
+
+**面试官怎么问**：
+- 向量分不可信时，关键词检索就能信吗？
+- 检索质量差 / 没搜到东西时，怎么保证 LLM 不编造？
+- RAG 怎么防幻觉？业界有什么做法（Self-RAG / 弃权）？
+
+**我们怎么设计**（用户拍板"最小改动"实现）：
+- retriever 每条命中打置信度 `confidence`（high/medium/low）：vector 按相似度 ≥0.60 high / 0.30~0.60 medium / <0.30 low；keyword 按命中词数 ≥3 high / 2 medium / 1 low
+- `search()` 双通道都不可信（向量 top1 < min_score 且关键词 0 命中）→ **显式返回空列表**，不再硬塞低分噪声结果——日志打 `knowledge.retrieve.none`（reason=both_channels_unreliable）
+- `_query_knowledge()` 透传整体 confidence：hits 非空取最高分档位，空 → `"none"`；rows 每行也带 confidence
+- `_analyze()` 动态规则：observations 含 knowledge 且 confidence=none → system prompt 追加「知识库未收录相关内容，必须如实说明，禁止编造或猜测知识库规则内容」
+- 关键词提取加固：2-gram 含虚词（与/于/在/的/了/是/也/和/或/及…）直接过滤（跨界垃圾词「货与」「与预」不占名额），关键词名额 5→8
+
+**为什么这么做**：
+- **关键词同样会错（用户质疑的实证）**：query 含"跨境电商"四字就可能误召回运营文档——字面命中 ≠ 语义相关；命中数分级只能缓解、不能消除，治本靠真实 embedding / rerank（备选）
+- **兜底的意义不是"更可信"，而是"换可验证证据"**：向量分低=无法判断相关（黑盒估计）；关键词命中=字面确实包含（可解释事实）
+- **防幻觉的关键是把"无依据"显式化**：空列表时 LLM 会自由发挥编一句"检索结果为空"，但系统从没告诉它"该不该编"——confidence=none + 禁编造规则把"弃权/拒答"变成系统级信号（业界对应：Self-RAG 的 critique token、RAG abstention 弃权机制）
+- **"中/弱 → 不引用具体数字"暂不实现**：用户明确最小改动，只保留最致命的"无依据禁编造"；min_score 0.20 是 mock 向量下的经验值，换真实模型后需重新标定（备选）
+
+**踩过的坑**：垃圾 2-gram（存补/货与/与预）挤占关键词名额 → 命中数被低估（"库存补货与预警规则"只算出 2 词标 medium）→ 虚词过滤 + 名额放宽后 3 词标 high
+
+**核心一句话**：检索不可信时别硬给结果——证据分级（high/medium/low/none）透传下游，无依据时显式说"知识库未收录"，这是 RAG 防幻觉的最后一道闸；关键词兜底换来的只是"可解释的字面证据"，不是"更可信"。
+
+**增量·摄入幂等升级：content_hash 变更检测（2026-09-21）**
+
+**面试官怎么问**：重灌同 title 文档时，系统怎么知道内容变没变？version 字段有什么用？
+
+**我们怎么设计**：documents 表新增 content_hash（全文 SHA-256 指纹）。ingest 时先查同 title 旧行：
+- 同 title + 同哈希 → **跳过重建**（零成本幂等，实测重跑 0 重建 / 11 跳过）
+- 同 title + 不同哈希 → 先删后建（CASCADE 清旧 chunk），此时才真正"知道内容变了"
+- 无旧行 → 直接建
+
+**为什么这么做**：旧实现"同 title 无条件全量重建"——系统不比较内容，哪怕只差一个字也整篇重算，且 version 字段是死字段（只写入、无逻辑）。content_hash 让"变更检测"成为机制而非假设，同时省掉无变化文档的重复向量化。
+
+**遗留与演进**：version 仍是预留字段（未参与唯一键/检索）；演进 B（可选）为 (title, department, brand, market, version) 版本键 + 检索取最新版，实现"同 title 不同版本并存、历史可查"。
+
+**核心一句话**：幂等从"同 title 就重建"升级为"同 title 同内容跳过、同 title 不同内容才重建"——系统第一次真正"知道"文档改没改。
+
+## RAG 检索结果 判断方案设计：
+##  是向量 + 关键词一起判断吗？—— 不是，是 "降级式"（择一），混合检索
+
+当前 `search()` 的执行流（上图左列）：
+
+```
+① 向量检索（PGVector 余弦 top-5）
+② 最高分 ≥ 0.20？ ──是──→ 直接用向量结果
+       │否（不可信）
+③ 关键词检索（2-gram 拆词 + ILIKE top-3）
+④ 有命中？ ──是──→ 用关键词结果（替换向量结果）
+       │否
+⑤ 返回空 + confidence=none（下游禁止编造）
+```
+关键点：**两路不会同时返回、分数也不合并**—— 是 "向量不可信 → 换关键词" 的**二选一**，所以叫**降级式 fallback**。
 
 
 ---

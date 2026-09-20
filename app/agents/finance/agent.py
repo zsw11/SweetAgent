@@ -15,7 +15,7 @@ from app.observability.logging import get_logger
 
 logger = get_logger("finance_agent")
 
-_KNOWN_REQS: frozenset[str] = frozenset({"profit", "cost", "revenue", "refund", "platform_fee"})
+_KNOWN_REQS: frozenset[str] = frozenset({"profit", "cost", "revenue", "refund", "platform_fee", "knowledge"})
 
 
 class FinanceAgent(BaseDepartmentAgent):
@@ -26,6 +26,7 @@ class FinanceAgent(BaseDepartmentAgent):
     FALLBACK_REQ = "profit"
     PLAN_PROMPT = PLAN_PROMPT
     ANALYSIS_PROMPT = ANALYSIS_PROMPT
+    KNOWLEDGE_DEPARTMENT = "finance"
 
     PRIORITY_TABLES: dict[str, list[str]] = {
         "profit": ["mart_product_profit_daily", "profit_daily", "product_skus", "brands"],
@@ -33,6 +34,7 @@ class FinanceAgent(BaseDepartmentAgent):
         "revenue": ["revenue_daily", "financial_transactions", "stores"],
         "refund": ["refunds", "orders", "product_skus"],
         "platform_fee": ["platform_fees", "orders", "stores"],
+        "knowledge": ["knowledge_documents", "knowledge_chunks"],
     }
 
     KEYWORD_MAP: dict[str, str] = {
@@ -41,6 +43,7 @@ class FinanceAgent(BaseDepartmentAgent):
         "revenue": "revenue",
         "refund": "refund",
         "platform_fee": "fee",
+        "knowledge": "knowledge",
     }
 
     def _load_dictionary(self) -> str:
@@ -67,7 +70,8 @@ class FinanceAgent(BaseDepartmentAgent):
             "②时间分段用 date > (SELECT MAX(date) - 21 FROM 主表)；"
             "③两段天数不同，对比必须换算为日均（SUM(x)/COUNT(DISTINCT date)）；"
             "④利润表 mart_product_profit_daily 已含 revenue/product_cost/platform_fee/advertising_cost/"
-            "logistics_cost/refund_cost/gross_profit/contribution_profit/profit_margin，优先用此宽表。"
+            "logistics_cost/refund_cost/gross_profit/contribution_profit/profit_margin，优先用此宽表；"
+            "⑤财务口径（收入/贡献毛利/退款规则）用 knowledge 数据域（RAG 向量检索）。"
         )
         text = "\n".join(lines)
         logger.debug("finance.dictionary", text=text[:1500])

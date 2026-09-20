@@ -133,6 +133,12 @@ class BaseDepartmentAgent:
     PLAN_PROMPT: str = ""
     ANALYSIS_PROMPT: str = ""
 
+    # ---- RAG（可选覆盖） ----
+    # 知识库检索所属部门标签（检索时按 department 过滤）；
+    # 子类设置后，数据域白名单中的 "knowledge" 将走 RAG 向量检索而非 SQL 生成。
+    KNOWLEDGE_DEPARTMENT: Optional[str] = None
+    KNOWLEDGE_TOP_K: int = 5
+
     # ---- 可选覆盖 ----
     PLAN_SYSTEM: str = "你是部门分析 Agent 的规划器，只输出数据域名称列表。"
 
@@ -209,7 +215,12 @@ class BaseDepartmentAgent:
         return self.tools["generate_sql"](sub_task, context, model=self.model)
 
     def _query_one(self, req: str, task: str, context: dict[str, Any]) -> dict[str, Any]:
-        """执行一个数据需求：生成 SQL -> 校验 -> 执行；失败/空结果自动 repair。"""
+        """执行一个数据需求：生成 SQL -> 校验 -> 执行；失败/空结果自动 repair。
+
+        knowledge 数据域不走 SQL——RAG 向量检索（见 _query_knowledge）。
+        """
+        if req == "knowledge":
+            return self._query_knowledge(task)
         schema_ctx = self._build_schema_context(req, context)
         sql = self._generate_sql(req, task, schema_ctx)
         logger.debug(f"{self.AGENT_NAME}.query.sql", requirement=req, sql=sql)
@@ -243,6 +254,53 @@ class BaseDepartmentAgent:
         raise RuntimeError(f"需求 {req} 查询失败（{self.max_sql_retries} 次重试）: {last_err}")
 
     # ------------------------------------------------------------------
+    # RAG：知识库向量检索（knowledge 数据域）
+    # ------------------------------------------------------------------
+    def _query_knowledge(self, task: str) -> dict[str, Any]:
+        """RAG 检索：把任务原文向量化 → 检索本部门知识库 top-k。
+
+        返回与 SQL 查询一致的 observations 结构（columns/rows/row_count/duration_ms/sql），
+        下游 analyze 无需区分来源。
+        """
+        from app.knowledge.retriever import KnowledgeRetriever
+
+        # 注意：self.executor 是 SQL 生成工具函数（输入 sql 字符串），不是 ReadOnlyExecutor 实例，
+        # 因此这里不传 executor，让检索器自建只读执行器（agent_reader 角色）。
+        retriever = KnowledgeRetriever(top_k=self.KNOWLEDGE_TOP_K)
+        import time
+        start = time.perf_counter()
+        hits = retriever.search(task, department=self.KNOWLEDGE_DEPARTMENT)
+        duration_ms = int((time.perf_counter() - start) * 1000)
+        # 证据置信度：整体取最高分档位；完全无命中 → "none"（显式"无合适检索"信号，
+        # 下游 prompt 据此禁止编造知识库内容，见 _analyze 动态规则）
+        overall = hits[0]["confidence"] if hits else "none"
+        rows = [
+            {
+                "title": h["title"],
+                "source_type": h["source_type"],
+                "content": h["content"],
+                "similarity": h["similarity"],
+                "method": h.get("method", "vector"),
+                "confidence": h.get("confidence", "low"),
+            }
+            for h in hits
+        ]
+        logger.info(
+            f"{self.AGENT_NAME}.knowledge.retrieve",
+            department=self.KNOWLEDGE_DEPARTMENT, hits=len(rows),
+            confidence=overall, duration_ms=duration_ms,
+        )
+        return {
+            "requirement": "knowledge",
+            "columns": ["title", "source_type", "content", "similarity", "method", "confidence"],
+            "rows": rows,
+            "row_count": len(rows),
+            "duration_ms": duration_ms,
+            "confidence": overall,
+            "sql": f"rag:search(department={self.KNOWLEDGE_DEPARTMENT}, top_k={self.KNOWLEDGE_TOP_K})",
+        }
+
+    # ------------------------------------------------------------------
     # 通用：LLM 分析
     # ------------------------------------------------------------------
     def _analyze(self, task: str, observations: list[dict[str, Any]], context: Optional[dict[str, Any]] = None):
@@ -254,8 +312,16 @@ class BaseDepartmentAgent:
         raw = ""
         try:
             from langchain_core.messages import HumanMessage, SystemMessage
+            system_text = self.ANALYSIS_PROMPT.split("任务：")[0]
+            # 知识库检索无命中（confidence=none）时，显式告知 LLM：未收录就明说，禁止编造
+            if any(o.get("requirement") == "knowledge" and o.get("confidence") == "none"
+                   for o in observations):
+                system_text += (
+                    "\n\n[知识库检索规则] 本次任务中知识库检索未命中相关内容（confidence=none）。"
+                    "你必须如实说明“知识库未收录相关内容”，禁止编造或猜测知识库规则内容。"
+                )
             resp = self.model.invoke([
-                SystemMessage(content=self.ANALYSIS_PROMPT.split("任务：")[0]),
+                SystemMessage(content=system_text),
                 HumanMessage(content=self.ANALYSIS_PROMPT.format(
                     task=task,
                     result_json=json.dumps(observations, ensure_ascii=False, default=str),
