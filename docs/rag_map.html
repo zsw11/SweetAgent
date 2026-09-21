@@ -1,0 +1,69 @@
+<html style="margin:0;padding:0;">
+<title>RAG 梳理地图</title>
+<div style="width:100%;box-sizing:border-box;font-family:'Microsoft YaHei',system-ui,sans-serif;background:#f7f9fb;color:#1f2937;padding:18px;">
+  <div style="text-align:center;font-size:21px;font-weight:700;margin-bottom:2px;">RAG 梳理地图：三段论 × 关键决策</div>
+  <div style="text-align:center;font-size:13px;color:#6b7280;margin-bottom:14px;">一句话定义：把私域文档切成块 → 向量化入库 → 提问时按语义召回相关块 → 注入 LLM 生成答案（给 LLM 装"外挂记忆"）| 示意</div>
+
+  <div style="display:flex;flex-wrap:wrap;gap:12px;">
+
+    <!-- 阶段一：索引 -->
+    <div style="flex:1 1 31%;min-width:300px;background:#fff;border:1px solid #d1d5db;border-top:4px solid #0f766e;border-radius:10px;padding:12px;box-sizing:border-box;">
+      <div style="font-size:16px;font-weight:700;color:#0f766e;">阶段① 索引 Indexing<br><span style="font-size:12px;font-weight:400;color:#6b7280;">把知识搬进"可检索的仓库"</span></div>
+      <div style="margin-top:8px;display:flex;flex-direction:column;gap:8px;font-size:13px;">
+        <div style="background:#f0fdfa;border:1px solid #ccfbf1;border-radius:8px;padding:8px;">
+          <b>加载 → 切分</b><br>决策：切多碎？<br><span style="color:#0f766e;">本项目：段落优先（语义完整）+ 超长段落 500 字窗口 + 50 字重叠</span><br><span style="color:#6b7280;">为什么：太碎=上下文残缺，太大=噪声多</span>
+        </div>
+        <div style="background:#f0fdfa;border:1px solid #ccfbf1;border-radius:8px;padding:8px;">
+          <b>向量化</b><br>决策：用什么模型？多少维？<br><span style="color:#0f766e;">本项目：真实模型 text-embedding-3-small（1536 维）/ 无 Key 降级 mock</span><br><span style="color:#6b7280;">为什么：维度必须和表结构一致，模型可换接口不变</span>
+        </div>
+        <div style="background:#f0fdfa;border:1px solid #ccfbf1;border-radius:8px;padding:8px;">
+          <b>存储</b><br>决策：存哪？带什么？<br><span style="color:#0f766e;">本项目：pgvector（vector(1536)）+ documents/chunks/embeddings 三表</span><br><span style="color:#6b7280;">为什么：与业务库同库、事务一致、幂等重灌</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- 阶段二：检索 -->
+    <div style="flex:1 1 31%;min-width:300px;background:#fff;border:1px solid #d1d5db;border-top:4px solid #1d4ed8;border-radius:10px;padding:12px;box-sizing:border-box;">
+      <div style="font-size:16px;font-weight:700;color:#1d4ed8;">阶段② 检索 Retrieval<br><span style="font-size:12px;font-weight:400;color:#6b7280;">提问时把最相关的块捞出来</span></div>
+      <div style="margin-top:8px;display:flex;flex-direction:column;gap:8px;font-size:13px;">
+        <div style="background:#eff6ff;border:1px solid #dbeafe;border-radius:8px;padding:8px;">
+          <b>问题向量化 → 相似度</b><br>决策：用什么度量？<br><span style="color:#1d4ed8;">本项目：余弦相似度（`<=>` 算子，相似度=1-距离）</span><br><span style="color:#6b7280;">为什么：向量已归一化，余弦直观且是 pgvector 原生算子</span>
+        </div>
+        <div style="background:#eff6ff;border:1px solid #dbeafe;border-radius:8px;padding:8px;">
+          <b>过滤 + top-k</b><br>决策：怎么限定范围？取几条？<br><span style="color:#1d4ed8;">本项目：department 部门隔离（JOIN documents）+ top-k(5)</span><br><span style="color:#6b7280;">为什么：物流 Agent 永远只查物流知识，防跨部门污染</span>
+        </div>
+        <div style="background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;padding:8px;">
+          <b>混合兜底</b><br>决策：向量召回不可信怎么办？<br><span style="color:#b45309;">本项目：最高分 &lt; 0.20 → 关键词检索（中文 2-gram，按命中数排序）</span><br><span style="color:#6b7280;">为什么：向量质量差时保底不漏检（双通道）</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- 阶段三：生成 -->
+    <div style="flex:1 1 31%;min-width:300px;background:#fff;border:1px solid #d1d5db;border-top:4px solid #b45309;border-radius:10px;padding:12px;box-sizing:border-box;">
+      <div style="font-size:16px;font-weight:700;color:#b45309;">阶段③ 生成 Generation<br><span style="font-size:12px;font-weight:400;color:#6b7280;">把证据喂给 LLM 产出结论</span></div>
+      <div style="margin-top:8px;display:flex;flex-direction:column;gap:8px;font-size:13px;">
+        <div style="background:#fffbeb;border:1px solid #fde68a;border-radius:8px;padding:8px;">
+          <b>注入什么</b><br>决策：把什么喂给 LLM？<br><span style="color:#b45309;">本项目：title + content + similarity + method（命中来源可溯源）</span><br><span style="color:#6b7280;">为什么：只喂原文片段，不喂整库（token 成本 + 噪声）</span>
+        </div>
+        <div style="background:#fffbeb;border:1px solid #fde68a;border-radius:8px;padding:8px;">
+          <b>怎么和 SQL 共存</b><br>决策：RAG 结果如何进入分析流程？<br><span style="color:#b45309;">本项目：与 SQL 查询同构的 observations（columns/rows/...），analyze 无感</span><br><span style="color:#6b7280;">为什么：LLM 不用区分"这是查库来的还是检索来的"</span>
+        </div>
+        <div style="background:#fffbeb;border:1px solid #fde68a;border-radius:8px;padding:8px;">
+          <b>谁决定查</b><br>决策：每次都要查知识库吗？<br><span style="color:#b45309;">本项目：LLM plan 阶段自主选 knowledge 数据域（低成本 3ms）</span><br><span style="color:#6b7280;">为什么：问销售额不查知识库，问规则才查——省 token</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 进阶与评估 -->
+  <div style="margin-top:12px;background:#fff;border:1px solid #d1d5db;border-radius:10px;padding:12px 14px;box-sizing:border-box;">
+    <div style="font-size:15px;font-weight:700;color:#1f2937;margin-bottom:8px;">④ 进阶变体（知道即可，本项目未做）与评估</div>
+    <div style="display:flex;flex-wrap:wrap;gap:8px;font-size:13px;">
+      <div style="background:#f3f4f6;border:1px solid #e5e7eb;border-radius:8px;padding:6px 10px;">Query 改写（把口语问题转成检索友好表述）</div>
+      <div style="background:#f3f4f6;border:1px solid #e5e7eb;border-radius:8px;padding:6px 10px;">多路召回（向量 + 关键词并行，融合排序）</div>
+      <div style="background:#f3f4f6;border:1px solid #e5e7eb;border-radius:8px;padding:6px 10px;">Rerank 重排序（用精排模型重排 top-50）</div>
+      <div style="background:#f3f4f6;border:1px solid #e5e7eb;border-radius:8px;padding:6px 10px;">Agentic RAG（检索失败→改写→再检索的闭环）</div>
+      <div style="background:#ecfdf5;border:1px solid #a7f3d0;border-radius:8px;padding:6px 10px;"><b>本项目评估</b>：verify_rag.py 8/8——命中正确文档 / 部门过滤无泄漏 / 兜底生效</div>
+    </div>
+  </div>
+</div>

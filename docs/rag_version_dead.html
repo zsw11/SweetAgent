@@ -1,0 +1,51 @@
+<html style="margin:0;padding:0;">
+<title>系统不知道改没改内容：version 死字段与演进方案</title>
+<div style="width:100%;box-sizing:border-box;font-family:'Microsoft YaHei',system-ui,sans-serif;background:#f7f9fb;color:#1f2937;padding:18px;">
+  <div style="text-align:center;font-size:20px;font-weight:700;margin-bottom:2px;">两个诚实回答：系统不知道改了内容 + version 是死字段</div>
+  <div style="text-align:center;font-size:13px;color:#6b7280;margin-bottom:14px;">现状 vs 演进：version / 内容哈希该有的用法 | 示意</div>
+
+  <div style="display:flex;flex-wrap:wrap;gap:10px;">
+    <!-- 左：当前实现 -->
+    <div style="flex:1 1 47%;min-width:360px;background:#fff;border:1px solid #fca5a5;border-radius:10px;padding:12px;box-sizing:border-box;">
+      <div style="font-size:15px;font-weight:700;color:#b91c1c;margin-bottom:8px;">当前实现（真实代码）</div>
+      <div style="background:#fef2f2;border:1px solid #fee2e2;border-radius:8px;padding:8px 10px;font-size:13px;line-height:1.8;">
+        <b>① 系统不知道改了部分内容</b><br>
+        ingest 只认 title：<code>DELETE WHERE title=%s</code> → 全量重建<br>
+        <span style="color:#b91c1c;">不比较新旧内容，不看 version，<b>无条件重灌</b></span><br>
+        同 title 哪怕只差一个字 = 整篇重建；内容完全一样 = 也重建
+      </div>
+      <div style="background:#fef2f2;border:1px solid #fee2e2;border-radius:8px;padding:8px 10px;margin-top:8px;font-size:13px;line-height:1.8;">
+        <b>② version 字段是"死字段"</b><br>
+        INSERT 时写入（实测 doc#8='v2.4'、doc#10='v3.0'…）<br>
+        但：幂等键 = <b>只有 title</b>（不含 version）<br>
+        检索 = 不区分版本（active 过滤只看 status）<br>
+        <span style="color:#b91c1c;font-weight:700;">→ version 只被"存了"，没有任何代码逻辑用它</span>
+      </div>
+    </div>
+
+    <!-- 右：演进 -->
+    <div style="flex:1 1 49%;min-width:400px;display:flex;flex-direction:column;gap:8px;">
+      <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:10px;padding:10px 12px;box-sizing:border-box;">
+        <div style="font-size:14px;font-weight:700;color:#15803d;">演进 A · 内容哈希（让系统"知道改了内容"）</div>
+        <div style="font-size:12px;color:#374151;margin-top:4px;">
+          入库时对全文算 <code>sha256</code> 存 content_hash 列<br>
+          重灌时：同 title + <b>同哈希 → 跳过</b>（零成本幂等，不重建）<br>
+          同 title + <b>不同哈希 → 更新</b>（此时才真正"知道"内容变了）
+        </div>
+      </div>
+      <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:10px;padding:10px 12px;box-sizing:border-box;">
+        <div style="font-size:14px;font-weight:700;color:#15803d;">演进 B · version 参与唯一键（让 version 活起来）</div>
+        <div style="font-size:12px;color:#374151;margin-top:4px;">
+          唯一键改为 <code>(title, department, brand, market, version)</code><br>
+          → v2.4 / v3.0 <b>并存</b>，历史可查（审计"当时规定是什么"）<br>
+          检索 <code>ORDER BY version DESC LIMIT 1</code> 取最新<br>
+          变更时 version+1 → 版本演进有语义
+        </div>
+      </div>
+      <div style="background:#fffbeb;border:1px solid #fde68a;border-radius:10px;padding:10px 12px;box-sizing:border-box;font-size:12px;">
+        <b>当前 version 的价值只剩"展示"</b>：seed_docs 标了 v2.4 等版本号，作为元数据给人看；逻辑上没有任何字段依赖它。
+        它是<b>预留字段</b>——表结构有前瞻，ingest 逻辑没跟上。
+      </div>
+    </div>
+  </div>
+</div>

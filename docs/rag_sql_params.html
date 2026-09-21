@@ -1,0 +1,69 @@
+<html style="margin:0;padding:0;">
+<title>问题文本怎么进 SQL：向量参数与相似度范围</title>
+<div style="width:100%;box-sizing:border-box;font-family:'Microsoft YaHei',system-ui,sans-serif;background:#f7f9fb;color:#1f2937;padding:18px;">
+  <div style="text-align:center;font-size:20px;font-weight:700;margin-bottom:2px;">问题文本怎么进 SQL？相似度范围是多少？%s::vector 怎么理解？</div>
+  <div style="text-align:center;font-size:13px;color:#6b7280;margin-bottom:14px;">三问一图：向量参数流 + 距离/相似度映射 | 示意</div>
+
+  <!-- 上半：参数流 -->
+  <div style="background:#fff;border:1px solid #d1d5db;border-radius:10px;padding:12px 14px;box-sizing:border-box;margin-bottom:10px;">
+    <div style="font-size:15px;font-weight:700;color:#1d4ed8;margin-bottom:8px;">① 为什么 SQL 里看不到问题原文？——它先变成了向量</div>
+    <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;font-size:13px;">
+      <div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:8px 10px;">「公司的绩效制度是什么？」</div>
+      <div style="font-size:16px;color:#9ca3af;">→</div>
+      <div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:8px 10px;">embed_query()</div>
+      <div style="font-size:16px;color:#9ca3af;">→</div>
+      <div style="background:#fef2f2;border:1px solid #fca5a5;border-radius:8px;padding:8px 10px;font-family:Consolas,monospace;font-size:12px;">[0.001, 0.002, ...] 1536 维向量</div>
+      <div style="font-size:16px;color:#9ca3af;">→</div>
+      <div style="background:#fef2f2;border:1px solid #fca5a5;border-radius:8px;padding:8px 10px;font-family:Consolas,monospace;font-size:12px;">作为 %s 传给 SQL（param[0] / param[2]）</div>
+    </div>
+    <div style="background:#fffbeb;border:1px solid #fde68a;border-radius:8px;padding:8px 10px;margin-top:8px;font-size:12px;">
+      <b>核心</b>：向量检索比的是<b>向量距离</b>，不是文本本身——所以 SQL 里只有向量数组，没有问题文字。
+      对比：<b>关键词检索</b>（ILIKE）的 SQL 里就有原文词：<code>%绩效% %制度%</code>——因为 ILIKE 是字符匹配，必须用原文。
+    </div>
+  </div>
+
+  <!-- 中：相似度范围 -->
+  <div style="background:#fff;border:1px solid #d1d5db;border-radius:10px;padding:12px 14px;box-sizing:border-box;margin-bottom:10px;">
+    <div style="font-size:15px;font-weight:700;color:#1d4ed8;margin-bottom:8px;">② 相似度范围：余弦距离 [0,2] → 相似度 [-1,1]</div>
+    <div style="display:flex;flex-wrap:wrap;gap:10px;">
+      <div style="flex:1 1 55%;min-width:300px;">
+        <div style="display:flex;align-items:center;gap:2px;font-size:11px;color:#6b7280;font-family:Consolas,monospace;">
+          <div style="flex:1;text-align:left;">距离 = 0（完全相同）</div>
+          <div style="flex:1;text-align:center;">距离 = 1（正交/垂直）</div>
+          <div style="flex:1;text-align:right;">距离 = 2（完全相反）</div>
+        </div>
+        <div style="height:14px;background:linear-gradient(to right,#15803d 0%,#f59e0b 50%,#dc2626 100%);border-radius:7px;margin:2px 0;"></div>
+        <div style="display:flex;font-size:12px;font-family:Consolas,monospace;">
+          <div style="flex:1;text-align:left;color:#15803d;">sim = 1.0</div>
+          <div style="flex:1;text-align:center;color:#b45309;">sim = 0.0</div>
+          <div style="flex:1;text-align:right;color:#dc2626;">sim = -1.0</div>
+        </div>
+        <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:6px 8px;margin-top:6px;font-size:12px;">
+          公式：<code>similarity = 1 - (embedding1 <=> embedding2)</code><br>
+          实际文本场景：embedding 多取非负权重 → 相似度几乎都在 <b>[0, 1]</b>
+        </div>
+      </div>
+      <div style="flex:1 1 40%;min-width:280px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:8px 10px;font-size:12px;">
+        <b>实测分布（本项目）</b>：<br>
+        · mock 向量：无关文本也常有 0.02~0.16 碰撞噪声 → min_score=0.20 的意义所在<br>
+        · 真实 embedding：语义相关文本通常 0.5~0.9（"床垫市场" vs "床垫行业趋势" → 高分）<br>
+        · 关键词兜底行 similarity 恒为 1.0（字面完全匹配，_normalize 里写死）
+      </div>
+    </div>
+  </div>
+
+  <!-- 下：%s::vector 解析 -->
+  <div style="background:#fff;border:1px solid #d1d5db;border-radius:10px;padding:12px 14px;box-sizing:border-box;">
+    <div style="font-size:15px;font-weight:700;color:#1d4ed8;margin-bottom:8px;">③ %s::vector 怎么理解？</div>
+    <div style="font-size:13px;line-height:1.8;">
+      <code>c.embedding <=> %s::vector</code> 拆两半：
+      <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:8px 10px;margin-top:6px;">
+        <b>%s</b> = psycopg2 参数占位符（防 SQL 注入），运行时被 <code>vector_to_sql(qvec)</code> 生成的字符串替换：<code>'[0.001,0.002,...]'</code><br>
+        <b>::vector</b> = PostgreSQL <b>类型转换</b>（CAST 的语法糖），等价于 <code>CAST(%s AS vector)</code><br>
+        <b>为什么必须转</b>：<code>&lt;=&gt;</code> 算子要求两侧都是 vector 类型；参数进来是字符串，不转就报错：<br>
+        <code style="color:#b91c1c;">operator does not exist: vector &lt;=&gt; unknown</code>
+      </div>
+      <div style="margin-top:6px;color:#6b7280;font-size:12px;">一句话：<b>%s 是"值从哪来"，::vector 是"数据库把这个值当什么类型算"</b>——没有后者，余弦算子根本不认识这个参数。</div>
+    </div>
+  </div>
+</div>

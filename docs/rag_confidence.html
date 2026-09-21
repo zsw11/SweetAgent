@@ -1,0 +1,45 @@
+<html style="margin:0;padding:0;">
+<title>检索证据置信度分级与出口</title>
+<div style="width:100%;box-sizing:border-box;font-family:'Microsoft YaHei',system-ui,sans-serif;background:#f7f9fb;color:#1f2937;padding:18px;">
+  <div style="text-align:center;font-size:20px;font-weight:700;margin-bottom:2px;">改进设计：检索证据置信度分级（而不是"有/没有"二值）</div>
+  <div style="text-align:center;font-size:13px;color:#6b7280;margin-bottom:14px;">你的质疑 → 承认"没有合适检索"要成为一等公民 | 示意</div>
+
+  <!-- 当前实现的缺陷 -->
+  <div style="background:#fff;border:1px solid #fca5a5;border-left:5px solid #dc2626;border-radius:10px;padding:10px 14px;box-sizing:border-box;font-size:13px;margin-bottom:12px;">
+    <b style="color:#dc2626;">当前实现的问题</b>：search() 只返回"有结果 / 空列表"二值。空列表时 LLM 会自己写一句「知识库检索结果为空」——但这是 LLM 的自由发挥，<b>系统没有给它一个明确信号："这里没有可信依据，禁止编造"</b>。
+  </div>
+
+  <!-- 四级出口 -->
+  <div style="display:flex;flex-wrap:wrap;gap:10px;">
+    <div style="flex:1 1 22%;min-width:200px;background:#f0fdf4;border:1px solid #86efac;border-radius:10px;padding:10px;box-sizing:border-box;">
+      <div style="font-size:14px;font-weight:700;color:#15803d;">高 · 强证据</div>
+      <div style="font-size:12px;color:#4b5563;margin:6px 0;">向量高分（≥0.60）+ 关键词命中 ≥2 词 同时成立</div>
+      <div style="font-size:13px;font-weight:700;color:#15803d;background:#dcfce7;border-radius:6px;padding:6px;margin-top:6px;">下游：放心引用，可溯源</div>
+    </div>
+    <div style="flex:1 1 22%;min-width:200px;background:#fefce8;border:1px solid #fde047;border-radius:10px;padding:10px;box-sizing:border-box;">
+      <div style="font-size:14px;font-weight:700;color:#a16207;">中 · 弱证据</div>
+      <div style="font-size:12px;color:#4b5563;margin:6px 0;">关键词命中 2~3 词，或向量 0.30~0.60</div>
+      <div style="font-size:13px;font-weight:700;color:#a16207;background:#fef9c3;border-radius:6px;padding:6px;margin-top:6px;">下游：可参考方向，不引用具体数字</div>
+    </div>
+    <div style="flex:1 1 22%;min-width:200px;background:#fff7ed;border:1px solid #fdba74;border-radius:10px;padding:10px;box-sizing:border-box;">
+      <div style="font-size:14px;font-weight:700;color:#c2410c;">低 · 疑似噪声</div>
+      <div style="font-size:12px;color:#4b5563;margin:6px 0;">只命中 1 词，或向量 0.20~0.30</div>
+      <div style="font-size:13px;font-weight:700;color:#c2410c;background:#ffedd5;border-radius:6px;padding:6px;margin-top:6px;">下游：不引用，明确标注"未验证"</div>
+    </div>
+    <div style="flex:1 1 22%;min-width:200px;background:#fef2f2;border:1px solid #fca5a5;border-radius:10px;padding:10px;box-sizing:border-box;">
+      <div style="font-size:14px;font-weight:700;color:#b91c1c;">无 · 无合适检索</div>
+      <div style="font-size:12px;color:#4b5563;margin:6px 0;">关键词 0 命中（或命中词全为垃圾 2-gram）</div>
+      <div style="font-size:13px;font-weight:700;color:#b91c1c;background:#fee2e2;border-radius:6px;padding:6px;margin-top:6px;">下游：显式回答"知识库未收录"，禁止编造</div>
+    </div>
+  </div>
+
+  <!-- 两种不可信的本质差异 -->
+  <div style="margin-top:12px;background:#fff;border:1px solid #d1d5db;border-radius:10px;padding:10px 14px;box-sizing:border-box;font-size:13px;">
+    <b>为什么"关键词命中"仍然提供价值（即便它也会错）</b>：
+    <div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:8px;">
+      <div style="flex:1 1 46%;background:#eff6ff;border:1px solid #dbeafe;border-radius:8px;padding:8px;font-size:12px;color:#1e40af;"><b>向量分低</b> = "我无法判断相不相关"（黑盒估计，方向不明）</div>
+      <div style="flex:1 1 46%;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:8px;font-size:12px;color:#166534;"><b>关键词命中</b> = "字面确实包含这些词"（可验证的事实，虽不等于语义相关）</div>
+    </div>
+    <div style="margin-top:8px;color:#374151;">所以兜底的意义不是"更可信"，而是<b>换一个可解释、可验证的证据来源</b>——但它同样要接受置信度分级，命中数太少就该判"无"。</div>
+  </div>
+</div>

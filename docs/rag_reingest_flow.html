@@ -1,0 +1,56 @@
+<html style="margin:0;padding:0;">
+<title>同 title 部分内容不同：RAG 重灌处理链</title>
+<div style="width:100%;box-sizing:border-box;font-family:'Microsoft YaHei',system-ui,sans-serif;background:#f7f9fb;color:#1f2937;padding:18px;">
+  <div style="text-align:center;font-size:20px;font-weight:700;margin-bottom:2px;">同 title、部分内容不同 → 重灌时 RAG 的处理链</div>
+  <div style="text-align:center;font-size:13px;color:#6b7280;margin-bottom:14px;">以真实文档「库存预警与补货规则」（doc#13，3 chunks）为例 | 示意</div>
+
+  <!-- 三阶段 -->
+  <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:stretch;margin-bottom:10px;">
+    <!-- 阶段1 -->
+    <div style="flex:1 1 30%;min-width:280px;background:#fff;border:1px solid #d1d5db;border-radius:10px;padding:10px 12px;box-sizing:border-box;">
+      <div style="font-size:13px;font-weight:700;color:#374151;margin-bottom:6px;">① 重灌前（当前库）</div>
+      <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:8px;font-size:12px;font-family:Consolas,monospace;line-height:1.8;">
+        documents: doc#13 库存预警与补货规则<br>
+        chunks: chunk#51 / #52 / #53<br>
+        embeddings: 51 / 52 / 53（1536维）
+      </div>
+    </div>
+    <!-- 箭头 -->
+    <div style="display:flex;align-items:center;font-size:20px;color:#9ca3af;">→</div>
+    <!-- 阶段2 -->
+    <div style="flex:1 1 30%;min-width:280px;background:#fef2f2;border:1px solid #fca5a5;border-radius:10px;padding:10px 12px;box-sizing:border-box;">
+      <div style="font-size:13px;font-weight:700;color:#b91c1c;margin-bottom:6px;">② ingest_document（同 title）</div>
+      <div style="background:#fee2e2;border:1px solid #fecaca;border-radius:8px;padding:8px;font-size:12px;font-family:Consolas,monospace;line-height:1.8;">
+        DELETE WHERE title=...<br>
+        → <b style="color:#b91c1c;">CASCADE 删光</b> doc#13 + chunk#51/52/53 + 3 个 embedding<br>
+        <span style="color:#b91c1c;font-weight:700;">旧内容全部消失（含被改掉的段落）</span>
+      </div>
+    </div>
+    <!-- 箭头 -->
+    <div style="display:flex;align-items:center;font-size:20px;color:#9ca3af;">→</div>
+    <!-- 阶段3 -->
+    <div style="flex:1 1 30%;min-width:280px;background:#fff;border:1px solid #d1d5db;border-radius:10px;padding:10px 12px;box-sizing:border-box;">
+      <div style="font-size:13px;font-weight:700;color:#15803d;margin-bottom:6px;">③ 全量重建（只留新版）</div>
+      <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:8px;font-size:12px;font-family:Consolas,monospace;line-height:1.8;">
+        INSERT 新 doc（id 变成 #19）<br>
+        重新切分：<b>chunk 边界可能变</b>（3 个变 4 个，id 全新）<br>
+        重新向量化 → 新 embeddings（只有新向量）
+      </div>
+    </div>
+  </div>
+
+  <!-- 对 RAG 检索的影响 -->
+  <div style="background:#fff;border:1px solid #d1d5db;border-radius:10px;padding:10px 14px;box-sizing:border-box;font-size:13px;line-height:1.8;">
+    <b style="color:#1d4ed8;">重灌后 RAG 检索侧的影响</b>：
+    <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:6px;">
+      <span style="background:#eff6ff;color:#1e40af;border-radius:6px;padding:3px 8px;font-size:12px;">✓ 检索<b>只看到新版内容</b>，不会新旧混合</span>
+      <span style="background:#eff6ff;color:#1e40af;border-radius:6px;padding:3px 8px;font-size:12px;">✓ 新改的段落立即生效（改库即生效）</span>
+      <span style="background:#fef2f2;color:#b91c1c;border-radius:6px;padding:3px 8px;font-size:12px;">✗ 被删/被改的旧段落<b>从此不可检索</b>（旧版永久丢失）</span>
+      <span style="background:#fef2f2;color:#b91c1c;border-radius:6px;padding:3px 8px;font-size:12px;">✗ 旧 chunk_id 全部废弃，引用旧 chunk 的缓存/日志失效</span>
+      <span style="background:#fffbeb;color:#b45309;border-radius:6px;padding:3px 8px;font-size:12px;">⚠ 全量重算向量：重灌成本 = 全文重新切分 + 重新 embedding</span>
+    </div>
+    <div style="margin-top:6px;color:#6b7280;font-size:12px;">
+      本质：同 title 重灌 = <b>全量替换（upsert 语义）</b>，不是"合并差异"也不是"增量更新"——部分内容不同 → 整篇重建。
+    </div>
+  </div>
+</div>

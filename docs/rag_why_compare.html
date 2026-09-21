@@ -1,0 +1,64 @@
+<html style="margin:0;padding:0;">
+<title>为什么用 RAG：三方案对比</title>
+<div style="width:100%;box-sizing:border-box;font-family:'Microsoft YaHei',system-ui,sans-serif;background:#f7f9fb;color:#1f2937;padding:18px;">
+  <div style="text-align:center;font-size:20px;font-weight:700;margin-bottom:2px;">为什么用 RAG？——三种"让 LLM 知道私域知识"的方案对比</div>
+  <div style="text-align:center;font-size:13px;color:#6b7280;margin-bottom:14px;">RAG / 微调 / 长上下文 | 本项目选型依据（示意）</div>
+
+  <div style="display:flex;flex-wrap:wrap;gap:12px;">
+
+    <!-- RAG -->
+    <div style="flex:1 1 31%;min-width:290px;background:#fff;border:1px solid #0f766e;border-top:4px solid #0f766e;border-radius:10px;padding:12px;box-sizing:border-box;">
+      <div style="font-size:16px;font-weight:700;color:#0f766e;">RAG（本项目）✅</div>
+      <div style="font-size:12px;color:#6b7280;margin:4px 0 8px;">做法：按需检索相关片段 → 注入 prompt</div>
+      <div style="font-size:13px;line-height:1.6;">
+        <div><b>优点</b></div>
+        <div>· 知识实时更新（改库即可，SOP 从 v2.4 升 v3.2 不用重训）</div>
+        <div>· 答案可溯源（命中片段带 title/similarity/method）</div>
+        <div>· 成本低（只注入 top-5 块 ≈ 1750 token）</div>
+        <div>· 不改模型权重，零训练</div>
+        <div style="margin-top:6px;"><b>缺点</b></div>
+        <div>· 上限取决于检索质量（召不回 → 答不好）</div>
+        <div style="margin-top:8px;background:#f0fdfa;border-radius:6px;padding:6px;color:#0f766e;"><b>本项目选择</b>：知识高频迭代 + 要溯源 + 成本敏感 + 多部门隔离</div>
+      </div>
+    </div>
+
+    <!-- 微调 -->
+    <div style="flex:1 1 31%;min-width:290px;background:#fff;border:1px solid #d1d5db;border-top:4px solid #6b7280;border-radius:10px;padding:12px;box-sizing:border-box;">
+      <div style="font-size:16px;font-weight:700;color:#374151;">微调 Fine-tuning</div>
+      <div style="font-size:12px;color:#6b7280;margin:4px 0 8px;">做法：用数据改模型权重，知识"焊死"进参数</div>
+      <div style="font-size:13px;line-height:1.6;">
+        <div><b>优点</b></div>
+        <div>· 风格/行为固化（适合模仿特定口吻/格式）</div>
+        <div>· 推理时零检索依赖</div>
+        <div style="margin-top:6px;"><b>缺点</b></div>
+        <div>· 贵：数据标注 + 训练 + 推理成本</div>
+        <div>· 更新慢：知识变了要重新训练</div>
+        <div>· 灾难性遗忘：新知识挤掉旧能力</div>
+        <div>· 无法溯源（知识在权重里，答了说不清依据）</div>
+        <div style="margin-top:8px;background:#f3f4f6;border-radius:6px;padding:6px;color:#4b5563;"><b>适合</b>：改说话方式/输出格式，不是喂知识</div>
+      </div>
+    </div>
+
+    <!-- 长上下文 -->
+    <div style="flex:1 1 31%;min-width:290px;background:#fff;border:1px solid #d1d5db;border-top:4px solid #6b7280;border-radius:10px;padding:12px;box-sizing:border-box;">
+      <div style="font-size:16px;font-weight:700;color:#374151;">长上下文 Long-context</div>
+      <div style="font-size:12px;color:#6b7280;margin:4px 0 8px;">做法：把全部知识塞进一次 prompt</div>
+      <div style="font-size:13px;line-height:1.6;">
+        <div><b>优点</b></div>
+        <div>· 实现最简单</div>
+        <div>· 知识量小时效果好</div>
+        <div style="margin-top:6px;"><b>缺点</b></div>
+        <div>· token 成本线性爆炸（11 篇全塞 ≈ 2.3 万 token/次）</div>
+        <div>· 噪声稀释：无关片段干扰判断</div>
+        <div>· Lost in the middle：模型对中部内容注意力衰减，关键知识被"淹没"</div>
+        <div>· 知识库大了窗口装不下</div>
+        <div style="margin-top:8px;background:#f3f4f6;border-radius:6px;padding:6px;color:#4b5563;"><b>适合</b>：小知识集、一次性资料</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 底部结论 -->
+  <div style="margin-top:12px;background:#fff;border:1px solid #d1d5db;border-radius:10px;padding:10px 14px;box-sizing:border-box;font-size:13px;">
+    <b>结论一句话</b>：RAG 是"按需拿证据"——检索只取相关片段注入，兼顾<b>更新快 / 可溯源 / 成本低</b>；微调改的是"风格"不是"知识"，长上下文是"全量堆"注定稀释。本项目 11 篇知识高频迭代（SOP 版本号）、答案必须给依据、推理成本敏感 → 三者全中，选 RAG。
+  </div>
+</div>

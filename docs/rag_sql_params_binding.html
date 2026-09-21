@@ -1,0 +1,59 @@
+<html style="margin:0;padding:0;">
+<title>params 4 参数与 SQL 占位符的位置绑定</title>
+<div style="width:100%;box-sizing:border-box;font-family:'Microsoft YaHei',system-ui,sans-serif;background:#f7f9fb;color:#1f2937;padding:18px;">
+  <div style="text-align:center;font-size:20px;font-weight:700;margin-bottom:2px;">为什么 params 有 4 个参数？——SQL 里有 4 个 %s，位置一一对应</div>
+  <div style="text-align:center;font-size:13px;color:#6b7280;margin-bottom:14px;">psycopg2 按位置绑定（positional binding）：参数顺序必须和 %s 出现顺序完全一致 | 示意</div>
+
+  <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:stretch;">
+    <!-- 左：SQL -->
+    <div style="flex:1 1 55%;min-width:420px;background:#0f172a;border-radius:10px;padding:14px;box-sizing:border-box;">
+      <div style="color:#94a3b8;font-size:12px;margin-bottom:6px;">SQL（占位符按出现顺序编号）</div>
+      <div style="font-family:Consolas,monospace;font-size:12px;line-height:1.9;color:#e2e8f0;white-space:pre;">SELECT c.id, c.document_id, c.chunk_index, c.content,
+       d.title, d.source_type, d.department,
+       d.brand, d.market,
+       <span style="color:#fbbf24;font-weight:700;">1 - (c.embedding &lt;=&gt; ①%s::vector)</span> AS similarity
+FROM knowledge_chunks c
+JOIN knowledge_documents d ON d.id = c.document_id
+WHERE c.embedding IS NOT NULL
+  AND d.status = 'active'
+  AND d.department = <span style="color:#34d399;font-weight:700;">②%s</span>
+ORDER BY c.embedding &lt;=&gt; <span style="color:#f472b6;font-weight:700;">③%s::vector</span>
+LIMIT <span style="color:#60a5fa;font-weight:700;">④%s</span></div>
+    </div>
+
+    <!-- 右：params -->
+    <div style="flex:1 1 40%;min-width:330px;display:flex;flex-direction:column;gap:6px;">
+      <div style="color:#6b7280;font-size:12px;">params = [vector_to_sql(qvec), *params, vector_to_sql(qvec), top_k]</div>
+      <div style="background:#fff;border:1px solid #d1d5db;border-radius:8px;padding:8px 10px;font-size:12px;font-family:Consolas,monospace;">
+        <span style="color:#fbbf24;font-weight:700;">[0]</span> 向量A（1536维）　←→ ① SELECT 算相似度
+      </div>
+      <div style="background:#fff;border:1px solid #d1d5db;border-radius:8px;padding:8px 10px;font-size:12px;font-family:Consolas,monospace;">
+        <span style="color:#34d399;font-weight:700;">[1]</span> 'company'　　　←→ ② WHERE 部门过滤
+      </div>
+      <div style="background:#fff;border:1px solid #d1d5db;border-radius:8px;padding:8px 10px;font-size:12px;font-family:Consolas,monospace;">
+        <span style="color:#f472b6;font-weight:700;">[2]</span> 向量A（同一份）　←→ ③ ORDER BY 排序
+      </div>
+      <div style="background:#fff;border:1px solid #d1d5db;border-radius:8px;padding:8px 10px;font-size:12px;font-family:Consolas,monospace;">
+        <span style="color:#60a5fa;font-weight:700;">[3]</span> 5　　　　　　　←→ ④ LIMIT
+      </div>
+      <div style="background:#fffbeb;border:1px solid #fde68a;border-radius:8px;padding:8px 10px;font-size:12px;">
+        <b>注意</b>：如果还传了 brand/market/document_type，过滤条件会在中间依次展开（params 变 5/6/7 个），顺序依然严格对应 SQL 中 %s 的出现顺序。
+      </div>
+    </div>
+  </div>
+
+  <!-- 底部两个为什么 -->
+  <div style="display:flex;flex-wrap:wrap;gap:10px;margin-top:12px;">
+    <div style="flex:1 1 46%;min-width:320px;background:#fff;border:1px solid #d1d5db;border-radius:10px;padding:10px 12px;box-sizing:border-box;font-size:13px;">
+      <b style="color:#b45309;">为什么向量出现两次（① 和 ③）？</b><br>
+      ORDER BY <b>不能引用 SELECT 的别名</b>：写 <code>ORDER BY similarity</code> 会报错
+      <code style="color:#b91c1c;">column "similarity" does not exist</code>——排序必须重写完整表达式
+      <code>c.embedding &lt;=&gt; %s::vector</code>，自然要再传一次向量。这是 pgvector + 参数化的常见写法。
+    </div>
+    <div style="flex:1 1 46%;min-width:320px;background:#fff;border:1px solid #d1d5db;border-radius:10px;padding:10px 12px;box-sizing:border-box;font-size:13px;">
+      <b style="color:#15803d;">为什么用 %s 而不是字符串拼接？</b><br>
+      psycopg2 参数化自动处理转义 → <b>防 SQL 注入</b>（向量字符串/过滤值含特殊字符也不怕）；
+      拼接则存在注入风险。参数与占位符按位置匹配，不按名字。
+    </div>
+  </div>
+</div>

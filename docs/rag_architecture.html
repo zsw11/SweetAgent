@@ -1,0 +1,59 @@
+<html style="margin:0;padding:0;">
+<title>RAG 真闭环架构</title>
+<div style="width:100%;box-sizing:border-box;font-family:'Microsoft YaHei',system-ui,sans-serif;background:#f7f9fb;color:#1f2937;padding:18px;">
+  <div style="text-align:center;font-size:20px;font-weight:700;margin-bottom:4px;">企业知识库 RAG 真闭环</div>
+  <div style="text-align:center;font-size:13px;color:#6b7280;margin-bottom:14px;">文档摄入（构建期）→ 向量检索（推理期）→ 部门 Agent 注入 | 示意结构</div>
+
+  <!-- 两栏主区 -->
+  <div style="display:flex;flex-wrap:wrap;gap:14px;">
+
+    <!-- 左栏：离线摄入 -->
+    <div style="flex:1 1 46%;min-width:330px;background:#fff;border:1px solid #d1d5db;border-radius:10px;padding:14px;box-sizing:border-box;">
+      <div style="font-size:15px;font-weight:700;color:#0f766e;margin-bottom:10px;">① 离线摄入（构建期 · scripts/ingest_knowledge.py）</div>
+      <div style="display:flex;flex-direction:column;gap:6px;align-items:center;">
+        <div style="width:100%;background:#ecfdf5;border:1px solid #a7f3d0;border-radius:8px;padding:8px 10px;font-size:14px;"><b>seed_docs.py</b> 11 篇种子文档<br><span style="font-size:12px;color:#4b5563;">O/F/L/P/company 五域 · sections 结构化（标题+正文）</span></div>
+        <div style="font-size:16px;color:#9ca3af;">↓</div>
+        <div style="width:100%;background:#ecfdf5;border:1px solid #a7f3d0;border-radius:8px;padding:8px 10px;font-size:14px;"><b>chunker.py</b> 文档切分<br><span style="font-size:12px;color:#4b5563;">段落优先（空行分隔）· 超长段落 500 字窗口 + 50 字重叠</span></div>
+        <div style="font-size:16px;color:#9ca3af;">↓</div>
+        <div style="width:100%;background:#ecfdf5;border:1px solid #a7f3d0;border-radius:8px;padding:8px 10px;font-size:14px;"><b>embedder.py</b> 批量向量化<br><span style="font-size:12px;color:#4b5563;">Key 有效 → 真实模型 text-embedding-3-small（1536 维）<br>Key 无效/失败 → 自动降级 mock_embedding（同文本=同向量）</span></div>
+        <div style="font-size:16px;color:#9ca3af;">↓</div>
+        <div style="width:100%;background:#ecfdf5;border:1px solid #a7f3d0;border-radius:8px;padding:8px 10px;font-size:14px;"><b>ingest.py</b> 写入三表（按 title 幂等：先删后建）<br><span style="font-size:12px;color:#4b5563;">knowledge_documents（1 行）→ knowledge_chunks（33 行）→ knowledge_embeddings（33 行，model/dim 落库可追溯）</span></div>
+      </div>
+    </div>
+
+    <!-- 右栏：在线检索 -->
+    <div style="flex:1 1 46%;min-width:330px;background:#fff;border:1px solid #d1d5db;border-radius:10px;padding:14px;box-sizing:border-box;">
+      <div style="font-size:15px;font-weight:700;color:#1d4ed8;margin-bottom:10px;">② 在线检索（推理期 · 部门 Agent 内）</div>
+      <div style="display:flex;flex-direction:column;gap:6px;align-items:center;">
+        <div style="width:100%;background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:8px 10px;font-size:14px;"><b>用户问题</b>（如「库存补货预警规则是什么？」）<br><span style="font-size:12px;color:#4b5563;">LLM plan 阶段自主决定查知识库 → 数据域 knowledge</span></div>
+        <div style="font-size:16px;color:#9ca3af;">↓</div>
+        <div style="width:100%;background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:8px 10px;font-size:14px;"><b>retriever.search()</b> 混合检索<br><span style="font-size:12px;color:#4b5563;">query 向量化 → PGVector 余弦 top-k(5) + metadata 过滤（department 隔离）</span></div>
+        <div style="width:100%;background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;padding:6px 10px;font-size:13px;"><b>向量最高分 &lt; 0.20？</b> → 关键词兜底<br><span style="font-size:12px;color:#4b5563;">英文连续词 + 中文 2-gram 提取 · 按命中词数降序（保底不漏检）</span></div>
+        <div style="font-size:16px;color:#9ca3af;">↓</div>
+        <div style="width:100%;background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:8px 10px;font-size:14px;"><b>命中片段注入</b>（title / content / similarity / method）<br><span style="font-size:12px;color:#4b5563;">observations 结构与 SQL 查询同构 → analyze 阶段无需区分来源</span></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 部门接入条 -->
+  <div style="margin-top:14px;background:#fff;border:1px solid #d1d5db;border-radius:10px;padding:12px 14px;box-sizing:border-box;">
+    <div style="font-size:15px;font-weight:700;color:#b45309;margin-bottom:8px;">③ 部门接入（四部门共用基类 BaseDepartmentAgent）</div>
+    <div style="display:flex;flex-wrap:wrap;gap:8px;font-size:13px;">
+      <div style="background:#fef3c7;border:1px solid #fde68a;border-radius:8px;padding:6px 10px;"><b>类属性</b> KNOWLEDGE_DEPARTMENT（检索时按部门过滤）<br>KNOWN_REQS 加 <code>knowledge</code> · PRIORITY_TABLES 加 documents/chunks</div>
+      <div style="background:#fef3c7;border:1px solid #fde68a;border-radius:8px;padding:6px 10px;"><b>特判</b> _query_one 中 req=="knowledge" → 不生成 SQL，直接走 _query_knowledge()（RAG）</div>
+      <div style="background:#fef3c7;border:1px solid #fde68a;border-radius:8px;padding:6px 10px;"><b>结果归一</b> 返回 columns/rows/row_count/duration_ms/sql 与 SQL 查询一致</div>
+      <div style="background:#fef3c7;border:1px solid #fde68a;border-radius:8px;padding:6px 10px;"><b>职责分离（Product）</b> market=文档清单 · knowledge=内容检索</div>
+    </div>
+  </div>
+
+  <!-- 验证结果条 -->
+  <div style="margin-top:14px;background:#fff;border:1px solid #d1d5db;border-radius:10px;padding:12px 14px;box-sizing:border-box;">
+    <div style="font-size:15px;font-weight:700;color:#1f2937;margin-bottom:8px;">④ 验证证据</div>
+    <div style="display:flex;flex-wrap:wrap;gap:8px;font-size:13px;">
+      <div style="background:#f3f4f6;border:1px solid #e5e7eb;border-radius:8px;padding:6px 10px;">单测 verify_rag.py <b>8/8 通过</b>（跨部门命中/部门过滤/关键词兜底）</div>
+      <div style="background:#f3f4f6;border:1px solid #e5e7eb;border-radius:8px;padding:6px 10px;">全链路回归 3 次通过：新品流程 46.4s · ROAS 红线 29.4s · 库存规则 13.6s</div>
+      <div style="background:#f3f4f6;border:1px solid #e5e7eb;border-radius:8px;padding:6px 10px;">logistics 引用知识库规则（安全库存 15 天/&lt;12 天预警）并与真实库存交叉 → 发现规则执行不一致</div>
+      <div style="background:#f3f4f6;border:1px solid #e5e7eb;border-radius:8px;padding:6px 10px;">原有 SQL 链路与埋点（SN-Q12-US -26.35%）未退化</div>
+    </div>
+  </div>
+</div>

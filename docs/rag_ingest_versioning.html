@@ -1,0 +1,59 @@
+<html style="margin:0;padding:0;">
+<title>同 title 不同内容：当前丢失 vs 改进方案</title>
+<div style="width:100%;box-sizing:border-box;font-family:'Microsoft YaHei',system-ui,sans-serif;background:#f7f9fb;color:#1f2937;padding:18px;">
+  <div style="text-align:center;font-size:20px;font-weight:700;margin-bottom:2px;">同 title 不同内容、两次都要保留？——当前实现会丢历史</div>
+  <div style="text-align:center;font-size:13px;color:#6b7280;margin-bottom:14px;">重灌 v2 → 旧 v1 去哪了？| 三个典型场景 + 三个改进方案 | 示意</div>
+
+  <!-- 典型场景 -->
+  <div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:10px;padding:10px 14px;box-sizing:border-box;font-size:13px;margin-bottom:12px;">
+    <b style="color:#1d4ed8;">什么时候会"同 title 不同内容、都要保留"？</b>
+    <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:6px;">
+      <span style="background:#dbeafe;color:#1e40af;border-radius:6px;padding:3px 8px;font-size:12px;">① 版本演进：SOP v1→v2→v3，合规要留历史（"当时规定是什么"）</span>
+      <span style="background:#dbeafe;color:#1e40af;border-radius:6px;padding:3px 8px;font-size:12px;">② 跨市场同名：「广告SOP」US 版 vs EU 版</span>
+      <span style="background:#dbeafe;color:#1e40af;border-radius:6px;padding:3px 8px;font-size:12px;">③ 定时抓取快照：平台规则 FAQ 每天变，历史可对比</span>
+    </div>
+  </div>
+
+  <div style="display:flex;flex-wrap:wrap;gap:10px;">
+    <!-- 左：当前行为 -->
+    <div style="flex:1 1 44%;min-width:340px;">
+      <div style="background:#fff;border:1px solid #fca5a5;border-radius:10px;padding:12px;box-sizing:border-box;">
+        <div style="font-size:15px;font-weight:700;color:#b91c1c;margin-bottom:8px;">① 当前行为（先删后建）</div>
+        <div style="font-family:Consolas,monospace;font-size:12px;line-height:1.9;background:#fef2f2;border:1px solid #fee2e2;border-radius:8px;padding:10px;">
+          重灌 title='广告SOP' v2 时：
+          <br>DELETE WHERE title='广告SOP' ──→ v1 被删（CASCADE 清 chunks/embeddings）
+          <br>INSERT v2 → 库里只有 v2
+          <br><span style="color:#dc2626;font-weight:700;">v1 永久丢失 ✗</span>
+        </div>
+        <div style="font-size:12px;color:#6b7280;margin-top:8px;">
+          为什么现在能接受：种子文档是"人工修正重灌"场景（改错了重灌=纠错），不需要历史；但如果知识库接入飞书/网页/定时抓取，这就是<b>数据丢失缺陷</b>
+        </div>
+      </div>
+    </div>
+
+    <!-- 右：三个改进方案 -->
+    <div style="flex:1 1 52%;min-width:380px;display:flex;flex-direction:column;gap:8px;">
+      <div style="background:#fff;border:1px solid #bbf7d0;border-radius:10px;padding:10px 12px;box-sizing:border-box;">
+        <div style="font-size:14px;font-weight:700;color:#15803d;">② 软删除（改动最小，一行）</div>
+        <div style="font-size:12px;color:#374151;margin-top:4px;">
+          DELETE → <code>UPDATE status='archived'</code>，再 INSERT 新版（active）<br>
+          检索本来就有 <code>d.status='active'</code> 过滤 → 历史版存档、不被召回，审计可查
+        </div>
+      </div>
+      <div style="background:#fff;border:1px solid #bbf7d0;border-radius:10px;padding:10px 12px;box-sizing:border-box;">
+        <div style="font-size:14px;font-weight:700;color:#15803d;">③ 版本键（语义最清晰）</div>
+        <div style="font-size:12px;color:#374151;margin-top:4px;">
+          唯一键 <code>(title, department, brand, market, version)</code> → v1/v2 并存<br>
+          检索 <code>ORDER BY version DESC LIMIT 1</code> 取最新；表已有 version 字段，但当前幂等键没用它
+        </div>
+      </div>
+      <div style="background:#fff;border:1px solid #bbf7d0;border-radius:10px;padding:10px 12px;box-sizing:border-box;">
+        <div style="font-size:14px;font-weight:700;color:#15803d;">④ 审计/快照表（最重）</div>
+        <div style="font-size:12px;color:#374151;margin-top:4px;">
+          删除前把旧行复制到 <code>knowledge_documents_history</code>（doc_id/title/content_hash/archived_at）<br>
+          与记忆系统的 memory_change_log 同思路：旧值不原地覆盖，独立审计表可追溯
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
