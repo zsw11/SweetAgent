@@ -648,7 +648,7 @@ CREATE TABLE IF NOT EXISTS agent_results (
 -- 34. 结构化长期记忆
 -- ============================================================
 
--- 用户画像（key-value）
+-- 用户画像（key-value）可以加版本表，用来记录旧的记忆版本链，当用户问我之前，为什么这次不一样等场景，查询旧的记忆，用一次注入就丢掉
 CREATE TABLE IF NOT EXISTS user_profiles (
     id         BIGSERIAL PRIMARY KEY,           -- 主键ID
     user_id    BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,  -- 用户ID
