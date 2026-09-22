@@ -1,0 +1,5 @@
+# Streamlit 客户端配置（项目根下 .streamlit/config.toml）
+# toolbarMode=minimal：对最终用户隐藏右上角开发菜单（Stop/Rerun/Clear cache/Deploy 等英文项）
+# 取值：auto / viewer / minimal / developer
+[client]
+toolbarMode = "minimal"
