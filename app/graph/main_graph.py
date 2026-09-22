@@ -120,6 +120,7 @@ def build_main_graph(
     def _decision(state: dict[str, Any]) -> dict[str, Any]:
         """Decision 节点：汇总各部门结果 -> 结构化最终报告。"""
         user_question = state.get("user_question", "")
+        user_id = state.get("user_id", "default")
         department_results = state.get("department_results") or {}
         skipped = state.get("skipped_tasks") or []
         if skipped:
@@ -127,7 +128,15 @@ def build_main_graph(
 
         logger.info("main.decision.start", departments=list(department_results.keys()))
         try:
-            report = dec.run(user_question, department_results)
+            # 决策阶段注入用户级记忆（画像/偏好/通用记忆）：
+            # Manager 只在规划时看到记忆，最终回答由 Decision 生成，
+            # 若用户问"我负责哪个市场"这类自身相关问题，Decision 需能读到画像。
+            memory = build_manager_memory(user_id, user_question)
+            report = dec.run(
+                user_question,
+                department_results,
+                memory=json.dumps(memory, ensure_ascii=False) if memory else None,
+            )
             logger.info("main.decision.done", confidence=report.get("confidence"))
             return {
                 "decision_result": report,
@@ -190,6 +199,7 @@ def run_question(
     thread_id: str = "default",
     user_id: str = "default",
     checkpointer: Any = None,
+    callbacks: Optional[list[Any]] = None,
 ) -> dict[str, Any]:
     """执行一次用户问题（主入口）。
 
@@ -198,6 +208,8 @@ def run_question(
         thread_id: 会话 ID（checkpoint / 记忆的 key）。
         user_id: 用户 ID。
         checkpointer: 可注入 checkpointer（默认自动获取 PostgresSaver 单例）。
+        callbacks: 可选 LangChain 回调（如评估脚本的 token 用量采集器），
+            经 invoke config 透传给图内所有 LLM 调用。
 
     Returns:
         包含 final_answer / decision_result / department_results 的完整状态字典。
@@ -217,9 +229,12 @@ def run_question(
         "skipped_tasks": [],
         "current_task": "",
     }
+    invoke_config: dict[str, Any] = {"configurable": {"thread_id": thread_id}}
+    if callbacks:
+        invoke_config["callbacks"] = callbacks
     result = app.invoke(
         initial_state,
-        config={"configurable": {"thread_id": thread_id}},
+        config=invoke_config,
     )
     logger.info(
         "run_question.done",

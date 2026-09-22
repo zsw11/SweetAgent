@@ -40,19 +40,23 @@ class DecisionAgent:
         self,
         user_question: str,
         department_results: dict[str, Any],
+        memory: Optional[str] = None,
     ) -> DecisionOutput:
         """执行一次决策分析，返回结构化 DecisionOutput。
 
         Args:
             user_question: 用户原始问题。
             department_results: 各部门结果字典，如 {"operation": {...}, "finance": {...}}。
+            memory: 用户级记忆 JSON 文本（画像/偏好/通用记忆），
+                回答"用户自身相关"问题（如负责哪个市场）时注入，无则 None。
         """
         logger.info(
             "decision.run.start",
             question=user_question[:100],
             departments=list(department_results.keys()),
+            has_memory=bool(memory),
         )
-        raw = self._synthesize(user_question, department_results)
+        raw = self._synthesize(user_question, department_results, memory)
         report = self._parse_and_validate(raw)
         logger.info(
             "decision.run.done",
@@ -65,7 +69,12 @@ class DecisionAgent:
     # ------------------------------------------------------------------
     # 内部步骤
     # ------------------------------------------------------------------
-    def _synthesize(self, user_question: str, department_results: dict[str, Any]) -> str:
+    def _synthesize(
+        self,
+        user_question: str,
+        department_results: dict[str, Any],
+        memory: Optional[str] = None,
+    ) -> str:
         """调用 LLM 生成结构化决策报告（原始文本）。"""
         from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -75,6 +84,7 @@ class DecisionAgent:
             SystemMessage(content=DECISION_SYSTEM_PROMPT),
             HumanMessage(content=DECISION_PROMPT.format(
                 user_question=user_question,
+                memory=memory or "（无）",
                 department_results_json=json.dumps(slim, ensure_ascii=False, default=str),
             )),
         ])

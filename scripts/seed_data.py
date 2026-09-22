@@ -31,7 +31,7 @@ DSN = os.getenv(
 TABLES = [
     "agent_results", "agent_interrupts", "agent_errors", "agent_tool_calls",
     "agent_steps", "agent_runs",
-    "evaluation_scores", "evaluation_runs", "evaluation_cases",
+    # evaluation_cases/runs/scores 由 scripts/seed_evaluation_cases.py 独立维护，不在此清空重灌
     "prompt_versions", "agent_business_rule", "agent_metric_definition",
     "knowledge_embeddings", "knowledge_chunks", "knowledge_documents",
     "business_preferences", "user_preferences", "user_profiles",
@@ -596,21 +596,7 @@ def main() -> None:
                 ("operation", "v1", "b" * 64, True),
                 ("decision", "v1", "c" * 64, True),
             ])
-            insert(cur, "evaluation_cases", ["id", "question", "expected_agents", "expected_sql_pattern", "expected_answer_key"], [
-                (1, "美国市场过去30天GMV变化", ["operation", "decision"], "mart_sales_daily", "GMV 趋势"),
-                (2, "为什么最近利润下降", ["operation", "finance", "logistics", "decision"], "mart_product_profit_daily", "利润归因"),
-                (3, "下一季度开发什么产品", ["operation", "finance", "logistics", "product", "decision"], "knowledge", "产品建议"),
-                (4, "美国SKU-A上个月销量多少", ["operation", "decision"], "mart_sales_daily", "销量数字"),
-                (5, "公司新品开发流程是什么", ["product", "decision"], "knowledge_documents", "SOP 流程"),
-            ], jsonb_cols={"expected_agents"})
-            insert(cur, "evaluation_runs", ["id", "run_id", "status"], [
-                (1, "eval-20260910", "completed"),
-            ])
-            insert(cur, "evaluation_scores", ["run_id", "case_id", "metric", "score"], [
-                (1, 1, "route_accuracy", 1.0),
-                (1, 1, "sql_correctness", 0.95),
-                (1, 2, "route_accuracy", 0.9),
-            ])
+            # 评估用例/运行/得分由 scripts/seed_evaluation_cases.py 独立维护（20 条正式用例），此处不再灌占位数据
             insert(cur, "financial_transactions", ["store_id", "transaction_date", "transaction_type", "amount", "currency", "description"], [
                 (1, END, "platform_payout", 48210.5, "USD", "9月中旬平台结算"),
                 (3, END, "platform_payout", 8120.3, "CAD", "9月中旬平台结算"),

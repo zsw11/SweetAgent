@@ -66,7 +66,7 @@ def ingest_document(
     content_hash = _content_hash(content)
     # 变更检测：同 title 且全文 SHA-256 相同 → 内容未变，跳过重建（零成本幂等）。
     # 幂等键当前 = title + content_hash（version 未参与任何逻辑，仅作展示元数据）。
-    # 【演进 B · 已记录未实现】唯一键改 (title, department, brand, market, version)：
+    # 【演进 B · 已记录-还未实现】唯一键改 (title, department, brand, market, version)：后面用version维护版本
     # 同 title 不同版本并存（历史可查），检索 ORDER BY version DESC 取最新；见 development_log 待办 18。
     cur = conn.execute(
         "SELECT id, content_hash FROM knowledge_documents WHERE title = %s", (title,)

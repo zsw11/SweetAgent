@@ -41,6 +41,12 @@ JUDGE_PROMPT = """你是用户长期记忆的"冲突裁判"。判断新记忆与
 只输出 JSON（不要 markdown 代码块）：
 {{"relation": "unrelated|duplicate|supplement|conflict|negation", "target_id": 候选id或null, "event": "ADD|NONE|UPDATE|MERGE", "new_content": "MERGE 时填合并后内容，其他情况填空字符串", "reason": "一句话理由"}}
 
+严格一致性约束（违反即输出错误）：
+1. relation 与 event 必须一一对应：relation=duplicate ↔ event=NONE；relation=supplement ↔ event=MERGE；relation=conflict/negation ↔ event=UPDATE；relation=unrelated ↔ event=ADD；
+2. 区分 duplicate 与 supplement：内容完全相同、只改写字句/换说法 = duplicate（event=NONE，不新增）；新内容确实比候选多了信息（范围扩大、部门归属、新增事实点）= supplement（event=MERGE）。判断不准时按 duplicate/NONE（不新增），不冒险版本化；
+3. target_id 必须逐字来自候选列表中真实存在的 id（方括号里的数字），禁止引用不存在的 id；拿不准 target_id 时填 null；
+4. reason 文字必须与 relation/event 一致：若 reason 描述为"重复/同一事实/换说法/仅措辞差异"，relation 必须=duplicate、event 必须=NONE，不得在 reason 说重复的同时 event 给 UPDATE/MERGE。
+
 约束：target_id 必须来自候选旧记忆的 id；拿不准时宁选 ADD/NONE，不冒险覆盖。"""
 
 

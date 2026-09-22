@@ -121,6 +121,17 @@ def add_memory(
         meta["decision_reason"] = reason
         meta["decided_by"] = "llm"
 
+        # 一致性兜底（judge 小模型常见症状）：reason 文字说"重复/同一事实"，
+        # event 却给了 UPDATE/MERGE —— 按 reason 降级为 duplicate/NONE，只刷新旧条，不版本化。
+        _DUP_HINTS = ("重复", "同一事实", "换说法", "措辞差异", "同一事件", "同一内容")
+        if event in ("UPDATE", "MERGE") and any(h in reason for h in _DUP_HINTS) and target_id in valid_ids:
+            logger.info(
+                "memory.judge.consistency_fix", user_id=uid,
+                original_event=event, target_id=target_id, reason=reason,
+            )
+            event = "NONE"
+            relation = "duplicate"
+
         # ADD / unrelated：新增
         if event == "ADD" or relation == "unrelated":
             return _insert(conn, uid, memory_type, content, department, meta, confidence, evidence, vec)

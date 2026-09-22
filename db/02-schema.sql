@@ -36,7 +36,7 @@ CREATE TABLE IF NOT EXISTS users (
     created_at    TIMESTAMPTZ  NOT NULL DEFAULT now(),     -- 创建时间
     updated_at    TIMESTAMPTZ  NOT NULL DEFAULT now()      -- 更新时间
 );
-
+select * from users;
 -- 用户-角色关联
 CREATE TABLE IF NOT EXISTS user_roles (
     id         BIGSERIAL PRIMARY KEY,           -- 主键ID
@@ -682,7 +682,7 @@ CREATE TABLE IF NOT EXISTS business_preferences (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),  -- 更新时间
     UNIQUE (key, scope)                         -- 联合唯一约束
 );
-
+select * from user_memories where user_id = 14;
 -- 用户非结构化记忆（设计文档 35 节：语义长期记忆）
 -- 存：偏好语义 / 事实 / 历史结论 / 业务规则（自由文本 + 向量），用户私有，检索优先选向量相近且执行度高的记忆top5
 -- department 标签用于"检索按任务过滤"（无标签 = 通用记忆，不参与粗筛淘汰）
@@ -795,9 +795,10 @@ select * from prompt_versions;
 CREATE TABLE IF NOT EXISTS evaluation_cases (
     id                   BIGSERIAL PRIMARY KEY,           -- 主键ID
     question             TEXT NOT NULL,                   -- 测试问题
-    expected_agents      JSONB,                           -- 期望调度的 Agent 列表
-    expected_sql_pattern TEXT,                            -- 期望 SQL 模式
-    expected_answer_key  TEXT,                            -- 期望答案关键词
+    expected_agents      JSONB,                           -- 期望调度的 Agent（{"required": [...]}，required 必须命中，多规划不扣分）
+    expected_sql_pattern TEXT,                            -- 期望 SQL 模式（、分隔必命中表/关键词；rag:<部门> 为知识库检索；- 不判）
+    expected_answer_key  TEXT,                            -- 期望答案关键词（、分隔，可注（m中n）；JUDGE: 前缀交 LLM 裁判）
+    category             VARCHAR(30),                     -- 用例维度（routing/sql/fact/safety/rag）
     created_at           TIMESTAMPTZ NOT NULL DEFAULT now()       -- 创建时间
 );
 select * from evaluation_cases;
@@ -807,7 +808,8 @@ CREATE TABLE IF NOT EXISTS evaluation_runs (
     run_id      VARCHAR(100),                    -- 运行批次ID
     started_at  TIMESTAMPTZ NOT NULL DEFAULT now(),  -- 开始时间
     finished_at TIMESTAMPTZ,                     -- 结束时间
-    status      VARCHAR(20) NOT NULL DEFAULT 'running'  -- 状态
+    status      VARCHAR(20) NOT NULL DEFAULT 'running',  -- 状态
+    notes       JSONB                            -- 批次元信息/汇总指标（mode、case_ids、token、费用、三维均分）
 );
 select * from evaluation_runs;
 -- 评估得分（按 metric）
@@ -815,12 +817,13 @@ CREATE TABLE IF NOT EXISTS evaluation_scores (
     id        BIGSERIAL PRIMARY KEY,           -- 主键ID
     run_id    BIGINT NOT NULL REFERENCES evaluation_runs(id) ON DELETE CASCADE,  -- 评估运行ID
     case_id   BIGINT NOT NULL REFERENCES evaluation_cases(id),  -- 用例ID
-    metric    VARCHAR(50) NOT NULL,            -- 指标名（routing_accuracy/sql_accuracy/answer_accuracy）
+    metric    VARCHAR(50) NOT NULL,            -- 指标名（routing_accuracy/sql_accuracy/answer_accuracy）raw_capture 人工修改判定依据后可以用这个数据不查询llm二次判分
     score     NUMERIC(8,4),                    -- 得分
     detail    JSONB,                           -- 评分详情
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()       -- 创建时间
 );
 select * from evaluation_scores;
+select * from evaluation_scores where metric = 'raw_capture' AND run_id = 2;
 -- ============================================================
 -- mart 层（设计文档 22、30 节）：Agent 优先查询层
 -- ============================================================

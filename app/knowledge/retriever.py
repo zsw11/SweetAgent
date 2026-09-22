@@ -194,7 +194,8 @@ class KnowledgeRetriever:
         if document_type:
             where.append("d.source_type = %s")
             params.append(document_type)
-
+        # `c.embedding <= > % s::vector
+        # ` 算出的是 ** 向量距离 **：值越小 = 两个向量方向越接近 = 越相关。范围约[0, 2]（完全同向 ≈ 0，正交 ≈ 1，完全反向 ≈ 2）。
         sql = (
             "SELECT c.id AS chunk_id, c.document_id, c.chunk_index, c.content, "
             "d.title, d.source_type, d.department, d.brand, d.market, "

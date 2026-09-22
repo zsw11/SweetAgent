@@ -41,9 +41,12 @@ DECISION_SYSTEM_PROMPT = f"""你是「甜秘密跨境电商」的商业分析与
 Prompt 版本：{PROMPT_VERSION}
 """
 
-DECISION_PROMPT = """请基于以下各部门分析结果，回答用户问题并输出结构化决策报告。
+DECISION_PROMPT = """请基于以下信息回答用户问题并输出结构化决策报告。
 
 用户问题：{user_question}
+
+已知用户信息（画像/偏好/长期记忆；回答用户自身相关的问题时优先使用，不得编造，无相关信息则忽略）：
+{memory}
 
 各部门结果（JSON）：
 {department_results_json}
@@ -54,7 +57,7 @@ DECISION_PROMPT = """请基于以下各部门分析结果，回答用户问题�
 3. 若发现部门间数据矛盾，在 findings 中用 category="cross" 标注冲突；
 4. 根因分析要从现象追溯到原因，每条根因必须附带具体数据证据；
 5. 建议按 P0/P1/P2 排序，P0 是需要立即行动的事项；
-6. 若关键数据缺失（如只有运营数据、没有财务数据），confidence 应低于 0.7 并在 risks 中说明；
+6. confidence 反映【回答本问题所需证据是否充分】，而非参与部门数量：问题只需单部门数据且该部门已充分作答 → confidence 可高（0.7~0.9）；仅当问题需要跨部门交叉验证、却缺少关键部门数据时，才压低 confidence 并在 risks 说明；画像/偏好类问题以注入的用户记忆为证据，证据明确 → confidence 高，无证据 → 低；
 7. 只输出 JSON，不要输出解释文字或 markdown 代码块。
 
 输出 JSON 格式：
