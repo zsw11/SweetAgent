@@ -82,7 +82,7 @@ def _rule_trigger(question: str, answer: str) -> bool:
 
 
 def _extract_once(user_id: str, question: str, answer: str) -> dict[str, Any]:
-    """执行一次 LLM 提取并写入（返回写入统计）。"""
+    """执行一次 LLM 提取记忆并写入（返回写入统计）。"""
     if not llm_available():
         return {"triggered": False, "reason": "llm_unavailable"}
     model = get_chat_model(tier="medium")

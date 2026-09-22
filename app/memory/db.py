@@ -24,7 +24,7 @@ def connect():
 def resolve_user_id(user_id: str) -> int:
     """字符串 user_id（username）→ users.id；不存在则插入新用户（幂等）。
 
-    说明：API 层 user_id 是字符串（如 "default"/"zhangwei"），而记忆表
+    说明：API 层 user_id 是字符串名称（如 "default"/"zhangwei"），而记忆表
     user_id 是 BIGINT REFERENCES users(id)，此处做映射。
     """
     username = (user_id or "default").strip() or "default"
