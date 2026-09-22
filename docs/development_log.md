@@ -1437,3 +1437,23 @@ class GlobalState(TypedDict, total=False):
 **为什么**：小模型（judge 用 tier=small）输出不稳定是常态——自然语言理由与结构化字段会矛盾、数字会幻觉。不能把自由文本解析成决策依据（那等于让 LLM 自己解释自己、又错一次），也不能只信字段（字段会飘）。正确姿势：结构化字段（event/target_id）决定行为，自由文本只做"一致性兜底"的校验信号；矛盾时取更保守的一侧（不新增、不覆盖），宁漏勿错。另一个教训：reason 落库时原样存，LLM 笔误（写错 id）会永久留在 metadata 里，所以 reason 仅供人读、绝不参与逻辑。
 
 **核心一句话**：LLM 裁判的结构化字段决定行为，自由文本只做一致性兜底；字段与文本矛盾时代码以"更保守"为准，不新增不覆盖。
+
+### 考点二十七：LangGraph `Annotated[list[str], _add_unique]` 到底在做什么？——reducer 的 left/right 语义与触发时机（2026-09-22 代码精读）
+
+**面试官怎么问**：`completed_tasks: Annotated[list[str], _add_unique]` 这行声明是什么含义？`_add_unique(left, right)` 什么时候被调用、两个参数分别是什么？并行节点同时写同一个列表字段，LangGraph 到底怎么合并才不丢数据？
+
+**设计（本项目真实实现，app/graph/state.py:10-16, 48-49）**：
+- `Annotated[list[str], _add_unique]` = 给字段挂**归约器（reducer）**：LangGraph 中该字段的更新语义从默认的"整体覆盖"变成"先归约后写入"
+- 归约调用约定：**每次节点返回后**，LangGraph 调用 `reducer(left, right)`：`left` = 当前 state 里该字段的累积值（上一次归约的结果），`right` = 本次节点返回的增量
+- `_add_unique`：保留 left 全部，right 中不在 left 的追加——去重合并，`["task_1"] + ["task_2"] → ["task_1","task_2"]`
+- 并行 superstep 中多个节点返回后，LangGraph 依序多次调用 reducer **累积**：left 永远是累积状态，后返回的节点不会覆盖先返回的
+- `total=False`：TypedDict 声明所有键可选，LangGraph 允许节点只返回部分字段（增量而非全量快照）
+- 使用位置：定义 state.py:48-49；初始化 main_graph.py:72,229；写入 router.py:97 `return {"skipped_tasks": list(skipped)}`；读取 router.py:80,112,151（判断任务是否已跳过）+ main_graph.py:125（decision 记日志）+ api/chat.py:91（响应输出给前端）
+
+**为什么**：
+- 默认 last-write-wins：并行节点基于同一状态快照写回，后完成者覆盖先完成者 → 丢任务 id（O/F/L 各写一个 id，只剩最后一个）
+- 节点只返回"自己那部分增量"，靠 reducer 累积合并 → 节点之间零耦合，天然支持并行 fan-out/多轮循环
+- 去重 = 幂等保护：同一任务 id 不会重复出现，fan-out 重试/循环调度安全
+- 类比：dict 字段用 `_merge_dict`（按 key 合并）解决同一问题，list 用 `_add_unique`（按元素去重）——同一机制、两种容器
+
+**核心一句话**：`Annotated[T, fn]` 是把字段的"覆盖写入"换成"归约写入"——LangGraph 每次节点返回都调 `fn(旧累积, 新增量)` 合并，并行写共享列表/字典靠它不互相覆盖、不丢数据、天然幂等。

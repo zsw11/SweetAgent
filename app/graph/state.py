@@ -46,7 +46,7 @@ class GlobalState(TypedDict, total=False):
 
     # 执行追踪（主 Graph 调度用，设计文档 6 节 DAG 执行）
     completed_tasks: Annotated[list[str], _add_unique]   # 已完成任务 id 列表
-    skipped_tasks: Annotated[list[str], _add_unique]     # 因 Agent 未实现而跳过的任务 id
+    skipped_tasks: Annotated[list[str], _add_unique]     # 因 Agent 未实现而跳过的任务 id，skipped_tasks 就是把 "规划与实现的差集" 显式记录下来的agent任务
     current_task: str                                    # 遗留字段（并行路由后不再使用，保留兼容）
 
     # Product Agent 跨部门上下文（由 Manager 按依赖 DAG 注入）

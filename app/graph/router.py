@@ -21,7 +21,7 @@ from app.observability.logging import get_logger
 
 logger = get_logger("router")
 
-# 已实现的部门 Agent -> 子图便捷入口（O/F/L/P 均已接入）
+# 已实现的所有部门 Agent -> 子图便捷入口（O/F/L/P 均已接入）
 # 新增部门 Agent 后，在此注册即可被 Router 调度。
 AVAILABLE_AGENTS: dict[str, Any] = {}
 
@@ -31,7 +31,7 @@ def register_department(agent_name: str, runner: Any) -> None:
     AVAILABLE_AGENTS[agent_name] = runner
 
 
-# 延迟导入 operation / finance / logistics / product，避免循环依赖
+# 延迟导入 operation / finance / logistics / product，避免循环依赖, 执行具体的子agent
 def _get_operation_runner():
     from app.agents.operation import run_operation
     return run_operation
