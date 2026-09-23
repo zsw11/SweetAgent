@@ -41,6 +41,7 @@ class DecisionAgent:
         user_question: str,
         department_results: dict[str, Any],
         memory: Optional[str] = None,
+        feedback: Optional[str] = None,
     ) -> DecisionOutput:
         """执行一次决策分析，返回结构化 DecisionOutput。
 
@@ -49,14 +50,17 @@ class DecisionAgent:
             department_results: 各部门结果字典，如 {"operation": {...}, "finance": {...}}。
             memory: 用户级记忆 JSON 文本（画像/偏好/通用记忆），
                 回答"用户自身相关"问题（如负责哪个市场）时注入，无则 None。
+            feedback: 质量门反馈（考点二十九）——上一次回答的偏差诊断或用户纠正意见，
+                quality_gate 评估不合格后回炉重生成时注入，指导本次修正；无则 None。
         """
         logger.info(
             "decision.run.start",
             question=user_question[:100],
             departments=list(department_results.keys()),
             has_memory=bool(memory),
+            has_feedback=bool(feedback),
         )
-        raw = self._synthesize(user_question, department_results, memory)
+        raw = self._synthesize(user_question, department_results, memory, feedback)
         report = self._parse_and_validate(raw)
         logger.info(
             "decision.run.done",
@@ -74,8 +78,13 @@ class DecisionAgent:
         user_question: str,
         department_results: dict[str, Any],
         memory: Optional[str] = None,
+        feedback: Optional[str] = None,
     ) -> str:
-        """调用 LLM 生成结构化决策报告（原始文本）。"""
+        """调用 LLM 生成结构化决策报告（原始文本）。
+
+        feedback 非空时在 prompt 中注入"反馈意见"段（考点二十九）：
+        quality_gate 判不合格后回炉，本次生成必须针对反馈逐条修正。
+        """
         from langchain_core.messages import HumanMessage, SystemMessage
 
         # 精简部门结果：只保留决策需要的字段，避免上下文爆炸
@@ -85,6 +94,7 @@ class DecisionAgent:
             HumanMessage(content=DECISION_PROMPT.format(
                 user_question=user_question,
                 memory=memory or "（无）",
+                feedback=feedback or "（无）",
                 department_results_json=json.dumps(slim, ensure_ascii=False, default=str),
             )),
         ])

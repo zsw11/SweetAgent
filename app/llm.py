@@ -68,7 +68,7 @@ def get_chat_model(
         max_retries=2,
     )
 
-
+# **`@lru_cache` 缓存的是 "实例对象"，不是 "跑过的数据"**。
 @lru_cache
 def get_cached_chat_model(
     provider: Optional[str] = None,

@@ -25,12 +25,13 @@ import streamlit as st
 
 DEFAULT_API = "http://localhost:8000"
 
-# 阶段英文 -> 中文（后端 stage 值：planning/running/done/error）
+# 阶段英文 -> 中文（后端 stage 值：planning/running/done/error/awaiting_feedback）
 STAGE_LABELS = {
     "planning": "规划中",
     "running": "执行中",
     "done": "完成",
     "error": "出错",
+    "awaiting_feedback": "等待确认（质量门）",
     "unknown": "未知",
 }
 

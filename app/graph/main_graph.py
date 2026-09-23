@@ -13,9 +13,13 @@ import json
 from typing import Any, Optional
 
 from langgraph.graph import END, START, StateGraph
+from langgraph.types import interrupt
+from langchain_core.runnables import RunnableConfig
 
 from app.agents.decision import DecisionAgent
 from app.agents.manager import ManagerAgent
+from app.config.settings import settings
+from app.graph.quality import check_answer_quality, llm_quality_check
 from app.graph.router import make_department_node, route_fn, router_node
 from app.graph.state import GlobalState
 from app.memory.injection import build_department_memory, build_manager_memory
@@ -118,15 +122,20 @@ def build_main_graph(
     product_node = make_department_node("product", context_builder=_product_context_builder)
 
     def _decision(state: dict[str, Any]) -> dict[str, Any]:
-        """Decision 节点：汇总各部门结果 -> 结构化最终报告。"""
+        """Decision 节点：汇总各部门结果 -> 结构化最终报告。
+
+        支持质量自纠（考点二十九）：quality_gate 判不合格后带 feedback 回炉，
+        本节点把 feedback 注入 DecisionAgent 重生成（部门结果保留在 state，不重跑 Router）。
+        """
         user_question = state.get("user_question", "")
         user_id = state.get("user_id", "default")
         department_results = state.get("department_results") or {}
+        feedback = state.get("quality_feedback") or ""
         skipped = state.get("skipped_tasks") or []
         if skipped:
             logger.info("main.decision.with_skipped", skipped=skipped)
 
-        logger.info("main.decision.start", departments=list(department_results.keys()))
+        logger.info("main.decision.start", departments=list(department_results.keys()), has_feedback=bool(feedback))
         try:
             # 决策阶段注入用户级记忆（画像/偏好/通用记忆）：
             # Manager 只在规划时看到记忆，最终回答由 Decision 生成，
@@ -136,11 +145,14 @@ def build_main_graph(
                 user_question,
                 department_results,
                 memory=json.dumps(memory, ensure_ascii=False) if memory else None,
+                feedback=feedback or None,
             )
             logger.info("main.decision.done", confidence=report.get("confidence"))
             return {
                 "decision_result": report,
                 "final_answer": report.get("summary", ""),
+                # feedback 已消费，清空避免下一轮残留
+                "quality_feedback": "",
                 "current_stage": "done",
             }
         except Exception as exc:
@@ -155,6 +167,121 @@ def build_main_graph(
             }
 
     # ------------------------------------------------------------------
+    # quality_gate：答案质量自纠回路（考点二十九）
+    # ------------------------------------------------------------------
+
+    def _quality_gate(state: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:
+        """质量门：评估 Decision 输出，决定 END / 回炉 / interrupt 等用户。
+
+        流程（条件边 _quality_route 承接）：
+        1. 规则检查（确定性零成本）+ 可选 LLM 裁判（settings.QUALITY_GATE_JUDGE_ENABLED）；
+        2. 合格 -> END；
+        3. 不合格且未达自动回炉上限 -> 带 quality_feedback 回 decision 重生成；
+        4. 自动回炉耗尽 -> human_in_the_loop=True 时 interrupt() 暂停等用户纠正（approve/revise），
+           否则放行（force_pass，保留诊断供日志/前端查看）。
+
+        interrupt() 需要编译时传 checkpointer；无 checkpointer 或调用失败时降级放行。
+        """
+        user_question = state.get("user_question", "")
+        decision_result = state.get("decision_result") or {}
+        summary = str(decision_result.get("summary") or state.get("final_answer") or "").strip()
+
+        # 1) 规则检查（永远启用）
+        verdict = check_answer_quality(user_question, decision_result)
+        issues = list(verdict["issues"])
+
+        # 2) 可选 LLM 裁判：规则通过后再查跑题/漏答（默认关闭，开启后每次回答多一次 small 调用）
+        if not issues and settings.QUALITY_GATE_JUDGE_ENABLED:
+            issues = llm_quality_check(user_question, summary or "(空)")
+
+        iteration = int(state.get("quality_iteration") or 0)
+        if not issues:
+            logger.info("quality_gate.pass", iteration=iteration)
+            return {
+                "quality_check": {"pass": True, "issues": []},
+                "quality_feedback": "",
+                "current_stage": "done",
+            }
+
+        # ---- 不合格 ----
+        # interrupt() 通过抛出 GraphInterrupt 实现暂停（执行器捕获后返回 __interrupt__），
+        # 因此不能用 try/except 包裹；无 checkpointer 编译时由 _hilt_ok 守卫降级（不 interrupt）。
+        human_in_the_loop = bool(
+            (config or {}).get("configurable", {}).get("human_in_the_loop", False)
+        )
+        _hilt_ok = human_in_the_loop and checkpointer is not None
+        if iteration >= settings.QUALITY_GATE_MAX_AUTO_RETRIES:
+            if _hilt_ok:
+                # 暂停执行，把候选答案和偏差诊断交给用户；resume 时 interrupt() 返回用户输入
+                # ** `interrupt()` = "暂停点 + 断点落盘 + 控制权交还"，等待发生在你的应用层，回来靠checkpoint续跑 **—— 不是"挂起等输入"
+                feedback = interrupt({
+                    "type": "quality_feedback",
+                    "question": user_question,
+                    "draft_answer": summary,
+                    "issues": issues,
+                    "iteration": iteration,
+                })
+
+                if isinstance(feedback, dict) and feedback.get("action") == "approve":
+                    logger.info("quality_gate.user.approve", iteration=iteration)
+                    return {
+                        "quality_check": {"pass": True, "approved": True, "issues": issues},
+                        "quality_feedback": "",
+                        "current_stage": "done",
+                    }
+                fb = ""
+                if isinstance(feedback, dict):
+                    fb = str(feedback.get("feedback") or "").strip()
+                elif feedback is not None:
+                    fb = str(feedback).strip()
+                if fb:
+                    logger.info("quality_gate.user.revise", iteration=iteration, feedback=fb[:100])
+                    return {
+                        "quality_feedback": fb,
+                        "quality_iteration": iteration + 1,
+                        "quality_check": {"pass": False, "issues": issues, "source": "user"},
+                        "current_stage": "revising",
+                    }
+                # 用户未给有效 feedback -> 放行（防死循环）
+                logger.info("quality_gate.user.no_feedback_force_pass", iteration=iteration)
+                return {
+                    "quality_check": {"pass": True, "force_pass": True, "issues": issues},
+                    "quality_feedback": "",
+                    "current_stage": "done",
+                }
+
+            # 非交互或未编译 checkpointer：自动重试耗尽后放行，保留诊断供日志/前端查看
+            logger.warning(
+                "quality_gate.force_pass",
+                iteration=iteration,
+                hilt=human_in_the_loop,
+                has_checkpointer=checkpointer is not None,
+                issues=issues[:3],
+            )
+            return {
+                "quality_check": {"pass": True, "force_pass": True, "issues": issues},
+                "quality_feedback": "",
+                "current_stage": "done",
+            }
+
+        # ---- 还有自动回炉额度：带 feedback 回 decision 重生成 ----
+        fb = "；".join(issues)
+        logger.info("quality_gate.revise.auto", iteration=iteration, issues=issues[:3])
+        return {
+            "quality_feedback": fb,
+            "quality_iteration": iteration + 1,
+            "quality_check": {"pass": False, "issues": issues, "source": "auto"},
+            "current_stage": "revising",
+        }
+
+    def _quality_route(state: dict[str, Any]) -> str:
+        """quality_gate 条件边：pass -> END；fail -> 回 decision 重生成。"""
+        qc = state.get("quality_check") or {}
+        if qc.get("pass"):
+            return "end"
+        return "revise"
+
+    # ------------------------------------------------------------------
     # 图组装
     # ------------------------------------------------------------------
     builder = StateGraph(GlobalState)
@@ -165,6 +292,18 @@ def build_main_graph(
     builder.add_node("logistics", logistics_node)
     builder.add_node("product", product_node)
     builder.add_node("decision", _decision)
+    if settings.QUALITY_GATE_ENABLED:
+        # 质量自纠回路（考点二十九）：decision -> quality_gate -> (END | 回 decision)
+        builder.add_node("quality_gate", _quality_gate)
+        builder.add_edge("decision", "quality_gate")
+        builder.add_conditional_edges(
+            "quality_gate",
+            _quality_route,
+            {"revise": "decision", "end": END},
+        )
+    else:
+        # 开关关闭时保持旧行为：decision 直接到 END
+        builder.add_edge("decision", END)
 
     builder.add_edge(START, "manager")
     builder.add_edge("manager", "router")
@@ -188,8 +327,6 @@ def build_main_graph(
     builder.add_edge("finance", "router")
     builder.add_edge("logistics", "router")
     builder.add_edge("product", "router")
-    # decision 是终点
-    builder.add_edge("decision", END)
 
     return builder.compile(checkpointer=checkpointer)
 
@@ -200,6 +337,7 @@ def run_question(
     user_id: str = "default",
     checkpointer: Any = None,
     callbacks: Optional[list[Any]] = None,
+    human_in_the_loop: bool = False,
 ) -> dict[str, Any]:
     """执行一次用户问题（主入口）。
 
@@ -210,11 +348,14 @@ def run_question(
         checkpointer: 可注入 checkpointer（默认自动获取 PostgresSaver 单例）。
         callbacks: 可选 LangChain 回调（如评估脚本的 token 用量采集器），
             经 invoke config 透传给图内所有 LLM 调用。
+        human_in_the_loop: 质量门自动回炉耗尽后是否 interrupt() 暂停等用户纠正
+            （考点二十九；默认 False 即非交互放行，True 时调用方需处理 __interrupt__ 并 resume）。
 
     Returns:
-        包含 final_answer / decision_result / department_results 的完整状态字典。
+        包含 final_answer / decision_result / department_results 的完整状态字典；
+        human_in_the_loop 触发暂停时，结果含 __interrupt__ 键（见 quality_gate）。
     """
-    logger.info("run_question.start", thread_id=thread_id, question=question[:100])
+    logger.info("run_question.start", thread_id=thread_id, question=question[:100], hilt=human_in_the_loop)
     if checkpointer is None:
         from app.memory.checkpoint import get_checkpointer
         checkpointer = get_checkpointer()
@@ -229,7 +370,12 @@ def run_question(
         "skipped_tasks": [],
         "current_task": "",
     }
-    invoke_config: dict[str, Any] = {"configurable": {"thread_id": thread_id}}
+    invoke_config: dict[str, Any] = {
+        "configurable": {
+            "thread_id": thread_id,
+            "human_in_the_loop": human_in_the_loop,
+        }
+    }
     if callbacks:
         invoke_config["callbacks"] = callbacks
     result = app.invoke(

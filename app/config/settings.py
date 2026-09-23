@@ -66,6 +66,13 @@ class Settings(BaseSettings):
     SQL_STATEMENT_TIMEOUT_MS: int = 30_000
     SQL_MAX_LIMIT: int = 5_000
 
+    # ---------- 质量自纠回路（考点二十九，2026-09-23） ----------
+    # quality_gate 节点评估 decision 输出；不合格带 feedback 回炉重生成，耗尽后走 human-in-the-loop 或放行
+    QUALITY_GATE_ENABLED: bool = True           # 总开关：False 时 decision 直接到 END（等同旧行为）
+    QUALITY_GATE_JUDGE_ENABLED: bool = False    # 是否启用 LLM 裁判查跑题/漏答（规则检查永远启用；开启后每次回答多一次 small 模型调用）
+    QUALITY_GATE_MAX_AUTO_RETRIES: int = 2      # 自动回炉上限；超过后若 human_in_the_loop=True 则 interrupt() 暂停，否则放行并记日志
+    QUALITY_GATE_MIN_SUMMARY_LEN: int = 15      # 核心结论最短长度（低于视为无效回答）
+
     # ---------- Redis（可选） ----------
     REDIS_URL: str = ""
 

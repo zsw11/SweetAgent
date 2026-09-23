@@ -55,6 +55,12 @@ class GlobalState(TypedDict, total=False):
     # Decision Agent 最终结论
     decision_result: dict[str, Any]
 
+    # 质量自纠回路（考点二十九）：quality_gate 评估 decision 输出，
+    # 不合格则带 feedback 回 decision 重生成；自动重试耗尽后 interrupt() 等用户纠正
+    quality_iteration: int          # 已回炉重生成次数（自动 + 用户反馈轮）
+    quality_feedback: str           # 偏差诊断/用户纠正意见（传给 decision 重生成的修正指令）
+    quality_check: dict[str, Any]   # 质量门评估结果（pass / issues / source / approved / force_pass）
+
     # Human-in-the-loop 中断载荷
     interrupt_payload: dict[str, Any]
 

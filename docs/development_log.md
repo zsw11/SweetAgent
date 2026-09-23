@@ -1457,3 +1457,107 @@ class GlobalState(TypedDict, total=False):
 - 类比：dict 字段用 `_merge_dict`（按 key 合并）解决同一问题，list 用 `_add_unique`（按元素去重）——同一机制、两种容器
 
 **核心一句话**：`Annotated[T, fn]` 是把字段的"覆盖写入"换成"归约写入"——LangGraph 每次节点返回都调 `fn(旧累积, 新增量)` 合并，并行写共享列表/字典靠它不互相覆盖、不丢数据、天然幂等。
+### 考点二十八：LLM 模型实例要不要缓存复用？——get_chat_model 每次 new 的真相（2026-09-22 代码精读）
+
+**面试官怎么问**：你的系统每个节点都用 LLM，模型实例是每次调用都 new 一个 ChatOpenAI 吗？这样有什么问题？怎么优化？复用实例会不会有并发问题？
+
+**现状与真相**：`app/llm.py` 的 `get_chat_model` 每次调用都 `return ChatOpenAI(...)` 新建实例——8 个调用点里，agent 构造期（base/decision/manager）低频无所谓，但 SQL 生成/修复（generator.py:76,95）和记忆裁判/提取（judge.py:74、extractor.py:88）是热路径，每次请求都 new。**注意：ChatOpenAI 是配置对象不是网络连接，new 本身不发起请求，真实成本是底层 httpx client 每次重建、TCP/TLS 连接不复用**——值得优化但别过度设计。另有 `get_cached_chat_model`（@lru_cache）定义了却无任何调用点，属死代码。
+
+**设计（推荐零改动方案）**：`@lru_cache(maxsize=32)` 直接加在 `get_chat_model` 上，函数体一字不改——8 个调用点零改动自动全部缓存；按 (provider, tier, temperature) 三维度做缓存 key（默认参数也参与）。`get_cached_chat_model` 删除或保留一行兼容。
+
+**为什么**：缓存加在唯一工厂入口（而不是让调用方各自缓存）才能做到"一处声明、全链收益"，且不破坏现有调用契约。ChatOpenAI 实例可复用且线程安全（内部 httpx client 并发安全），正好契合 LangGraph 并行 fan-out 场景——O/F/L 并行节点共享同一实例互不干扰。
+
+**注意点**：① 测试污染——@lru_cache 缓存实例，mock 后需 `get_chat_model.cache_clear()` 清理，否则跨用例状态残留；② temperature 作为缓存维度之一，不同温度会产生多份实例（可接受）；③ 若未来要热更新 key/模型，lru_cache 需 cache_clear 或改手动注册表方案。
+
+**核心一句话**：LLM 实例是"可复用的配置对象"而非"一次性连接"，在统一工厂入口加 @lru_cache 即可零改动全链复用；真正要防的是测试 mock 污染，而不是实例本身的并发安全。
+
+**追问：缓存共享实例，并行调用会不会数据串扰？** —— 不会。数据（prompt/问题/SQL/历史）全部走"参数通道"（model.invoke(prompt)），ChatOpenAI 内部不保存调用级状态，是"执行器"而非"会话对象"；会话/记忆在 LangGraph state 里管理，不进实例。实例内部只有配置（构造时定死，缓存按 (provider,tier,temperature) 分 key）和 httpx client 连接池（请求/响应天然配对，线程安全）。真正会串的只有三个反例：①往实例属性塞状态（model.last_prompt=xxx）；②实例级 callback 写"上次请求"共享变量——本项目 UsageCollector 通过 invoke config 传入而非绑实例，是正确示范；③复用流式响应对象。项目并行 fan-out 共享同一实例安全（LangChain 官方支持 ChatOpenAI 并发复用）。核心：共享实例只共享执行能力、不共享数据——数据在参数、历史在 state，不往实例塞状态即可零风险。**追问：每次 new 的都是独立对象吗？能不能用线程池/对象池维护？** —— 每次 new 都是独立实例（配置同、实例不同），各自持有独立 httpx client（独立连接池）——N 个实例 = N 套连接池，TCP 不复用，这是"每次 new"的真正代价。但**线程池是并发执行调度器，管"执行"不管"对象"**，概念错位；对象池（acquire/release）是为"有状态、不可并发、创建昂贵"的资源（数据库连接）设计的，ChatOpenAI 无状态、httpx client 线程安全、可并发共享，池化是过度设计。正确方向是"共享"：① @lru_cache 共享实例 → 共享连接池；② 需要精细控制时显式传 http_client=httpx.Client(limits=..., timeout=...) 自定义连接池/超时/重试。LangGraph 并行 fan-out 下共享同一实例并发请求安全高效，无需额外线程池。
+
+### 考点二十九：StateGraph 生成的答案和问题有偏差，会自己纠正吗？（2026-09-23 代码精读）
+
+**面试官怎么问**：你的多 Agent 用的是 langgraph.graph.state.StateGraph——如果最后生成的答案和用户问题有偏差（跑题、漏答、答非所问），框架会自动纠正优化吗？为什么？
+
+**设计（本项目真实实现，app/graph/main_graph.py + app/agents/finance/graph.py）**：
+- **框架层不内置自纠正**：StateGraph 是确定性执行框架（节点=函数、边=静态/条件路由、状态=reducer 归约），图怎么走完全由开发者定义的拓扑决定，它自己不会"判断答案好不好"，也不会主动回炉重生成。纠不纠正 = 你的图里有没有"生成→评估→重试"回路
+- **现状盘点**：① 主图 `manager→router→O/F/L(并行)→router→product→router→decision→END`，decision 是**一次性 synthesize**（decision/graph.py: START→synthesize→END），直接进 END——**最终答案没有任何质量校验/回炉回路**，答案偏差目前不会自动纠正；② 部门子图有 retry 回路（finance/graph.py: plan→query→analyze→decide→retry→query），但它的判据是 `enough/missing` + `_KNOWN_REQS` 白名单，纠的是**"查数信息充分性"**，不是"答案与问题的一致性"；③ 异常 → error_state → 降级 summary 是**故障兜底**，不是质量纠正
+- **LangGraph 里做自纠正的正确姿势**（框架只提供循环执行能力，评估逻辑必须业务自建）：
+  1. **Reflection/Critic 回路**：decision 后加 quality_gate 节点，把 final_answer + user_question 交给 LLM 裁判或规则检查（是否覆盖问题要点/是否跑题/是否空泛），不合格则把批评意见反馈给 decision 重新生成，**带最大轮数（如 2 轮）防死循环烧钱**——与 SQL repair 三道闸（考点六）同一哲学
+  2. **Grounding 证据校验**：答案里关键数字/事实必须在 department_results.evidence 里能找到来源，找不到回炉——与考点二十二"无依据禁编造"、考点二十三评估体系同源
+  3. **检索侧纠偏（RAG 场景）**：答案偏差源于检索内容与问题无关时，在检索节点后加相关性评估（rerank/阈值），低于阈值改写 query 重新检索（query rewriting loop）
+  4. **Human-in-the-loop**：LangGraph `interrupt()` 暂停等用户确认/纠正，checkpointer + time-travel 从断点继续（本项目 checkpointer 已就绪，考点十九）
+
+**为什么框架不内置**：- "答案与问题一致"没有通用客观标准（不同业务评判维度不同），框架无法内置裁判；- 框架能给的只是**循环的执行能力**（conditional edge 回边 + reducer 状态累积 + checkpointer 断点恢复），"什么算偏差、偏差了怎么办"是业务规则——这正是评估体系（考点二十三）要解决的命题；- 业界对照：Self-RAG 的 critique token、Reflexion 的反思式重试，本质都是"显式评估节点 + 有界循环"
+
+**最小改动方案（若要做）**：主图 `decision→END` 改 `decision→quality_gate→END`，条件边回 `decision`（携带 feedback 字段），`iteration≥2` 强制放行——复用现有 DecisionAgent 的 run() 加 feedback 参数即可，节点数 +1、状态字段 +2（feedback/quality_iteration），不动部门子图
+
+**核心一句话**：StateGraph 不会自动纠正答案偏差——它是"能跑循环的执行器"不是"会自我评判的裁判"，答案质量回路（生成→评估→带反馈回炉→有界轮数）必须由开发者显式画进图里；本项目现状是"部门查数有重试、最终答案无校验"，要补只需在 decision 和 END 之间加一个 quality_gate 条件边。
+
+**实现落地（2026-09-23，真实代码）**：
+- **改动文件**：`app/graph/quality.py`（新，评估逻辑）+ `app/graph/main_graph.py`（quality_gate 节点/条件边/human_in_the_loop）+ `app/graph/state.py`（quality_iteration/quality_feedback/quality_check 三字段）+ `app/agents/decision/agent.py`+`prompts.py`（run 加 feedback 参数、prompt 加"反馈意见"段）+ `app/config/settings.py`（QUALITY_GATE_ENABLED/JUDGE_ENABLED/MAX_AUTO_RETRIES/MIN_SUMMARY_LEN）+ `app/api/chat.py`（awaiting_feedback 响应 + POST /chat/{thread_id}/resume 端点）+ `webui.py`（阶段标签）+ `scripts/verify_quality_gate.py`（mock 集成测试）/`verify_quality_gate_live.py`（真实链路冒烟）
+- **feedback 字段是干嘛的**：它是"偏差诊断 + 修正指令"的统一载体——①自动回炉时由 quality_gate 把发现的偏差（如"核心结论为空"）拼成 feedback 串；②human-in-the-loop 时由用户输入纠正意见作为 feedback；decision 重生成时把 feedback 注入 prompt 的"反馈意见"段（"必须逐条修正"），部门结果保留在 state 不重跑 Router，只重生成答案——这正是"带反馈回炉"的含义
+- **interrupt 落地要点**：LangGraph 的 `interrupt()` 是通过**抛出 GraphInterrupt 异常**实现暂停的（执行器捕获后 invoke 返回 `__interrupt__`），**绝不能 try/except 吞掉**；无 checkpointer 编译时（内存图/测试）用 `_hilt_ok = human_in_the_loop and checkpointer is not None` 守卫降级为 force_pass；resume 用 `Command(resume=payload)` + 同一 thread_id/checkpointer 从断点继续（time-travel）
+- **行为分层**：默认（human_in_the_loop=False）自动回炉耗尽后 force_pass 放行——评估/verify 等既有链路零破坏；API 传 human_in_the_loop=true 才 interrupt 等用户
+- **验证**：mock 集成四场景全过（自动回炉修正 / interrupt→approve / interrupt→revise 带用户 feedback / 非交互 force_pass）；真实链路冒烟 30.4s，quality_gate.pass 直接放行零额外 LLM 调用
+
+
+### 考点三十：数据域白名单里的 "knowledge" 为什么走 RAG 不走 SQL？——KNOWLEDGE_DEPARTMENT 是干嘛的（2026-09-23 代码精读）
+
+**面试官怎么问**：你系统里 `KNOWLEDGE_DEPARTMENT: Optional[str] = None` 这个字段是什么？注释说"子类设置后，数据域白名单中的 knowledge 将走 RAG 向量检索而非 SQL 生成"——为什么一个数据域会走两种不同的查询路径？
+
+**设计（本项目真实实现，app/agents/base.py:136-140, 217-223, 260-301）**：
+- **`KNOWLEDGE_DEPARTMENT` = 知识库检索的部门过滤标签**（documents 表按 department 分域存储），子类设置后启用 RAG；基类默认 `None` = 不接入知识库（RAG 是可选能力，新部门不设置即天然关闭）
+- **`knowledge` 是白名单里的特殊"路由指令"而非业务表**：`_plan()` 用 `KNOWN_REQS` 白名单过滤 LLM 输出的数据域（如 operation 的 `{sales_sku, brand_summary, ad, review, inventory, knowledge}`）；当 plan 中出现 `knowledge` 时，`_query_one()` 里 `if req == "knowledge": return self._query_knowledge(task)` **拦截**，不走 generate_sql→validate→execute→repair 链路
+- **RAG 执行**：`_query_knowledge` 把任务原文向量化 → `retriever.search(task, department=self.KNOWLEDGE_DEPARTMENT)` 按部门过滤 top-k 召回；**返回与 SQL 完全一致的 observations 结构**（columns/rows/row_count/duration_ms/sql，sql 字段伪写成 `rag:search(department=..., top_k=5)`）——下游 `_analyze` 无需区分来源
+- 四部门（O/F/L/P）均已设置各自标签，全部启用 RAG
+
+**为什么**：
+- **知识是非结构化文本，SQL 查不出"退货政策是什么"**——制度/规则/清单类文档不属于任何业务表，向量检索才是对的工具；SQL 生成链对它是"错误工具 + 浪费 token"
+- **为什么保留在统一白名单**：规划层仍是统一的"数据域列表"机制，`knowledge` 同样受白名单约束（防 LLM 编造数据域），只是执行器不同——**路由在 `_query_one` 层拦截，上层零感知**
+- **为什么返回统一 observations**：`_query_one`→`_analyze` 接口不变，主循环/子图/repair 逻辑不用为 RAG 开分支，最小改动接入
+- **为什么按部门过滤**：知识库按部门分域，运营只搜运营的文档，防跨部门知识污染（与 SQL 数据域白名单同一安全哲学）
+- **为什么基类默认 None 而非空串**：None 表达"未启用"的语义（可选能力声明），与 `KNOWN_REQS` 里恒有 knowledge 互补——白名单声明"允许查"，部门标签声明"真的接没接"
+
+**踩过的坑**：`self.executor` 是 SQL 生成工具函数（输入 sql 字符串）而非 ReadOnlyExecutor 实例，所以 `_query_knowledge` 不传 executor，让 KnowledgeRetriever 自建只读执行器（agent_reader 角色）——传错会导致 RAG 检索走 SQL 生成工具直接报错
+
+**核心一句话**：`knowledge` 不是表是"路由指令"——白名单里声明"允许查知识"、`KNOWLEDGE_DEPARTMENT` 声明"真的接 RAG"，执行时在 `_query_one` 拦截改走向量检索，但返回与 SQL 同构的 observations，让"换了查询引擎"这件事对整个分析链路透明。
+
+
+**追问：KNOWLEDGE_DEPARTMENT 不就是个部门过滤吗？"从 SQL 切换到 RAG"到底由谁触发？（2026-09-23）**
+
+**澄清**：切换**不是** `KNOWLEDGE_DEPARTMENT` 触发的——真正的切换点是 `_query_one` 的硬编码分支（base.py:222）：`if req == "knowledge": return self._query_knowledge(task)`，只要 plan 里出现 `knowledge` 这个数据域就**无条件走 RAG**，字段设没设都不影响路由。`KNOWLEDGE_DEPARTMENT` 的真实职责是 RAG 路径**内部**的检索参数：`retriever.search(task, department=self.KNOWLEDGE_DEPARTMENT)` → 拼进 WHERE `d.department = %s`（retriever.py:185-187），决定"从哪个部门的知识子空间捞"。
+
+**注释因果链的正确读法**：子类设置标签 = 声明"本部门真的接入了知识库"（有文档、有部门归属）→ 它白名单里的 `knowledge` 才是**有意义的 RAG（按部门隔离）**；子类不设置（None）时 `knowledge` 照样被拦截走 RAG，但 `department=None` → WHERE 不拼过滤条件 → **全库检索**，运营的问题可能召回财务文档（跨部门污染）——这正是要求子类覆盖它的原因。
+
+**权限 vs 过滤**：无任何身份鉴权，不是权限控制；是"检索命名空间/分域路由"（类似 tenant_id 过滤）——决定"查哪个部门的知识"，不决定"能不能查"（"能不能查知识"由白名单 `KNOWN_REQS` 是否含 knowledge 表达）。
+
+**核心一句话**：切换由"数据域是 knowledge"决定（`_query_one` 的 if 分支），`KNOWLEDGE_DEPARTMENT` 只是开关拨到 RAG 之后的"检索范围旋钮"——它是过滤参数不是触发开关，设了才按部门隔离，不设则全库召回。
+
+
+**追问二：一个问题既要业务数据又要知识规则怎么办？knowledge 域会不会"替代"业务查询？（2026-09-23，用户拍板方案 C）**
+
+**澄清**：`_query_one` 是按**单个数据域**分派的，不是"整个任务二选一"。plan 是列表——`["sales_sku", "knowledge"]` 时两个 req 各自执行（sales_sku 走 SQL、knowledge 走 RAG），observations 里两类结果都在、`_analyze` 一起消费，**"同时走 SQL + RAG"架构上已支持**。`if req == "knowledge"` 只是说"这一个 req 不生成 SQL"，不是"整个任务不走 SQL"。
+
+**真实缺口（用户直觉点到的）**："同时"没有机制保证，全靠 LLM 一次性 plan 的自觉——可能只规划 knowledge 漏掉业务域（该查表没查），或只规划业务域漏掉 knowledge（规则没参考）。这是**规划完整性问题**，不是路由代码问题；评估体系（考点二十三 expected_agents 必选集合 + rag:<部门> 标注）正是抓这类漏规划的。
+
+**三方案权衡**：
+- **A（最小改动）**：`_plan()` 后置补全——LLM 输出 knowledge 且无任何业务域时强制补 `FALLBACK_REQ`（查知识时至少带一次基础业务查询）。代价：纯知识问题（"退货政策是什么"）白查业务表浪费 token。
+- **B（语义重构）**：knowledge 不占数据域名额、变全局背景，每次业务查询自动附 RAG。代价：plan/observations/评估标注（rag:部门）全要动，每次请求检索开销增加。
+- **C（保持现状，已拍板）**：knowledge 就是普通数据域，是否同时查业务由 LLM plan 决定，靠评估兜底——与设计文档意图一致（"plan 阶段 LLM 自主决定是否查知识库"）。
+
+**为什么选 C**：强制补业务查询治的是"LLM 漏规划"的症状而非根因（根因在 prompt 引导/模型能力，应靠 prompt 迭代 + 评估抓 bad case）；且纯知识问题会付出白查业务表的成本；现状与设计意图一致、零改动。**触发重审条件**：评估出现"该查业务却只查知识"的稳定 bad case 时，再上方案 A。
+
+
+**追问：human_in_the_loop=True 时 interrupt() 真的会"等待用户输入"吗？`Command(resume=payload)` 是什么意思？（2026-09-23）**
+
+**interrupt() 是"暂停并返回"，不是"阻塞等待"**。三层理解：
+1. **图内部**：interrupt(payload) 通过**抛 GraphInterrupt 异常**实现暂停，执行器捕获后 `invoke` **立即返回**（进程/线程不挂起），结果带 `__interrupt__` 键 + payload（候选答案、issues、iteration）。
+2. **API 层**：chat.py 检测 `__interrupt__` → 返回 `stage=awaiting_feedback` + `quality_pending`，后端线程释放。阻塞等用户=占线程/连接，Web 场景不可接受，所以暂停后立即交还控制权。
+3. **真正的等待在应用层**：前端展示候选答案+诊断 → 用户输入 approve / revise+feedback → 调 `POST /chat/{thread_id}/resume`。
+
+**`Command(resume=payload)` 语义**：`Command` 是 langgraph.types 的指令对象，`resume=payload` = "我不是发新任务，是**回答那个被 interrupt() 暂停的调用点**，payload 就是它的返回值"。执行器用同一 thread_id + checkpointer 找断点快照恢复，让 `feedback = interrupt({...})`（main_graph.py:216）**第二次执行时不再暂停**，返回 payload → 节点据此分支（approve→放行 END；revise→带 feedback 回 decision 再生成）。
+
+**两处 invoke 对比**：普通 `invoke(initial_state, config)` = 从图入口喂新输入；`invoke(Command(resume=payload), config)` = 从断点恢复。resume 后 invoke 返回恢复后整个图跑完的 state，所以 resume_chat 可直接 `result.get("user_question")` 取原始问题（数据在 checkpoint 里，客户端不用重传）。
+
+**为什么这么设计（面试点）**：① 抛异常而非阻塞 → 无状态化，任何进程/任何时候拿 thread_id 都能续跑（time-travel，考点十九）；② checkpoint 落库断点 → 进程重启也能 resume；③ `_hilt_ok = human_in_the_loop and checkpointer is not None` 守卫 → 无 checkpointer 编译（测试/内存图）降级 force_pass 不炸。
+
+**核心一句话**：interrupt = 暂停点 + 断点落盘 + 控制权交还；Command(resume) = 带着用户答复回到暂停那一行、让 interrupt() 的返回值 = payload。
