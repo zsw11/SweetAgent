@@ -25,13 +25,9 @@
 - **预估工作量**：S（半天~1 天，取决于三问确认）
 - **验收标准**：一次真实提问在 LangSmith 面板可见完整 trace 树（含 LLM 调用、工具调用、quality_gate 判定）。
 
-### OPT-03 评测报告正式化
-- **现状**：`expected_agents` 必选集合 + `rag:<部门>` 标注 + verify 脚本已扎实，但无正式评测报告产物。
-- **目标**：产出可交付、可复现的评测报告（质量能力 + 求职证据双收）。
-- **做法**：新增 `scripts/eval_report.py`——运行场景集（正常/边缘/失败注入），汇总通过率、bad case 归因、质量门触发统计，输出 Markdown/JSON 报告到 `docs/eval/`。
-- **涉及范围**：`scripts/`、`docs/eval/`。
-- **预估工作量**：S（半天）
-- **验收标准**：一份含「场景清单 / 通过率 / bad case 表 / 改进闭环」的报告，可一键重跑复现。
+### OPT-03 评测报告正式化（**✅ 已完成 2026-09-24**）
+- **落地**：新增 `scripts/eval_report.py`——读 evaluation_runs/scores/cases，汇总批次对比 + 最新批次明细 + bad case 归因 + 费用耗时，输出 Markdown 到 `docs/eval/`；渲染/bad case 提取已 mock 验证，DB 不可用优雅降级提示。用法：`run_evaluation.py` 跑完 → `eval_report.py` 一键出报告。
+- **待办（可选）**：MCP tracking 用例加入用例库（`expected_sql_pattern` 加 `mcp:` 标注）；质量门触发统计需 run_evaluation 先落库质量门字段。
 
 ---
 
@@ -112,7 +108,7 @@
 |---|---|---|---|---|
 | OPT-01 | MCP 接入 | P0 | M | ✅（2026-09-24） |
 | OPT-02 | LangSmith 可观测性 | P0 | S | ⬜（待三问确认） |
-| OPT-03 | 评测报告正式化 | P0 | S | ⬜ |
+| OPT-03 | 评测报告正式化 | P0 | S | ✅（2026-09-24） |
 | OPT-04 | 结构化输出强化 | P1 | S~M | ⬜ |
 | OPT-05 | Function Calling 原生化 | P1 | M | ⬜ |
 | OPT-06 | 提示注入/输出安全 | P1 | M | ⬜ |
