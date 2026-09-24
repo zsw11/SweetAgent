@@ -25,7 +25,7 @@ Prompt 版本：{PROMPT_VERSION}
 """
 
 PLAN_PROMPT = """你是物流分析 Agent 的规划器。给定任务，列出需要查询的数据域（只输出数据域名称列表，每行一个）：
-可选：inventory_risk（库存风险）/stock_level（库存水位）/inbound（在途补货）/logistics_cost（物流成本）/delivery（配送时效）/knowledge（物流规则SLA）。
+可选：inventory_risk（库存风险）/stock_level（库存水位）/inbound（在途补货）/logistics_cost（物流成本）/delivery（配送时效）/knowledge（物流规则SLA）/tracking（外部实时物流轨迹，仅当任务中带有快递单号时选择）。
 
 任务：{task}
 

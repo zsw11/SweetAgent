@@ -1561,3 +1561,25 @@ class GlobalState(TypedDict, total=False):
 **为什么这么设计（面试点）**：① 抛异常而非阻塞 → 无状态化，任何进程/任何时候拿 thread_id 都能续跑（time-travel，考点十九）；② checkpoint 落库断点 → 进程重启也能 resume；③ `_hilt_ok = human_in_the_loop and checkpointer is not None` 守卫 → 无 checkpointer 编译（测试/内存图）降级 force_pass 不炸。
 
 **核心一句话**：interrupt = 暂停点 + 断点落盘 + 控制权交还；Command(resume) = 带着用户答复回到暂停那一行、让 interrupt() 的返回值 = payload。
+
+
+### 考点三十一：Agent 怎么接外部能力？——MCP 接入快递100 物流跟踪（OPT-01 落地，2026-09-24）
+
+**面试官怎么问**：你们 Agent 要查外部数据（如快递物流）怎么办？直接调 HTTP API 不就行了吗，为什么上 MCP？MCP 和普通 HTTP API 的本质区别是什么？
+
+**设计**：新增 tracking 数据域走 MCP 协议（快递100 streamable 端点），与 knowledge 域同一模式——在 _query_one 加 `if req == "tracking": return self._query_tracking(task)`，不经 LLM function calling、不经 SQL；_query_tracking 调 `LogisticsTrackingClient().track(task)`：正则提取单号 → MCP auto_number 识别承运商 → query_trace 查实时轨迹 → 返回与 SQL/RAG 同构的 observations（columns/rows/row_count/duration_ms/sql="mcp:kuaidi100(query_trace)"），下游 _analyze 无感；无 key / 无单号 / 连接失败一律降级空 rows + warning，不炸主链路。key 走 settings（TRACKING_MCP_KEY，.env 注入，.gitignore 已忽略）。
+
+**MCP vs HTTP 的本质区别（核心考点）**：HTTP 是"通用网络传输协议"，MCP 是"为 LLM 调用工具而生的标准化协议"——类比：HTTP API 是每种电器自带专用插头，MCP 是 USB 标准。四个差异：
+① **动态发现**：MCP 有 tools/list + input_schema（运行时拿到工具名、描述、参数 JSON Schema），HTTP 靠读文档写死调用代码；
+② **工具语义**：MCP 工具即函数（name/description/inputs 直接喂 LLM function calling），HTTP 接口是给人/程序读文档设计的；
+③ **传输可换**：stdio（本地进程）/ SSE / streamable HTTP 同协议多传输，HTTP 只有网络；
+④ **生态复用**：一次接入 MCP，Claude/Cursor/自研 Agent 通吃；HTTP 每个客户端单独对接每个 API（认证/签名/解析各写一遍）。
+对快递100 具体：HTTP 路径要自己实现 sign 签名（MD5(param+key+customer) 大写）+ 拼 com/num/phone/from/to + 解析返回；MCP 路径 server 把物流查询封装成工具，签名细节由 server 处理。
+
+**为什么选 MCP 而非 HTTP 直连**：① 功能上 HTTP 直连更简单（官方 demo 就是 HTTP），但 MCP 带来**协议层证据**——工具发现运行时化、不读文档写死、LLM 语义原生；② 快递100 官方支持 streamable 端点（文档标注推荐、SSE 可能不稳）；③ 与 OPT-01 目标一致（Client 方向，条件触发项）。代价：mcp 2.2.0 协议握手 + 依赖（cffi/cryptography 等），比 requests.post 重。
+
+**mcp 2.2.0 Python SDK 踩坑（记录）**：① 导入名 streamable_http_client（下划线，非 streamablehttp_client）；② 上下文返回 **2-tuple** (read, write)——旧版 session_id 已移除；③ Tool 字段是 input_schema（下划线，非 inputSchema）；④ 异常是 BaseExceptionGroup，需展开 .exceptions 看真实错误；⑤ 工具返回文本在 res.content[i].text。
+
+**真实验证结果**：streamable 初始化成功 → 动态发现 5 个工具（query_trace 核心 / auto_number 单号识别承运商 / estimate_time / estimate_price / estimate_time_with_logistic）→ auto_number 识别 YT9693083639795=圆通速递(yuantong) ✅；query_trace 同单号返回"查询无结果"（demo 单号失效，非 MCP 问题，机制已通）。verify_tracking_mcp.py 三场景全过：无 key 降级 / 无单号降级 / 真实调用识别承运商。
+
+**核心一句话**：MCP 不是比 HTTP "更强"的传输，而是"让 LLM 应用以统一协议发现和调用任意工具"的标准层——HTTP 修的是路，MCP 做的是 USB 插口，代价是握手复杂度，收益是动态发现 + 生态复用 + LLM 函数语义。

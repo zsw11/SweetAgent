@@ -217,10 +217,13 @@ class BaseDepartmentAgent:
     def _query_one(self, req: str, task: str, context: dict[str, Any]) -> dict[str, Any]:
         """执行一个数据需求：生成 SQL -> 校验 -> 执行；失败/空结果自动 repair。
 
-        knowledge 数据域不走 SQL——RAG 向量检索（见 _query_knowledge）。
+        knowledge 数据域不走 SQL——RAG 向量检索（见 _query_knowledge）；
+        tracking 数据域不走 SQL——外部 MCP 物流轨迹（见 _query_tracking，OPT-01）。
         """
         if req == "knowledge":
             return self._query_knowledge(task)
+        if req == "tracking":
+            return self._query_tracking(task)
         schema_ctx = self._build_schema_context(req, context)
         sql = self._generate_sql(req, task, schema_ctx)
         logger.debug(f"{self.AGENT_NAME}.query.sql", requirement=req, sql=sql)
@@ -298,6 +301,35 @@ class BaseDepartmentAgent:
             "duration_ms": duration_ms,
             "confidence": overall,
             "sql": f"rag:search(department={self.KNOWLEDGE_DEPARTMENT}, top_k={self.KNOWLEDGE_TOP_K})",
+        }
+
+    # ------------------------------------------------------------------
+    # 外部 MCP：物流轨迹查询（tracking 数据域，OPT-01）
+    # ------------------------------------------------------------------
+    def _query_tracking(self, task: str) -> dict[str, Any]:
+        """外部物流轨迹：MCP 协议调快递100（auto_number 识别承运商 + query_trace 查轨迹）。
+
+        返回与 SQL/RAG 同构的 observations（columns/rows/row_count/duration_ms/sql），
+        下游 analyze 无感；未配置 key / 无单号 / 查询失败时 rows 为空并降级。
+        """
+        from app.tools.logistics_tracking import LogisticsTrackingClient
+
+        import time
+        start = time.perf_counter()
+        rows = LogisticsTrackingClient().track(task)
+        duration_ms = int((time.perf_counter() - start) * 1000)
+        logger.info(
+            f"{self.AGENT_NAME}.tracking.mcp",
+            hits=len(rows), duration_ms=duration_ms, task=task[:80],
+        )
+        return {
+            "requirement": "tracking",
+            "columns": ["tracking_no", "carrier_code", "carrier", "raw", "method", "confidence"],
+            "rows": rows,
+            "row_count": len(rows),
+            "duration_ms": duration_ms,
+            "confidence": rows[0]["confidence"] if rows else "none",
+            "sql": "mcp:kuaidi100(query_trace)",
         }
 
     # ------------------------------------------------------------------

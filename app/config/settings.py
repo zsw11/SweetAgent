@@ -73,6 +73,12 @@ class Settings(BaseSettings):
     QUALITY_GATE_MAX_AUTO_RETRIES: int = 2      # 自动回炉上限；超过后若 human_in_the_loop=True 则 interrupt() 暂停，否则放行并记日志
     QUALITY_GATE_MIN_SUMMARY_LEN: int = 15      # 核心结论最短长度（低于视为无效回答）
 
+    # ---------- 物流跟踪外部 MCP（快递100，OPT-01 落地） ----------
+    # tracking 数据域走 MCP 协议查外部物流轨迹（query_trace / auto_number）；
+    # 未配置 key 或连接失败时降级为空结果，不影响主链路。
+    TRACKING_MCP_URL: str = "https://api.kuaidi100.com/mcp/streamable?key={key}"
+    TRACKING_MCP_KEY: str = "uebKuhFT4730"          # 快递100 授权 key（api.kuaidi100.com 企业后台获取；敏感值建议放 .env）
+
     # ---------- Redis（可选） ----------
     REDIS_URL: str = ""
 

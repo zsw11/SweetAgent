@@ -15,7 +15,7 @@ from app.observability.logging import get_logger
 
 logger = get_logger("logistics_agent")
 
-_KNOWN_REQS: frozenset[str] = frozenset({"inventory_risk", "stock_level", "inbound", "logistics_cost", "delivery", "knowledge"})
+_KNOWN_REQS: frozenset[str] = frozenset({"inventory_risk", "stock_level", "inbound", "logistics_cost", "delivery", "knowledge", "tracking"})
 
 
 class LogisticsAgent(BaseDepartmentAgent):
@@ -35,6 +35,7 @@ class LogisticsAgent(BaseDepartmentAgent):
         "logistics_cost": ["logistics_cost", "carriers", "orders"],
         "delivery": ["logistics_orders", "tracking_events", "carriers"],
         "knowledge": ["knowledge_documents", "knowledge_chunks"],
+        "tracking": [],  # 外部 MCP 物流轨迹（无本地业务表，走 _query_tracking）
     }
 
     KEYWORD_MAP: dict[str, str] = {
@@ -44,6 +45,7 @@ class LogisticsAgent(BaseDepartmentAgent):
         "logistics_cost": "cost",
         "delivery": "tracking",
         "knowledge": "knowledge",
+        "tracking": "tracking",
     }
 
     def _load_dictionary(self) -> str:

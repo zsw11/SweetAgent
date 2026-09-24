@@ -52,13 +52,62 @@ def check_health(base: str) -> dict[str, Any]:
         return {"ok": False, "error": str(exc)}
 
 
-def ask(base: str, question: str, user_id: str = "default") -> dict[str, Any]:
-    """调用 POST /chat，返回 (ok, elapsed, data|error)。"""
+def ask(
+    base: str,
+    question: str,
+    user_id: str = "default",
+    human_in_the_loop: bool = False,
+) -> dict[str, Any]:
+    """调用 POST /chat，返回 (ok, elapsed, data|error)。
+
+    human_in_the_loop=True 时，质量门自动回炉耗尽且答案仍不合格，
+    后端返回 stage="awaiting_feedback"（候选答案 + issues），
+    需再调 resume_chat 提交 approve/revise（考点二十九）。
+    """
     t0 = time.time()
     try:
         r = requests.post(
             f"{base}/chat",
-            json={"question": question, "user_id": user_id},
+            json={
+                "question": question,
+                "user_id": user_id,
+                "human_in_the_loop": human_in_the_loop,
+            },
+            timeout=300,
+        )
+        elapsed = round(time.time() - t0, 1)
+        r.raise_for_status()
+        return {"ok": True, "elapsed": elapsed, "data": r.json()}
+    except requests.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.response.json().get("detail", "")
+        except Exception:
+            pass
+        return {
+            "ok": False,
+            "elapsed": round(time.time() - t0, 1),
+            "error": f"HTTP {exc.response.status_code}: {detail}",
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "elapsed": round(time.time() - t0, 1),
+            "error": str(exc),
+        }
+
+
+def resume_chat(base: str, thread_id: str, action: str, feedback: str = "") -> dict[str, Any]:
+    """POST /chat/{thread_id}/resume：质量门暂停后提交用户意见。
+
+    action="approve"：接受候选答案放行 END；
+    action="revise"：带 feedback（用户纠正意见）重新生成，需非空 feedback。
+    """
+    t0 = time.time()
+    try:
+        r = requests.post(
+            f"{base}/chat/{thread_id}/resume",
+            json={"action": action, "feedback": feedback},
             timeout=300,
         )
         elapsed = round(time.time() - t0, 1)
@@ -295,6 +344,102 @@ def render_memory_panel(base: str, user_id: str) -> None:
 # ---------------------------------------------------------------------------
 # 主页面
 # ---------------------------------------------------------------------------
+def render_chat_result(resp: dict[str, Any], data: dict[str, Any], q: str, uid: str) -> None:
+    """渲染一次 /chat 完整结果（决策报告 / 各部门 / 路由），并记录本轮供"立即沉淀"。"""
+    stage_zh = STAGE_LABELS.get(data["stage"], data["stage"])
+    st.caption(
+        f"耗时 {resp['elapsed']}s · 阶段：{stage_zh} · "
+        f"会话 {data['thread_id'][:8]}… · 用户 {uid}"
+    )
+    render_decision(data["decision_result"])
+
+    st.divider()
+    st.subheader("🏢 各部门分析")
+    depts = data.get("department_results") or {}
+    if depts:
+        tabs = st.tabs(list(depts.keys()))
+        for tab, name in zip(tabs, depts.keys()):
+            with tab:
+                render_department(name, depts[name])
+    else:
+        st.info("本轮没有部门被调度。")
+
+    with st.expander("路由与任务信息", expanded=False):
+        st.write("**规划部门**：", data.get("required_agents"))
+        st.write("**已完成任务**：", data.get("completed_tasks"))
+        st.write("**跳过任务**：", data.get("skipped_tasks"))
+
+    # 记录本轮，供"立即沉淀"使用（/chat 内置钩子已自动尝试提取）
+    st.session_state["last"] = {
+        "thread_id": data["thread_id"],
+        "question": q,
+        "answer": " ".join(
+            filter(
+                None,
+                [
+                    data.get("final_answer", ""),
+                    str((data.get("decision_result") or {}).get("summary", "")),
+                ],
+            )
+        ),
+    }
+    st.caption(
+        "💡 记忆说明：/chat 后端已内置【对话后自动沉淀记忆】钩子（规则+历史阈值触发，"
+        "零额外费用）；如未自动触发，可在左侧【记忆管理】点【立即沉淀本轮对话为记忆】。"
+    )
+
+
+def _handle_resume_result(base: str, resp: dict[str, Any], q: str, uid: str) -> None:
+    """resume 返回后统一处理：成功则渲染结果；若再次暂停（re-revise 后仍不合格）则继续等待。"""
+    if not resp["ok"]:
+        st.error(f"恢复执行失败：{resp['error']}")
+        return
+    data = resp["data"]
+    if data.get("stage") == "awaiting_feedback":
+        render_quality_pending(base, data, uid, q)
+    else:
+        st.success("✅ 已按你的意见恢复执行完成")
+        render_chat_result(resp, data, q, uid)
+
+
+def render_quality_pending(base: str, data: dict[str, Any], uid: str, q: str) -> None:
+    """质量门暂停面板（human-in-the-loop）：展示候选答案 + issues，供用户 approve / revise。
+
+    对应后端 stage="awaiting_feedback"（quality_pending 含 draft_answer / issues），
+    approve -> 放行 END；revise -> 带 feedback 重新生成（考点二十九）。
+    """
+    st.warning("⚠️ 质量门：答案经自动回炉（≤2 次）仍不合格，已暂停等待你确认或纠正。")
+    thread_id = data["thread_id"]
+    st.caption(f"会话 {thread_id[:8]}… · 用户 {uid}")
+    pending = data.get("quality_pending") or {}
+    st.markdown("**候选答案（草稿）**")
+    st.info(pending.get("draft_answer") or "（空）")
+    issues = pending.get("issues") or []
+    if issues:
+        st.markdown(f"**质量门诊断（{len(issues)}）**")
+        for it in issues:
+            st.markdown(f"- {it}")
+    st.markdown("**请选择：接受该答案，或输入纠正意见后重新生成**")
+
+    col1, col2 = st.columns([1, 2])
+    with col1:
+        if st.button("✅ 接受答案", key=f"approve_{thread_id[:8]}"):
+            resp = resume_chat(base, thread_id, "approve")
+            _handle_resume_result(base, resp, q, uid)
+    with col2:
+        feedback = st.text_input(
+            "纠正意见（revise 必填）",
+            key=f"fb_{thread_id[:8]}",
+            placeholder="例如：请补充库存因素，并正面回答销量下滑的具体原因",
+        )
+        if st.button("✏️ 提交修改并重新生成", key=f"revise_{thread_id[:8]}"):
+            if not (feedback or "").strip():
+                st.error('action="revise" 时必须提供非空 feedback')
+            else:
+                resp = resume_chat(base, thread_id, "revise", feedback.strip())
+                _handle_resume_result(base, resp, q, uid)
+
+
 def main() -> None:
     st.set_page_config(page_title="SweetNight Agent 工作台", layout="wide")
     st.title("SweetNight 跨境电商 AI Agent 工作台")
@@ -305,6 +450,12 @@ def main() -> None:
     base = api_base()
     user_id = st.sidebar.text_input("用户 ID", "default")
     uid = user_id.strip() or "default"
+    hilt = st.sidebar.checkbox(
+        "质量门人工确认（human-in-the-loop）",
+        value=False,
+        help="答案经自动回炉仍不合格时，暂停等待你确认或输入纠正意见（考点二十九）；"
+        "关闭时不合格答案直接放行（非交互）。",
+    )
 
     health = check_health(base)
     if health["ok"]:
@@ -329,52 +480,15 @@ def main() -> None:
             st.warning("请输入问题。")
         else:
             with st.spinner("Agent 执行中（真实调用多部门 LLM，预计 10~60 秒）..."):
-                resp = ask(base, q, uid)
+                resp = ask(base, q, uid, human_in_the_loop=hilt)
             if not resp["ok"]:
                 st.error(f"执行失败：{resp['error']}")
             else:
                 data = resp["data"]
-                stage_zh = STAGE_LABELS.get(data["stage"], data["stage"])
-                st.caption(
-                    f"耗时 {resp['elapsed']}s · 阶段：{stage_zh} · "
-                    f"会话 {data['thread_id'][:8]}… · 用户 {uid}"
-                )
-                render_decision(data["decision_result"])
-
-                st.divider()
-                st.subheader("🏢 各部门分析")
-                depts = data.get("department_results") or {}
-                if depts:
-                    tabs = st.tabs(list(depts.keys()))
-                    for tab, name in zip(tabs, depts.keys()):
-                        with tab:
-                            render_department(name, depts[name])
+                if data.get("stage") == "awaiting_feedback":
+                    render_quality_pending(base, data, uid, q)
                 else:
-                    st.info("本轮没有部门被调度。")
-
-                with st.expander("路由与任务信息", expanded=False):
-                    st.write("**规划部门**：", data.get("required_agents"))
-                    st.write("**已完成任务**：", data.get("completed_tasks"))
-                    st.write("**跳过任务**：", data.get("skipped_tasks"))
-
-                # 记录本轮，供"立即沉淀"使用（/chat 内置钩子已自动尝试提取）
-                st.session_state["last"] = {
-                    "thread_id": data["thread_id"],
-                    "question": q,
-                    "answer": " ".join(
-                        filter(
-                            None,
-                            [
-                                data.get("final_answer", ""),
-                                str((data.get("decision_result") or {}).get("summary", "")),
-                            ],
-                        )
-                    ),
-                }
-                st.caption(
-                    "💡 记忆说明：/chat 后端已内置【对话后自动沉淀记忆】钩子（规则+历史阈值触发，"
-                    "零额外费用）；如未自动触发，可在左侧【记忆管理】点【立即沉淀本轮对话为记忆】。"
-                )
+                    render_chat_result(resp, data, q, uid)
 
 
 if __name__ == "__main__":

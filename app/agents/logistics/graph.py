@@ -34,7 +34,7 @@ def build_logistics_agent(agent: Optional[LogisticsAgent] = None):
         queried = set(state.get("queried") or [])
         observations = list(state.get("observations") or [])
         sql_history = list(state.get("sql_history") or [])
-
+        # 查询规划的所有数据域
         for req in plan:
             if req in queried:
                 continue
@@ -49,7 +49,7 @@ def build_logistics_agent(agent: Optional[LogisticsAgent] = None):
                 queried.add(req)
 
         return {
-            "observations": observations,
+            "observations": observations,#观察结果
             "sql_history": sql_history,
             "queried": queried,
         }
