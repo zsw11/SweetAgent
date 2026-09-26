@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 from typing import Any, Optional
 
 from langgraph.graph import END, START, StateGraph
@@ -34,18 +35,29 @@ def build_finance_agent(agent: Optional[FinanceAgent] = None):
         queried = set(state.get("queried") or [])
         observations = list(state.get("observations") or [])
         sql_history = list(state.get("sql_history") or [])
-
-        for req in plan:
-            if req in queried:
-                continue
-            try:
-                obs = ag._query_one(req, task, context)
-                observations.append(obs)
-                sql_history.append({"requirement": req, "sql": obs.get("sql"), "ok": True})
-                queried.add(req)
-            except Exception as exc:
-                logger.warning("finance_graph.query.fail", requirement=req, error=str(exc))
-                sql_history.append({"requirement": req, "ok": False, "error": str(exc)})
+        # 并行查询所有未查询需求（无依赖数据域并行，耗时 sum→max，对齐 logistics 模式）
+        todo = [req for req in plan if req not in queried]
+        if todo:
+            outcomes: dict[str, tuple[str, Any]] = {}
+            max_workers = min(len(todo), 4)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+                future_map = {pool.submit(ag._query_one, req, task, context): req for req in todo}
+                for fut in concurrent.futures.as_completed(future_map):
+                    req = future_map[fut]
+                    try:
+                        outcomes[req] = ("ok", fut.result())
+                    except Exception as exc:
+                        outcomes[req] = ("fail", str(exc))
+            # 按 plan 顺序收集，保持 observations/sql_history 顺序稳定
+            for req in todo:
+                status, payload = outcomes[req]
+                if status == "ok":
+                    obs = payload
+                    observations.append(obs)
+                    sql_history.append({"requirement": req, "sql": obs.get("sql"), "ok": True})
+                else:
+                    logger.warning("finance_graph.query.fail", requirement=req, error=payload)
+                    sql_history.append({"requirement": req, "ok": False, "error": payload})
                 queried.add(req)
 
         return {
@@ -72,6 +84,7 @@ def build_finance_agent(agent: Optional[FinanceAgent] = None):
         return "retry"
 
     def _retry(state: dict[str, Any]) -> dict[str, Any]:
+        # 第一轮计划是模型猜的，可能漏规划合法域；analyze基于真实查询结果发现缺口后，retry补计划、query再查
         plan = list(state.get("plan") or [])
         queried = set(state.get("queried") or [])
         added = False

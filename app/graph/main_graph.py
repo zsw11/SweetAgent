@@ -10,6 +10,7 @@ Phase 1 最小闭环：Manager -> Operation -> Decision（设计文档 58 节）
 from __future__ import annotations
 
 import json
+import uuid
 from typing import Any, Optional
 
 from langgraph.graph import END, START, StateGraph
@@ -24,6 +25,7 @@ from app.graph.router import make_department_node, route_fn, router_node
 from app.graph.state import GlobalState
 from app.memory.injection import build_department_memory, build_manager_memory
 from app.observability.logging import get_logger
+from app.observability.tracing import get_run_url_by_id, init_langsmith
 
 logger = get_logger("main_graph")
 
@@ -356,6 +358,8 @@ def run_question(
         human_in_the_loop 触发暂停时，结果含 __interrupt__ 键（见 quality_gate）。
     """
     logger.info("run_question.start", thread_id=thread_id, question=question[:100], hilt=human_in_the_loop)
+    # OPT-02 LangSmith：任何 LLM/图调用前同步环境变量并挂载自动 tracer（幂等，失败仅降级）
+    init_langsmith()
     if checkpointer is None:
         from app.memory.checkpoint import get_checkpointer
         checkpointer = get_checkpointer()
@@ -370,7 +374,11 @@ def run_question(
         "skipped_tasks": [],
         "current_task": "",
     }
+    # 预生成顶层 run id：LangGraph/LangChain tracer 会用这个 id 作为本次提问的
+    # 根 run（config 透传 run_id），返回结果里即可携带精确的 trace 链接（OPT-02）。
+    run_id = uuid.uuid4()
     invoke_config: dict[str, Any] = {
+        "run_id": run_id,
         "configurable": {
             "thread_id": thread_id,
             "human_in_the_loop": human_in_the_loop,
@@ -382,11 +390,16 @@ def run_question(
         initial_state,
         config=invoke_config,
     )
+    # trace 链接回业务：失败/未启用返回空串，不影响主链路
+    trace_url = get_run_url_by_id(str(run_id))
+    result["trace_url"] = trace_url
     logger.info(
         "run_question.done",
         thread_id=thread_id,
         stage=result.get("current_stage"),
         confidence=result.get("decision_result", {}).get("confidence"),
+        run_id=str(run_id),
+        trace_url=trace_url,
     )
 
     # 长期记忆提取钩子（两级触发：规则命中 / 历史阈值；写入失败不影响主流程）

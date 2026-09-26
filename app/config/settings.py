@@ -82,10 +82,10 @@ class Settings(BaseSettings):
     # ---------- Redis（可选） ----------
     REDIS_URL: str = ""
 
-    # ---------- 可观测性（可选） ----------
+    # ---------- 可观测性（OPT-02 LangSmith，2026-09-26） ----------
     LANGSMITH_TRACING: bool = False
     LANGSMITH_API_KEY: str = ""
-    LANGSMITH_PROJECT: str = "sweetnight-agent"
+    LANGSMITH_PROJECT: str = "sweetagent"
 
 
 @lru_cache

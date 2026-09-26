@@ -20,7 +20,7 @@ logger = get_logger("sql.generator")
 
 # ---------------------------------------------------------------------------
 # OPT-05 Function Calling 原生化：SQL 生成/修复走原生 tool_calls 通道
-# （LLM 的 SQL 输出进入结构化 arguments，不再依赖文本 + markdown 剥离）
+# （LLM 的 SQL 输出进入结构化 arguments，不再依赖文本 + markdown 剥离） ***REMOVED***
 # ---------------------------------------------------------------------------
 
 _SQL_TOOLS: list[dict[str, Any]] = [

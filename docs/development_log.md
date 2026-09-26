@@ -453,7 +453,7 @@ graph LR
     2026-09-21 晚补充：① 界面中文化（阶段 done→完成、置信度加语义说明）；② 集成记忆管理——侧边栏【记忆管理】= GET /memory 查看画像/偏好/非结构化 + POST /memory/extract 手动"立即沉淀本轮对话为记忆"（关窗写入的等价入口；/chat 后端已内置自动沉淀钩子，UI 不重复触发以免双份 LLM 费用）；③ **修复记忆利用缺口**：画像原只注入 Manager（规划用），最终回答由 Decision 生成却看不到画像 → "用户负责什么市场"类自身问题必然答不出；现已将用户级记忆注入 Decision（dec.run 加 memory 参数、DECISION_PROMPT 加"已知用户信息"段），实测 user1 注入画像后正确回答"负责美国（US）市场，担任市场负责人"（见考点二十五）
     2026-09-22 再补充：④ 置信度设计修正——原 prompt 写死"单部门数据 confidence<0.7"，把【数据覆盖度】和【回答置信度】绑死，用户指出不合理（只要回答所需证据充分，单部门也该高置信）；DECISION_PROMPT 第 6 条改为"confidence 反映回答本问题所需证据是否充分，而非参与部门数量：单部门充分作答可 0.7~0.9；仅当问题需跨部门交叉验证却缺关键部门才压低；画像/偏好类问题以注入记忆为证据、证据明确即高"，实测画像类问题 confidence 0.45→0.95；⑤ Streamlit 右上角 Stop/Rerun/Clear cache 等英文菜单是框架自带 UI 改不了语言，用项目根 `.streamlit/config.toml`（toolbarMode=minimal）对最终用户隐藏
 - [~] **13. Agent 评估体系**（2026-09-21 Phase A/B 落地：20 用例 + run_evaluation.py 三维自动打分 + JUDGE 裁判 + token/费用采集 + runs/scores 落库 + --replay 离线重放/--fresh 记忆隔离，首批实跑 6/10 通过、评分器已人工校准；**Phase C 跨版本对比回归报告 / D prompt 版本归因 / E 线上回流待做**，JUDGE 三题 15/16/17 待实跑）—— 详见上方「三点六」。**2026-09-21 用户指示暂缓，Phase C 起不继续**（见「闭环结论与暂缓决定」）
-- [ ] **14. LangSmith 接入（Agent trace 可视化 + Prompt 版本管理 + 评估）** —— 替代 agent_steps/agent_tool_calls/agent_errors 手动记录；保留 agent_runs/agent_results 业务表
+- [x] ~~**14. LangSmith 接入（Agent trace 可视化 + Prompt 版本管理 + 评估）**~~（2026-09-26 OPT-02 完成：环境变量自动 tracing 全链路上云——manager→部门→decision→quality_gate 完整 trace 树，含 LLM 调用/工具调用/质量门判定；`upload_eval_dataset.py` 评估结果幂等回流 `sweetagent-eval` dataset；业务代码零侵入，详见考点三十七。说明：本次落地 Trace 可视化 + 评测回流；Prompt 版本管理（面板侧）未启用，agent_steps/agent_tool_calls 手动记录仍保留）
 - [x] ~~15. 记忆去重阈值优化~~（2026-09-20 完成）——方案 B+C（差异化阈值+置信度门控）实现后被**LLM 裁判模式**取代（相似度只召回、LLM 决策 ADD/NONE/UPDATE/MERGE、版本化 superseded），见考点二十一、二十二
 - [ ] 16. 记忆变更日志表（memory_change_log）——结构化 key-value 被覆盖的旧值不保留，历史追溯需独立审计表。**2026-09-21 讨论定稿、决定暂缓**：路线 A 触发器（AFTER UPDATE OR DELETE，old_data/new_data JSONB 行快照，WHEN OLD IS DISTINCT FROM NEW 过滤同值重写），应用层零改动且覆盖 seed/手工 SQL 全部写入路径；user_id 可空 + scope 列（business_preferences 无用户维度，且运行时无写入路径、仅 seed）；
       配只读 GET /memory/changes，不做回滚 API（回滚=拿 old_data 重新 upsert）。旧值定位"保险丝"：给人排障/回滚用、不给 Agent 用；场景以 bad case 还原现场、误提取回滚（含临时/持久偏好混淆）为主，本项目无合规需求。优先级低于 13/14，成本约 1~2h、不存在越晚越贵。详见考点二十追问三补充
@@ -1674,3 +1674,36 @@ class GlobalState(TypedDict, total=False):
 **为什么本项目不会自动回调**：① 语义不匹配——generate_sql 不是"动作工具"，是"LLM 产出出口"，执行者是程序，不需要回调函数；② 架构选择——手写 LangGraph 节点，工具执行时机由程序控制（生成→校验→执行→失败才 repair），可观测、可重试、费用可控，不走框架的自动循环（与考点三十五"半自动架构"同一取舍）。
 
 **核心一句话**：bind_tools 给的是"说明书"，tool_calls 是"模型的决定"，执行永远在代码侧；自动回调属于 Agent 执行器，只在框架接管循环时才发生——本项目不回调是刻意的半自动设计，不是功能缺失。
+
+### 考点三十七：LLM 应用怎么做可观测性？LangSmith 接入为什么零侵入？（OPT-02 落地，2026-09-26）
+
+**面试官怎么问**：LLM 应用和传统后端不一样——同样的输入可能输出不一样，你怎么排查线上问题？你们项目怎么追踪一次提问的完整链路？LangSmith 是什么、怎么接入的？LLM 调用数据和业务数据一起上云，你考虑过合规吗？
+
+**设计（环境变量自动 tracing + 幂等初始化，业务零侵入）**：
+① **接入方式**：设置 `LANGSMITH_TRACING=true` + API key + project 后，LangChain/LangGraph 自动 tracer 挂载在 callback 链路上，一次真实提问的完整链路自动上云——manager → router → operation/finance 并行 → decision → quality_gate 判定，每个 LLM 调用（含 with_structured_output / bind_tools 通道）、工具调用（execute_readonly_sql）、节点输入输出、耗时、token 全被捕获，**业务代码不需要加任何埋点**；
+② **核心坑（pydantic-settings 不写回 os.environ）**：项目用 pydantic-settings 读 .env，读到的值只进 Python 对象、**不会写回环境变量**；而 LangChain tracer / langsmith SDK 只认环境变量。所以 `app/observability/tracing.py` 的 `init_langsmith()` 先把 settings 同步回 os.environ，再初始化 Client（list_projects 轻量探活验证 key/网络），幂等、失败仅降级；
+③ **挂载时机**：环境变量必须在**首次 LLM 调用前**设置好（tracer 在第一次 run 时读取环境变量决定挂不挂）。两个入口：`app/main.py`（FastAPI 启动）+ `run_question()` 开头（脚本/测试路径兜底）；
+④ **评测回流**：`scripts/upload_eval_dataset.py` 读 evaluation_runs/scores 批次，按 case_id 生成稳定 example_id（uuid5）幂等上报 `sweetagent-eval` dataset，多批次同一用例可对比分数演变。
+
+**为什么这么设计（面试点）**：
+- **零侵入 vs 手写埋点**：手写埋点要改每个节点、容易漏、维护成本高；LangChain 生态的 tracer 挂在全局 callback manager 上，只要 LLM 调用走 langchain 通道（本项目 8 处全走 `app/llm/structured.py` 封装）就自动全捕获——可观测性是框架给的能力，接入是"接线"不是"埋点"；
+- **可观测性必须可降级**：`init_langsmith()` 全程 try/except，key 失效/网络不通只打 `langsmith.init_fail` 警告，主链路照常——可观测性永远不能拖垮业务（与质量门/记忆提取钩子的降级哲学一致）；
+- **三问先行**：接云前必须确认 ①API Key ②网络可达 ③数据是否允许上云。LLM 输入输出原文会上云，涉敏场景要关 tracing 或只开非敏感项目；
+- **自动 tracer 的盲区**：不走 langchain 通道的调用（原生 SDK 直连、httpx 裸调）不会被捕获——这是"全走封装层"的又一收益；
+- **运行时的验证闭环**：`verify_langsmith.py --run 1` 用真实提问验证"面板可见完整 trace 树"（验收标准），而不是只看配置项。
+
+**核心一句话**：LangSmith 接入的本质不是"埋点"而是"接线"——用环境变量把 LangChain 自带的 tracer 接上云、业务零侵入；两个关键坑是 pydantic-settings 不写回环境变量（要显式同步）和必须在首次 LLM 调用前完成；可观测性必须可降级，且接云前先过"key/网络/数据合规"三问。
+### 考点三十八：部门子图 query 从串行改并行——无依赖数据域并发的顺序与安全（2026-09-27）
+
+**面试官怎么问**：你部门子图的 query 节点要把 plan 里所有数据域逐个查询（查 SQL/RAG/MCP），是串行还是并行？串行为什么慢？改成并行要注意什么？并行会不会丢数据、把 observations 顺序搞乱、或者一个域失败拖垮全部？
+
+**设计（本次落地，四个部门子图统一对齐 logistics 模式）**：`app/agents/{finance,operation,product,logistics}/graph.py` 的 `_query` 全部改为：`todo = [req for req in plan if req not in queried]`（只查未查询过的域）→ `ThreadPoolExecutor(max_workers=min(len(todo), 4))` 提交 `ag._query_one(req, task, context)` → `as_completed` 收集到 `outcomes: dict[req, ("ok"|"fail", payload)]` → **按 plan 顺序回填** observations/sql_history → 失败只记 `*.query.fail` warning + sql_history 记 fail，不炸链路 → queried 统一标记。
+
+**为什么（三个关键点）**：
+- **耗时 sum→max**：无依赖数据域天然可并行（呼应考点三十二/三十三的落点），串行 6 域=逐域累加，并行≈最慢一域；max_workers=4 受 DB 连接池/外部限流约束
+- **顺序稳定是硬要求**：`as_completed` 返回无序，必须按 `todo`（=plan 顺序）回填 observations/sql_history——下游 `_analyze` 按顺序消费，顺序乱了会改变分析输入（面试必问点）
+- **并发安全**：`_query_one` 是纯函数（输入 req/task/context，输出 obs），outcomes 按 req 键收集无共享写；observations/sql_history/queried 只在主线程回填，天然无竞态；单个域异常在 future 内捕获记入 outcomes，收集阶段统一处理——单域失败隔离，不拖垮整批
+
+**验证**：py_compile 四文件通过 + 实跑三子图：finance 8.09s（2 域）、operation 4.98s（2 域）、product 10.14s（6 域并行全查），queried/observations/sql_history 完整、按 plan 顺序、enough=True、final_result 正常；日志 `*.query.batch_done` 输出 ok/failed 正常。
+
+**核心一句话**：无依赖数据域并行 = 耗时 sum→max，但必须"as_completed 无序收集 → 按 plan 顺序回填"才能保住下游顺序契约；`_query_one` 纯函数 + 主线程回填 + future 内捕获异常，并发安全与单域失败隔离兼得。

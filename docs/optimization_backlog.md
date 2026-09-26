@@ -17,13 +17,14 @@
 - **预估工作量**：M（1~2 天，条件触发后）
 - **验收标准**：Agent 通过 MCP Client 完成一次外部工具调用（如物流查询/汇率换算），结果进入 observations 供决策消费。
 
-### OPT-02 LangSmith 可观测性（待办主线）
-- **现状**：自建 logging/metrics 已有；LangSmith 接入是当前待办主线，需先确认三问：① API Key；② langsmith.com 网络可达性；③ 业务数据是否允许上云（敏感则降级为仅本地 prompt 版本化）。
-- **目标**：Agent 全链路 trace（manager→部门→decision→quality_gate）+ 评测数据回流。
-- **做法**：接入 `langsmith` SDK / LangGraph callback；`project_name=sweetagent`；评估结果上报为 dataset。
-- **涉及范围**：`app/graph/main_graph.py`（编译时配置）、`app/observability/`。
-- **预估工作量**：S（半天~1 天，取决于三问确认）
-- **验收标准**：一次真实提问在 LangSmith 面板可见完整 trace 树（含 LLM 调用、工具调用、quality_gate 判定）。
+### OPT-02 LangSmith 可观测性（**✅ 已完成 2026-09-26**）
+- **落地**：三问确认（① Key ✅ ② 网络可达 ✅ ③ 模拟数据上云风险可控 ✅）。接入方式=环境变量自动 tracing + langsmith SDK，业务代码零侵入：
+  - `app/observability/tracing.py`：`init_langsmith()` 把 .env 配置同步回 os.environ（pydantic-settings 不写回环境变量是核心坑）→ 初始化并验证 Client（list_projects 轻量探活），幂等、失败仅降级；
+  - 挂载点：`app/main.py`（FastAPI 启动）+ `run_question()` 开头（脚本路径兜底）；LangGraph/LangChain 自动 tracer 捕获全链路；
+  - 验证：`scripts/verify_langsmith.py --run 1`——真实提问完整跑 manager→router→operation/finance 并行→decision→quality_gate，trace 上云，run URL 可打开；
+  - 评测回流：`scripts/upload_eval_dataset.py`——读 evaluation_runs/evaluation_scores 最新批次，按 case_id 幂等（uuid5 example_id）上报 `sweetagent-eval` dataset；
+  - 教学文档：`docs/langsmith_guide.md`（面板用法/trace 解读/工作流/FAQ）。
+- **待办（可选）**：面板 Testing 云端回归执行；Feedback API 接入人工反馈标注。
 
 ### OPT-03 评测报告正式化（**✅ 已完成 2026-09-24**）
 - **落地**：新增 `scripts/eval_report.py`——读 evaluation_runs/scores/cases，汇总批次对比 + 最新批次明细 + bad case 归因 + 费用耗时，输出 Markdown 到 `docs/eval/`；渲染/bad case 提取已 mock 验证，DB 不可用优雅降级提示。用法：`run_evaluation.py` 跑完 → `eval_report.py` 一键出报告。
@@ -102,7 +103,7 @@
 | 编号 | 项目 | 优先级 | 工作量 | 状态 |
 |---|---|---|---|---|
 | OPT-01 | MCP 接入 | P0 | M | ✅（2026-09-24） |
-| OPT-02 | LangSmith 可观测性 | P0 | S | ⬜（待三问确认） |
+| OPT-02 | LangSmith 可观测性 | P0 | S | ✅（2026-09-26） |
 | OPT-03 | 评测报告正式化 | P0 | S | ✅（2026-09-24） |
 | OPT-04 | 结构化输出强化 | P1 | S~M | ✅（2026-09-24） |
 | OPT-05 | Function Calling 原生化 | P1 | M | ✅（2026-09-24） |

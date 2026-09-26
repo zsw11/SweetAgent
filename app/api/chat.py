@@ -66,6 +66,9 @@ class ChatResponse(BaseModel):
     quality_pending: Optional[dict[str, Any]] = Field(
         None, description='stage="awaiting_feedback" 时非空：待用户确认的候选答案与偏差诊断'
     )
+    trace_url: Optional[str] = Field(
+        None, description="本次执行的 LangSmith trace 链接（未启用 tracing 时为空）"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +108,7 @@ def _build_response(
             skipped_tasks=result.get("skipped_tasks", []),
             quality_check=result.get("quality_check"),
             quality_pending=pending,
+            trace_url=result.get("trace_url") or None,
         )
 
     return ChatResponse(
@@ -120,6 +124,7 @@ def _build_response(
         skipped_tasks=result.get("skipped_tasks", []),
         quality_check=result.get("quality_check"),
         quality_pending=None,
+        trace_url=result.get("trace_url") or None,
     )
 
 

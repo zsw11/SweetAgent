@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 from typing import Any, Optional
 
 from langgraph.graph import END, START, StateGraph
@@ -51,23 +52,34 @@ def build_operation_agent(agent: Optional[OperationAgent] = None):
         observations = list(state.get("observations") or [])
         sql_history = list(state.get("sql_history") or [])
 
-        # 批量执行所有未查询需求（避免逐需求多轮图调度）。
+        # 并行批量执行所有未查询需求（无依赖数据域并行，耗时 sum→max，对齐 logistics 模式）。
         # 每个需求只查一次：queried 是"已查记忆"，retry 追加的新需求下次进入本节点时才会被查。
         ok_count, fail_count = 0, 0
-        for req in plan:
-            if req in queried:
-                continue
-            try:
-                obs = ag._query_one(req, task, context)
-                observations.append(obs)
-                sql_history.append({"requirement": req, "sql": obs.get("sql"), "ok": True})
+        todo = [req for req in plan if req not in queried]
+        if todo:
+            outcomes: dict[str, tuple[str, Any]] = {}
+            max_workers = min(len(todo), 4)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+                future_map = {pool.submit(ag._query_one, req, task, context): req for req in todo}
+                for fut in concurrent.futures.as_completed(future_map):
+                    req = future_map[fut]
+                    try:
+                        outcomes[req] = ("ok", fut.result())
+                    except Exception as exc:
+                        outcomes[req] = ("fail", str(exc))
+            # 按 plan 顺序收集，保持 observations/sql_history 顺序稳定
+            for req in todo:
+                status, payload = outcomes[req]
+                if status == "ok":
+                    obs = payload
+                    observations.append(obs)
+                    sql_history.append({"requirement": req, "sql": obs.get("sql"), "ok": True})
+                    ok_count += 1
+                else:
+                    logger.warning("operation_graph.query.fail", requirement=req, error=payload)
+                    sql_history.append({"requirement": req, "ok": False, "error": payload})
+                    fail_count += 1
                 queried.add(req)
-                ok_count += 1
-            except Exception as exc:
-                logger.warning("operation_graph.query.fail", requirement=req, error=str(exc))
-                sql_history.append({"requirement": req, "ok": False, "error": str(exc)})
-                queried.add(req)
-                fail_count += 1
         logger.debug("operation_graph.query.batch_done", ok=ok_count, fail=fail_count)
 
         return {

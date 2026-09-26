@@ -44,7 +44,7 @@ pytest>=8.0.0
 pytest-asyncio>=0.24.0
 
 # ---------- 可选企业能力（按需启用） ----------
-# langsmith>=0.1.0
+langsmith>=0.1.0
 # opentelemetry-api>=1.26.0
 # opentelemetry-sdk>=1.26.0
 # redis>=5.0.0
