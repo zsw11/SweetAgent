@@ -15,13 +15,28 @@ LLM 不可用或输出解析失败时返回 None，由调用方走降级规则�
 
 from __future__ import annotations
 
-import json
 from typing import Any, Optional
 
+from pydantic import BaseModel
+
 from app.llm import get_chat_model, llm_available
+from app.llm.structured import extract_json, invoke_structured, invoke_text
 from app.observability.logging import get_logger
 
 logger = get_logger("memory_judge")
+
+
+# ---------------------------------------------------------------------------
+# OPT-04 结构化输出：记忆裁判 schema（with_structured_output 用）
+# ---------------------------------------------------------------------------
+
+class JudgeOutput(BaseModel):
+    """裁判输出 schema（与 JUDGE_PROMPT 要求 JSON 同构）。"""
+    relation: str = "unrelated"
+    target_id: Optional[Any] = None
+    event: str = "ADD"
+    new_content: str = ""
+    reason: str = ""
 
 JUDGE_PROMPT = """你是用户长期记忆的"冲突裁判"。判断新记忆与候选旧记忆的关系，决定如何写入记忆库。
 
@@ -80,36 +95,23 @@ def judge_memory(
         new_conf="None" if new_confidence is None else round(new_confidence, 2),
         candidates="\n".join(cand_lines)[:3000],
     )
-    try:
-        resp = model.invoke([
-            SystemMessage(content="你是记忆冲突裁判，严格输出 JSON。"),
-            HumanMessage(content=prompt),
-        ])
-        return _parse_judge_json(str(resp.content))
-    except Exception as exc:  # LLM 调用失败不阻断写入，走降级
-        logger.warning("memory.judge.failed", error=str(exc))
+    messages = [
+        SystemMessage(content="你是记忆冲突裁判，严格输出 JSON。"),
+        HumanMessage(content=prompt),
+    ]
+    # OPT-04：结构化通道优先，失败降级文本解析
+    d = invoke_structured(model, JudgeOutput, messages, logger_name="memory_judge")
+    if d is not None:
+        return _normalize_judge(d)
+    text = invoke_text(model, messages, logger_name="memory_judge")
+    if text is None:
+        logger.warning("memory.judge.failed")
         return None
+    return _parse_judge_json(text)
 
 
-def _parse_judge_json(raw: str) -> Optional[dict[str, Any]]:
-    t = (raw or "").strip()
-    if t.startswith("```"):
-        t = t.strip("`")
-        if t.lower().startswith("json"):
-            t = t[4:].strip()
-    try:
-        obj = json.loads(t)
-    except json.JSONDecodeError:
-        start, end = t.find("{"), t.rfind("}")
-        if start >= 0 and end > start:
-            try:
-                obj = json.loads(t[start:end + 1])
-            except json.JSONDecodeError:
-                return None
-        else:
-            return None
-    if not isinstance(obj, dict):
-        return None
+def _normalize_judge(obj: dict[str, Any]) -> dict[str, Any]:
+    """把裁判 dict 规范化到约定白名单（结构化通道与文本降级共用）。"""
     event = str(obj.get("event") or "ADD").upper()
     if event not in ("ADD", "NONE", "UPDATE", "MERGE"):
         event = "ADD"
@@ -120,3 +122,11 @@ def _parse_judge_json(raw: str) -> Optional[dict[str, Any]]:
         "new_content": str(obj.get("new_content") or ""),
         "reason": str(obj.get("reason") or ""),
     }
+
+
+def _parse_judge_json(raw: str) -> Optional[dict[str, Any]]:
+    """从 LLM 输出中提取裁判 JSON（统一委托 extract_json + normalize）。"""
+    obj = extract_json(raw)
+    if obj is None:
+        return None
+    return _normalize_judge(obj)

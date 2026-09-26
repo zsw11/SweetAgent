@@ -11,13 +11,26 @@
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
+from pydantic import BaseModel, ConfigDict, Field
+
 from app.config.settings import settings
+from app.llm.structured import extract_json, invoke_structured, invoke_text
 from app.observability.logging import get_logger
 
 logger = get_logger("quality_gate")
+
+
+# ---------------------------------------------------------------------------
+# OPT-04 结构化输出：质量裁判 schema（with_structured_output 用）
+# ---------------------------------------------------------------------------
+
+class QualityVerdict(BaseModel):
+    """LLM 裁判输出 schema：pass=1 覆盖要点；pass=0 附带 issues。"""
+    model_config = ConfigDict(populate_by_name=True)
+    passed: bool = Field(default=True, alias="pass")
+    issues: list[str] = Field(default_factory=list)
 
 # LLM 常见"甩锅/没答到点上"的模板话术（命中即视为无效回答，零成本规则）
 _WEAK_PATTERNS = (
@@ -81,6 +94,7 @@ def llm_quality_check(user_question: str, answer: str) -> list[str]:
     解析失败按"无问题"处理（裁判不可用时不得阻塞主流程）。
     """
     from app.llm import get_chat_model
+    from langchain_core.messages import HumanMessage
 
     judge = get_chat_model(tier="small")
     prompt = (
@@ -91,17 +105,24 @@ def llm_quality_check(user_question: str, answer: str) -> list[str]:
         "- 回答覆盖问题要点 → {\"pass\": 1}\n"
         "- 回答跑题 / 漏答 / 答非所问 → {\"pass\": 0, \"issues\": [\"具体偏差1\", \"具体偏差2\"]}\n"
     )
-    try:
-        resp = judge.invoke(prompt)
-        raw = str(resp.content if hasattr(resp, "content") else resp)
-        start, end = raw.index("{"), raw.rindex("}") + 1
-        verdict = json.loads(raw[start:end])
-        if verdict.get("pass") == 0:
-            issues = verdict.get("issues") or []
-            logger.info("quality_gate.judge.fail", issues=issues[:3])
-            return [str(i) for i in issues][:3]
+    messages = [HumanMessage(content=prompt)]
+    # OPT-04：结构化通道优先（QualityVerdict 约束 passed/issues 类型）
+    d = invoke_structured(judge, QualityVerdict, messages, logger_name="quality_gate")
+    if d is not None:
+        if not d.get("passed", True):
+            issues = [str(i) for i in d.get("issues") or []][:3]
+            logger.info("quality_gate.judge.fail", issues=issues)
+            return issues
         logger.debug("quality_gate.judge.pass")
         return []
-    except Exception as exc:
-        logger.warning("quality_gate.judge.failed", error=str(exc))
+    # 降级：文本解析（解析失败按"无问题"处理，裁判不可用不得阻塞主流程）
+    text = invoke_text(judge, messages, logger_name="quality_gate")
+    if text is None:
         return []
+    verdict = extract_json(text)
+    if verdict and verdict.get("pass") == 0:
+        issues = verdict.get("issues") or []
+        logger.info("quality_gate.judge.fail", issues=issues[:3])
+        return [str(i) for i in issues][:3]
+    logger.debug("quality_gate.judge.pass")
+    return []

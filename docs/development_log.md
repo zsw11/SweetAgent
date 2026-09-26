@@ -1583,3 +1583,94 @@ class GlobalState(TypedDict, total=False):
 **真实验证结果**：streamable 初始化成功 → 动态发现 5 个工具（query_trace 核心 / auto_number 单号识别承运商 / estimate_time / estimate_price / estimate_time_with_logistic）→ auto_number 识别 YT9693083639795=圆通速递(yuantong) ✅；query_trace 同单号返回"查询无结果"（demo 单号失效，非 MCP 问题，机制已通）。verify_tracking_mcp.py 三场景全过：无 key 降级 / 无单号降级 / 真实调用识别承运商。
 
 **核心一句话**：MCP 不是比 HTTP "更强"的传输，而是"让 LLM 应用以统一协议发现和调用任意工具"的标准层——HTTP 修的是路，MCP 做的是 USB 插口，代价是握手复杂度，收益是动态发现 + 生态复用 + LLM 函数语义。
+
+
+### 考点三十二：什么是 tool schema？LLM 原生返回 tool_calls 是什么意思？并行多工具调用怎么工作？（2026-09-24，OPT-05 前置概念）
+
+**面试官怎么问**：你们 Agent 的工具调用是怎么做的？prompt 式工具调用和 function calling 有什么区别？什么是 tool schema？LLM 原生返回 tool_calls 是什么机制？并行多工具调用是怎么回事？
+
+**tool schema = 给 LLM 看的"工具说明书"**（JSON Schema 描述，LLM 消费）：① name（调用时用的工具名）；② description（何时该调它——LLM 靠它做调用决策）；③ parameters（参数结构，含必填/类型/枚举——LLM 只能照这个填）。本质是"API 文档的机器可读版，但读者是模型"。
+
+**tool_calls = LLM 决定调用时走的独立结构化输出通道**：不走文本回复，返回数组 `[{id, type:"function", function:{name, arguments:JSON字符串}}]`。程序只需 `json.loads(arguments)` + 按 name 分派，不需要"解析文本抠指令"。**"原生"的含义**：模型训练时就优化了该通道——不会发明参数名、不漏必填字段（违背 schema 的输出在生成时被抑制）。
+
+**prompt 式 vs function calling（项目现状 vs OPT-05 目标）**：现状 `self.tools["generate_sql"](sub_task, context, model)` 是发 prompt 让 LLM 输出 SQL 文本再解析；原生化后声明 generate_sql 为 tool schema，LLM 直接返回结构化 tool_calls。
+
+**并行多工具调用（parallel tool calls）机制**：tool_calls 是数组——LLM 一次回复可同时声明多个互不依赖的调用；程序并行执行，结果合并成多个 tool message 一次性回传，LLM 拿全部结果继续推理。**收益**：耗时从 sum 变 max（串行 12+10+8=30s → 并行 max=12s），LLM 往返从 N 次变 1 次。**项目落点**：现状 logistics/graph.py `_query` 是 `for req in plan` 串行循环，plan 的多个 req（如 ["inventory_risk","delivery","tracking"]）天然独立，适合并行。
+
+**为什么这么设计（面试点）**：① 格式幻觉归零——LLM 原生保证 schema 合规，不再依赖手写 JSON 解析 + 嵌套容错（parse_analysis_json 那套）；② 参数结构化——工具名/参数分离，便于审计与多工具分派；③ 并行能力——tool_calls 数组语义天然支持 fan-out，耗时从 sum 变 max。**前提与注意**：只适用于互不依赖的调用（A 的结果喂 B 时必须串行，如 SQL 出错 → repair 用错误信息重生成）；并行受 DB 连接池与限流约束。
+
+**与 MCP 的关系（故事线）**：MCP 本质 = function calling 的标准化协议（MCP 工具的 input_schema 可直接映射成 LLM function schema）。完整演进线：**prompt 式 → function calling（OPT-05，内部工具原生形态）→ MCP（OPT-01，外部工具标准协议，已落地）**——OPT-05 是 OPT-01 的官方前置项，MCP 做完后补 OPT-05 正好闭环。
+
+**核心一句话**：tool schema 是给 LLM 的工具说明书（能不能调、传什么），tool_calls 是 LLM 的原生调用通道（结构化、可并行、不靠解析文本）；并行收益 = 耗时 sum 变 max + LLM 往返 1 次，前提是调用间无依赖。
+
+
+### 考点三十三：结构化输出（with_structured_output）和 Function Calling 原生化（bind_tools）怎么落地？（OPT-04 + OPT-05，2026-09-24）
+
+**面试官怎么问**：你们 LLM 输出经常不按格式来，怎么治？"结构化输出"和"function calling"是一回事吗？SQL 生成是文本输出，怎么用 tool_calls 原生化？降级怎么做？
+
+**设计（两条链路，全部带降级）**：
+① **OPT-04 结构化输出**（约束"LLM 说什么"）：定义 Pydantic schema——`AnalysisOutput`（summary/metrics/anomalies/confidence/enough/missing，base.py）、`DecisionOutputSchema`（summary/findings/root_causes/recommendations/risks/confidence，decision/agent.py），字段全默认值 + confidence 加 ge/le 校验。调用点优先 `model.with_structured_output(Schema).invoke(messages)` → `model_dump()` 直接得合规 dict（内部即 function calling 强制 tool_calls）；异常或返回 None → 降级普通 `model.invoke` 文本 → 走旧手写解析链（`parse_analysis_json` / `_parse_and_validate`）。结构化成功时**完全不进**手写容错路径（日志 `*.structured.ok` 可证）。
+② **OPT-05 Function Calling 原生化**（约束"LLM 怎么交 SQL"）：`generator.py` 新增 `_SQL_TOOLS` 两个 function schema（generate_sql 参数 sql / repair_sql 参数 fixed_sql）+ `_invoke_sql(model, system, user, tool_index)`：`model.bind_tools([solo_tool])` 强制单工具调用 → 从 `resp.tool_calls[0]["args"]` 结构化取 SQL（langchain 已把 arguments JSON 解析成 dict）；无 tool_calls → 直接用 `resp.content` 文本兜底（不重复调用）；bind_tools/API 抛异常 → 降级无 tools 的普通 invoke。`_llm_generate` 与 `repair_sql` 均已切换，markdown 剥离逻辑保留为兜底。
+③ **接口契约**：`run()`/`_analyze` 返回值对下游无感——结构化 dict 与旧解析结果**同构**（`_structured_analysis_to_result` 把 AnalysisOutput 转成 (analysis, evidence, enough, missing)，metrics/anomalies 变 llm_metric/llm_anomaly evidence 项）。
+
+**验证（verify_opt04_05.py，mock + 真实）**：A tool_calls 提取 SQL ✅；B 文本/异常降级 ✅；C `_analyze` 结构化→同构 result ✅；D `_analyze` 降级（文本 JSON + 结构化异常）✅；E/F decision 结构化/降级 ✅；**G DeepSeek 真实 bind_tools 冒烟 ✅**（真 key 下 SQL 从 tool_calls arguments 返回，证明 DeepSeek 兼容协议支持 function calling）。回归：verify_quality_gate.py / verify_tracking_mcp.py 全过。
+
+**为什么这么设计（面试点）**：① **格式幻觉归零在通道层**——with_structured_output/bind_tools 是模型训练优化的原生通道，不再赌"LLM 文本里恰好是合法 JSON"；② **降级必须存在**——DeepSeek/OpenAI 兼容协议虽都支持 function calling，但模型行为、API 版本有差异（有的模型不支持工具、有的只回文本），结构化失败不能炸主链路，必须无缝回旧链；③ **返回值同构**——下游（graph/Web UI/quality_gate）零改动，改造面收敛到单点；④ **工具 schema 比 prompt 描述强**——generate_sql 的"输出格式要求"从 5 条硬性规则文字变成 JSON Schema（required/type 强约束），LLM 不会漏 LIMIT 字段名拼错。
+**并行扩展点（考点三十二的落点）**：`_invoke_sql` 已具备多 tool_calls 提取能力（取 `tc[0]`），下一步把 logistics/graph.py `_query` 的 `for req in plan` 串行循环改并行（无依赖数据域并发），耗时 sum→max。
+
+**核心一句话**：OPT-04 用 with_structured_output（Pydantic schema + 强制 tool_calls）约束"LLM 说什么"，OPT-05 用 bind_tools 让 SQL 走原生 tool_calls arguments 而非文本，两条都带"异常→旧手写解析"降级链且返回同构，验证含 DeepSeek 真实冒烟。
+
+
+### 考点三十四：结构化输出/Function Calling 全量统一封装（OPT-04/05 收尾，2026-09-25）
+
+**面试官怎么问**：你们把结构化输出和 function calling 铺到所有 LLM 调用点了吗？每个地方各写一套降级吗？with_structured_output 在 DeepSeek 上能用吗？为什么报 400？
+
+**设计（统一封装层 app/llm/structured.py）**：把"原生通道 + 降级"抽成 4 个公共函数，全项目 LLM 调用点（8 处）统一接入：
+① `invoke_structured(model, schema, messages)`——with_structured_output 通道，**显式 method="function_calling"**，成功返回 Pydantic dict，异常/不支持返回 None；
+② `invoke_tool(model, tool_schema, messages, arg_key)`——bind_tools 通道，返回 (value, text)：工具通道成功 → 参数值；模型未走 tool_calls → (None, 原始文本)（免重调）；API 异常 → (None, None)；
+③ `invoke_text(model, messages)`——文本通道统一兜底（失败返回 None）；
+④ `extract_json(text)`——公共 JSON 提取（markdown 剥壳 + 花括号截取），替代 5 处手写 _parse_*_json（base/decision/manager/extractor/judge 全部委托它）。
+
+**接入点全景（8 处 LLM 调用全改造）**：base._plan（PlanOutput）、base._analyze（AnalysisOutput）、decision._synthesize（DecisionOutputSchema）、manager._plan（ManagerPlanOutput）、memory.extractor（ExtractOutput）、memory.judge（JudgeOutput）、graph.quality（QualityVerdict）、sql.generator（generate_sql/repair_sql 工具通道）。manager 抽出公共 `_validate_plan`（结构化 dict 与文本解析共用 DAG 校验：过滤未知 agent、补 decision、环检测）；judge 抽出 `_normalize_judge`（event/relation 白名单规范化共用）。降级策略各点自定：plan 失败回 FALLBACK_REQ、记忆失败回空、SQL 失败重调文本、quality 失败按"无问题"。
+
+**关键坑（真实环境踩到）**：langchain-openai **1.6+ 的 with_structured_output 默认 method="json_schema"**（走 response_format=json_schema），而 **DeepSeek 兼容协议不支持 json_schema → 400 "This response_format type is unavailable now"** → 结构化通道形同虚设（每次降级）。修复：显式 `method="function_calling"`（走 tools 强制，DeepSeek 支持，与 bind_tools 同通道）。真实冒烟验证通过：DeepSeek + with_structured_output(function_calling) 正常返回合规 dict。**教训**：OpenAI 兼容协议不等于全特性兼容，默认值随库版本漂移，接第三方模型必须真实验证两条通道。
+
+**验证（verify_structured_all.py，mock 12 场景 + 真实 2 冒烟）**：A 封装层 4 函数 ✅；B _plan 结构化/降级/兜底 ✅；C manager 结构化+DAG 校验/文本降级 ✅；D extractor 结构化/降级 ✅；E judge 结构化+normalize/降级 ✅；F quality 结构化 pass/fail/降级 ✅；真实：DeepSeek bind_tools 冒烟 ✅ + with_structured_output(function_calling) 冒烟 ✅。回归：verify_opt04_05 / verify_quality_gate / verify_logistics_parallel / verify_tracking_mcp 全过。
+
+**为什么这么设计（面试点）**：① 通道层不吞业务——invoke_* 只回答"原生通道成不成"，降级策略留在各调用点（业务语义不同，不能统一吞）；② 返回一律 dict——下游不感知通道差异，改造面收敛；③ method 显式化——把库默认值的漂移风险钉死在封装层一处，而不是散落 8 个调用点；④ 公共解析器——5 份手写 JSON 容错（各 20 行）合并成 1 份 extract_json。
+
+**核心一句话**：统一封装 = 两条原生通道（with_structured_output / bind_tools）+ 文本兜底 + 公共 JSON 提取，8 个 LLM 调用点全部接入；最大坑是 langchain-openai 1.6 默认 json_schema 而 DeepSeek 不支持，必须显式 method="function_calling" 并真实验证。
+
+
+### 考点三十五：工具 schema 为什么只有 generate_sql / repair_sql 两个？其他工具怎么不放进去？（2026-09-25）
+
+**面试官怎么问**：你们项目有 8 个工具（list_tables / schema_search / get_table_schema / get_relationship / metric_definition / execute_readonly_sql / generate_sql / repair_sql），为什么走 function calling 的只有 generate_sql 和 repair_sql 两个？剩下的为什么不声明给 LLM？
+
+**设计（两类工具区分）**：
+① **LLM 产出出口（进 _SQL_TOOLS，走 function calling 强制结构化）**：generate_sql / repair_sql——只有 LLM 能生成 SQL 文本内容，强制 tool_calls 让 SQL 进结构化 arguments（schema 约束字段名/必填），消灭"包 markdown 代码块、混解释文字"的格式幻觉；
+② **程序确定性管道（代码直调 self.tools[name](...)，不进 function calling）**：list_tables / schema_search / get_table_schema / get_relationship / metric_definition / execute_readonly_sql——schema 探索是固定流程（列表 → 定位表 → 取字段 → 取口径），代码按序直调，LLM 不参与决策。
+
+**为什么这么设计（面试点）**：
+- 确定性流程交给 LLM = 引入不确定性（可能乱调/漏调/多调）+ 每步多一轮 LLM 往返（token 翻倍、延迟翻倍、更贵）——schema 探索没有"智能决策"空间，是机械管道；
+- execute_readonly_sql 尤其不能放权：若声明给 LLM，等于把"执行时机"交给模型（ReAct 风格），项目选择固定安全管线——**程序只执行 validator 通过的单条 SELECT**，空结果/报错由程序决定调 repair_sql，执行与修复决策永远在代码侧；
+- 与 ReAct 架构的对比：ReAct 让 LLM 循环自主调全部工具（灵活但贵、难控、易跑偏），本项目是"半自动"——LLM 只负责它唯一能做的（生成/修正 SQL 内容），其余全部程序控制，可观测、可重试、费用可控。
+
+**为什么需要文本降级（连带考点，与考点三十四衔接）**：① 模型能力差异——今天实测 with_structured_output 默认 json_schema 模式，DeepSeek 直接 400，降级兜住后记忆提取仍成功；② 未来换模型/供应商零改动——结构化能力从"硬依赖"变"可选能力"；③ 降级是换通道不是换服务（同一模型，只是不用 tools/structured 参数），结构化成功时降级路径零开销。核心认知：**with_structured_output 是 langchain 客户端封装，不是模型原生能力**——它把你的 schema 翻译成模型能懂的参数（function_calling→tools、json_schema→response_format），但服务端认不认这些参数封装管不了；"兼容 LLM"不是兼容输出格式（封装解决的），而是兼容输入能力（模型认不认 tools/response_format）。
+
+**核心一句话**：工具分两类——"LLM 产出的出口"（SQL 生成/修复，走 function calling 强制结构化）和"程序确定的管道"（schema 探索/执行，代码直调，绝不放权给 LLM）；这不是漏了 6 个工具，而是"LLM 只做它唯一能做的事"的半自动架构，与 ReAct 的取舍点。
+
+
+### 考点三十六：generate_sql / repair_sql 是"自动回调"吗？谁提供回调能力？（2026-09-25）
+
+**面试官怎么问**：你们 bind_tools 声明工具后，LLM 返回 tool_calls，工具函数是被自动调用的吗？谁提供"自动回调"这个能力？为什么会自动回调？
+
+**设计（实际机制拆解）**：`_SQL_TOOLS` 声明 → `bind_tools().invoke()` → LLM 返回 tool_calls → `_invoke_sql` 手动解析。三步中**没有任何自动执行**：
+① `bind_tools([schema])` 只把工具说明书发给模型 API；
+② 模型返回 `tool_calls[0]["args"]["sql"]`（结构化参数）；
+③ **你的代码自己** `tc[0].get("args", {}).get("sql")` 提取字符串 → 校验 → 执行。全程不调用项目里的 `generate_sql` / `repair_sql` 函数——它们只是"LLM 产出 SQL"这个语义的说明书名字，不是执行目标。
+
+**谁提供"自动回调"能力（关键认知）**：langchain 的 **Agent 执行器**（AgentExecutor / create_agent / create_tool_calling_agent）。框架接管循环时才会：检测到 tool_calls → 按 name 找到你注册的工具函数 → **自动调用它** → 把返回结果包成 tool message 回传给 LLM → LLM 继续推理 → 循环直到结束。所以"自动回调"= 框架的调度循环，前提是：① 你提供了真实可执行的工具函数（如 schema_search 真去搜索）；② 你把工具交给框架跑循环。
+
+**为什么本项目不会自动回调**：① 语义不匹配——generate_sql 不是"动作工具"，是"LLM 产出出口"，执行者是程序，不需要回调函数；② 架构选择——手写 LangGraph 节点，工具执行时机由程序控制（生成→校验→执行→失败才 repair），可观测、可重试、费用可控，不走框架的自动循环（与考点三十五"半自动架构"同一取舍）。
+
+**核心一句话**：bind_tools 给的是"说明书"，tool_calls 是"模型的决定"，执行永远在代码侧；自动回调属于 Agent 执行器，只在框架接管循环时才发生——本项目不回调是刻意的半自动设计，不是功能缺失。

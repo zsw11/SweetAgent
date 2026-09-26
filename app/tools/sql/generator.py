@@ -12,16 +12,74 @@ from typing import Any, Optional
 
 from app.config.settings import settings
 from app.llm import get_chat_model
+from app.llm.structured import invoke_text, invoke_tool
 from app.observability.logging import get_logger
 from app.tools.sql.validator import SQLValidationError, validate_and_bind_limit
 
 logger = get_logger("sql.generator")
 
+# ---------------------------------------------------------------------------
+# OPT-05 Function Calling 原生化：SQL 生成/修复走原生 tool_calls 通道
+# （LLM 的 SQL 输出进入结构化 arguments，不再依赖文本 + markdown 剥离）
+# ---------------------------------------------------------------------------
 
-def _llm_generate(task: str, schema_context: dict[str, Any], model) -> str:
-    """LLM 生成 SQL（OpenAI 兼容协议）。"""
+_SQL_TOOLS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_sql",
+            "description": (
+                "根据任务、可用表结构、业务数据字典，生成一条 PostgreSQL SELECT 查询。"
+                "必须只读 SELECT、必须带 LIMIT（不超过 5000）、只能使用给定表结构中的字段。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "sql": {"type": "string", "description": "生成的 SELECT SQL 语句"},
+                },
+                "required": ["sql"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "repair_sql",
+            "description": "根据执行错误修正一条失败的 SELECT SQL。保持只读 SELECT、带 LIMIT。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "fixed_sql": {"type": "string", "description": "修正后的 SELECT SQL 语句"},
+                },
+                "required": ["fixed_sql"],
+            },
+        },
+    },
+]
+
+
+def _invoke_sql(model, system: str, user: str, tool_index: int) -> str:
+    """走原生 tool_calls 通道取 SQL；失败降级文本回复。
+
+    Args:
+        model: ChatModel。
+        system/user: 提示词。
+        tool_index: _SQL_TOOLS 下标（0=generate_sql，1=repair_sql）。
+    """
     from langchain_core.messages import HumanMessage, SystemMessage
 
+    messages = [SystemMessage(content=system), HumanMessage(content=user)]
+    key = "sql" if tool_index == 0 else "fixed_sql"
+    sql, text = invoke_tool(model, _SQL_TOOLS[tool_index], messages, key, logger_name="sql.generator")
+    if sql is not None:
+        return sql
+    if text is not None:
+        return text
+    return invoke_text(model, messages, logger_name="sql.generator") or ""
+
+
+def _llm_generate(task: str, schema_context: dict[str, Any], model) -> str:
+    """LLM 生成 SQL（OPT-05：原生 tool_calls 通道，失败降级文本）。"""
     schema_text = "\n\n".join(
         f"表 {t.get('table')}: {t.get('columns')}" for t in schema_context.get("tables", [])
     )
@@ -39,17 +97,16 @@ def _llm_generate(task: str, schema_context: dict[str, Any], model) -> str:
         "2. 必须带 LIMIT（不超过 5000）；\n"
         "3. 只能使用给定表结构中的字段；\n"
         "4. 品牌/市场等过滤必须依据数据字典中的真实取值与关联方式，禁止臆造；\n"
-        "5. 直接输出 SQL 本身，不要解释、不要 markdown 代码块。"
+        "5. 通过工具调用输出 SQL（arguments.sql），不要解释。"
     )
     user = (
         f"任务：{task}\n\n"
         f"可用表结构：\n{schema_text}\n\n"
         f"业务数据字典（必须遵守）：\n{dictionary or '(无)'}\n\n"
         f"指标口径（agent_metric_definition）：\n{metrics_text or '(无)'}\n\n"
-        "请生成 SQL："
+        "请调用 generate_sql 工具并输出 SQL："
     )
-    resp = model.invoke([SystemMessage(content=system), HumanMessage(content=user)])
-    sql = str(resp.content).strip()
+    sql = _invoke_sql(model, system, user, tool_index=0)
     logger.debug(
         "sql.generate.llm",
         model=model.model_name if hasattr(model, "model_name") else str(type(model).__name__),
@@ -90,17 +147,14 @@ def generate_sql(task: str, context: Optional[dict[str, Any]] = None, model=None
 def repair_sql(sql: str, error: str, context: Optional[dict[str, Any]] = None, model=None) -> str:
     """根据执行错误修正 SQL（设计文档 40 节 B 类，最多 MAX_SQL_RETRIES 次，LLM 模式）。"""
     context = context or {}
-    from langchain_core.messages import HumanMessage, SystemMessage
-
     m = model or get_chat_model(tier="medium")
     system = (
-        "你是 SQL 专家。上一条 SQL 执行失败，请根据错误信息修正后只输出修正后的 SQL。"
-        "保持 SELECT-only、带 LIMIT。直接输出 SQL 本身，不要使用任何 markdown 代码块标记。"
+        "你是 SQL 专家。上一条 SQL 执行失败，请根据错误信息修正后通过调用 repair_sql 工具输出"
+        "（arguments.fixed_sql）。保持 SELECT-only、带 LIMIT。"
     )
-    user = f"原 SQL：\n{sql}\n\n错误：\n{error}\n\n请输出修正后的 SQL："
-    resp = m.invoke([SystemMessage(content=system), HumanMessage(content=user)])
-    # 剥离 LLM 可能包裹的 markdown 代码块（```sql ... ```），避免 validator 解析失败
-    fixed_raw = str(resp.content).strip()
+    user = f"原 SQL：\n{sql}\n\n错误：\n{error}\n\n请调用 repair_sql 工具输出修正后的 SQL："
+    fixed_raw = _invoke_sql(m, system, user, tool_index=1)
+    # 兜底：剥离 LLM 可能包裹的 markdown 代码块（```sql ... ```），避免 validator 解析失败
     if fixed_raw.startswith("```"):
         fixed_raw = fixed_raw.strip("`").strip()
         if fixed_raw.lower().startswith("sql"):

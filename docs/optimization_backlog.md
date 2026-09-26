@@ -33,21 +33,16 @@
 
 ## P1 —— 补强已有能力
 
-### OPT-04 结构化输出强化
-- **现状**：`parse_analysis_json` 手写 JSON 解析 + 嵌套提取容错。
-- **目标**：用 Pydantic 输出解析器（如 `PydanticOutputParser` / `with_structured_output`）约束 plan/analysis/decision 结构。
-- **做法**：为 `PLAN_PROMPT` / `ANALYSIS_PROMPT` / `DECISION_PROMPT` 各定义输出 schema；保留旧解析做兜底。
-- **涉及范围**：`app/agents/*/prompts.py`、`app/agents/base.py`、`app/agents/decision/agent.py`。
-- **预估工作量**：S~M
-- **验收标准**：非法输出场景减少 50%+，解析容错代码路径缩减。
+### OPT-04 结构化输出强化（**✅ 已完成 2026-09-24，全量接入 2026-09-25**）
+- **落地**：统一封装层 `app/llm/structured.py`（invoke_structured / invoke_tool / invoke_text / extract_json），8 处 LLM 调用点全部接入——base._plan/_analyze、decision._synthesize、manager._plan、memory extractor/judge、graph.quality、sql generator（工具通道）。manager 抽公共 `_validate_plan`、judge 抽 `_normalize_judge`。详见 development_log.md 考点三十四。
+- **关键坑**：langchain-openai 1.6+ with_structured_output 默认 json_schema，DeepSeek 不支持（400）→ 显式 method="function_calling" 并真实冒烟通过。
+- **待办（可选）**：上真实业务回归。
 
-### OPT-05 Function Calling 原生化
-- **现状**：SQL 生成、知识检索为 prompt 式工具调用（让 LLM 输出 JSON 指令），非原生 tool schema。
-- **目标**：声明原生 tools（`search_knowledge` / `query_sql`），走 function calling 流程，减少格式幻觉。
-- **做法**：定义 tool schema 绑定 LLM；节点内解析 tool_calls 分派执行。
-- **涉及范围**：`app/agents/base.py`（工具调用层）。
-- **预估工作量**：M
-- **验收标准**：工具调用不再依赖手写 JSON 格式；bad case 中"工具格式错误"归零。
+### OPT-05 Function Calling 原生化（**✅ 已完成 2026-09-24**）
+- **落地**：SQL 生成/修复走原生 tool_calls——`generator.py` 新增 `_SQL_TOOLS`（generate_sql / repair_sql 两个 function schema）与 `_invoke_sql()`：`bind_tools` 强制单工具调用，SQL 从 `tool_calls[0].args` 结构化提取（不再依赖文本 + markdown 剥离），模型不支持/API 异常自动降级文本回复。verify_opt04_05.py 场景 A/B/G 通过（G 为 DeepSeek 真实 bind_tools 冒烟）。
+- **扩展点（✅ 2026-09-24 已落地并行执行）**：logistics/graph.py `_query` 已改 `ThreadPoolExecutor` 并行（max_workers=min(未查数,4)，observations 按 plan 顺序收集保序，单域异常隔离 + queried 防重试），verify_logistics_parallel.py 验证：4 域串行 1.6s → 并行 0.41s。knowledge RAG 检索同样可声明为 tool 走同一通道（未做）。
+- **涉及范围**：`app/tools/sql/generator.py`、`app/agents/logistics/graph.py`。
+- **验收标准**：工具调用不再依赖手写 JSON 格式；bad case 中"工具格式错误"归零 —— 通道层已就绪，bad case 验证待真实业务回归。
 
 ### OPT-06 提示注入 / 输出安全
 - **现状**：SQL 侧安全已有（ReadOnlyExecutor 只读 + validator 校验 + 参数化），LLM 输入/输出侧未系统化防护。
@@ -109,8 +104,8 @@
 | OPT-01 | MCP 接入 | P0 | M | ✅（2026-09-24） |
 | OPT-02 | LangSmith 可观测性 | P0 | S | ⬜（待三问确认） |
 | OPT-03 | 评测报告正式化 | P0 | S | ✅（2026-09-24） |
-| OPT-04 | 结构化输出强化 | P1 | S~M | ⬜ |
-| OPT-05 | Function Calling 原生化 | P1 | M | ⬜ |
+| OPT-04 | 结构化输出强化 | P1 | S~M | ✅（2026-09-24） |
+| OPT-05 | Function Calling 原生化 | P1 | M | ✅（2026-09-24） |
 | OPT-06 | 提示注入/输出安全 | P1 | M | ⬜ |
 | OPT-07 | 查询/RAG 缓存 | P1 | S~M | ⬜ |
 | OPT-08 | 容器化 | P2 | M | ⬜ |

@@ -8,19 +8,38 @@
 
 from __future__ import annotations
 
-import json
-from typing import Any, Optional
+from typing import Any, Optional, Union
+
+from pydantic import BaseModel, Field
 
 from app.agents.manager.prompts import MANAGER_PLAN_PROMPT, MANAGER_SYSTEM_PROMPT
 from app.agents.manager.state import ManagerState
 from app.config.settings import settings
 from app.llm import get_chat_model, llm_available
+from app.llm.structured import extract_json, invoke_structured, invoke_text
 from app.observability.logging import get_logger
 
 logger = get_logger("manager_agent")
 
 # 已知部门 Agent（与设计文档 3.1 节一致）
 _KNOWN_DEPARTMENTS: frozenset[str] = frozenset({"operation", "finance", "logistics", "product"})
+
+
+# ---------------------------------------------------------------------------
+# OPT-04 结构化输出：任务 DAG schema（with_structured_output 用）
+# ---------------------------------------------------------------------------
+
+class ManagerTaskItem(BaseModel):
+    id: str = ""
+    agent: str = ""
+    depends_on: list[str] = Field(default_factory=list)
+    description: str = ""
+
+
+class ManagerPlanOutput(BaseModel):
+    """Manager 规划输出 schema（与 MANAGER_PLAN_PROMPT 要求 JSON 同构）。"""
+    intent: str = "business_analysis"
+    tasks: list[ManagerTaskItem] = Field(default_factory=list)
 
 
 class ManagerAgent:
@@ -44,8 +63,12 @@ class ManagerAgent:
         memory: 用户长期记忆文本（画像/偏好/通用记忆，注入规划 prompt）。
         """
         logger.info("manager.run.start", question=user_question[:100])
-        raw = self._plan(user_question, memory=memory)
-        plan = self._parse_and_validate(raw, user_question)
+        result = self._plan(user_question, memory=memory)
+        if isinstance(result, dict):
+            # 结构化通道：仍须过公共 DAG 校验（过滤未知 agent、补 decision、环检测）
+            plan = self._validate_plan(result, user_question)
+        else:
+            plan = self._parse_and_validate(result, user_question)
         logger.info(
             "manager.run.done",
             intent=plan.get("intent"),
@@ -57,28 +80,35 @@ class ManagerAgent:
     # ------------------------------------------------------------------
     # 内部步骤
     # ------------------------------------------------------------------
-    def _plan(self, user_question: str, memory: Optional[str] = None) -> str:
-        """调用 LLM 生成任务 DAG（原始文本）。"""
+    def _plan(self, user_question: str, memory: Optional[str] = None) -> Union[dict[str, Any], str]:
+        """生成任务 DAG：结构化通道（OPT-04）优先返回 dict；失败降级原始文本。"""
         from langchain_core.messages import HumanMessage, SystemMessage
 
-        resp = self.model.invoke([
+        messages = [
             SystemMessage(content=MANAGER_SYSTEM_PROMPT),
             HumanMessage(content=MANAGER_PLAN_PROMPT.format(
                 user_question=user_question,
                 memory=memory or "（无）",
             )),
-        ])
-        raw = str(resp.content)
+        ]
+        d = invoke_structured(self.model, ManagerPlanOutput, messages, logger_name="manager_agent")
+        if d is not None:
+            logger.info("manager.plan.structured.ok", task_count=len(d.get("tasks") or []))
+            return d
+        raw = invoke_text(self.model, messages, logger_name="manager_agent") or ""
         logger.debug("manager.plan.llm", raw=raw[:2000])
         return raw
 
     def _parse_and_validate(self, raw: str, user_question: str) -> dict[str, Any]:
-        """解析 LLM 输出，校验 DAG 合法性，必要时修复（确保 decision 任务始终存在）。"""
+        """文本降级路径：解析 LLM 输出 JSON 后走公共 DAG 校验。"""
         parsed = _parse_plan_json(raw)
         if not parsed or not isinstance(parsed.get("tasks"), list):
             logger.warning("manager.parse.failed", raw_preview=raw[:500])
             return _fallback_plan(user_question)
+        return self._validate_plan(parsed, user_question)
 
+    def _validate_plan(self, parsed: dict[str, Any], user_question: str) -> dict[str, Any]:
+        """公共 DAG 校验（结构化 dict 与文本解析共用）：过滤未知 agent、补 decision、环检测。"""
         tasks = parsed["tasks"]
         # 1) 过滤：只保留已知部门 + decision；agent 字段缺失的跳过
         valid_tasks: list[dict[str, Any]] = []
@@ -155,23 +185,8 @@ class ManagerAgent:
 # ---------------------------------------------------------------------------
 
 def _parse_plan_json(text: str) -> Optional[dict[str, Any]]:
-    """从 LLM 输出中提取 JSON（容忍 markdown 代码块）。"""
-    t = text.strip()
-    if t.startswith("```"):
-        t = t.strip("`")
-        if t.lower().startswith("json"):
-            t = t[4:].strip()
-    try:
-        obj = json.loads(t)
-        return obj if isinstance(obj, dict) else None
-    except json.JSONDecodeError:
-        start, end = t.find("{"), t.rfind("}")
-        if start >= 0 and end > start:
-            try:
-                return json.loads(t[start:end + 1])
-            except json.JSONDecodeError:
-                return None
-    return None
+    """从 LLM 输出中提取 JSON（统一委托 extract_json：markdown 剥壳 + 花括号截取）。"""
+    return extract_json(text)
 
 
 def _has_cycle(tasks: list[dict[str, Any]]) -> bool:

@@ -9,16 +9,53 @@ Decision Agent 不查数据库，是纯 LLM 综合分析节点。使用强推理
 from __future__ import annotations
 
 import json
-from typing import Any, Optional
+from typing import Any, Optional, Union
+
+from pydantic import BaseModel, Field
 
 from app.agents.decision.output import DecisionOutput
 from app.agents.decision.prompts import DECISION_PROMPT, DECISION_SYSTEM_PROMPT
 from app.agents.decision.state import DecisionState
 from app.config.settings import settings
 from app.llm import get_chat_model, llm_available
+from app.llm.structured import extract_json, invoke_structured, invoke_text
 from app.observability.logging import get_logger
 
 logger = get_logger("decision_agent")
+
+
+# ---------------------------------------------------------------------------
+# OPT-04 结构化输出：Pydantic 约束（with_structured_output 用），替代手写 JSON 容错
+# ---------------------------------------------------------------------------
+
+class DecisionFinding(BaseModel):
+    category: str = "cross"
+    finding: str = ""
+
+
+class DecisionRootCause(BaseModel):
+    cause: str = ""
+    evidence: str = ""
+
+
+class DecisionRecommendation(BaseModel):
+    priority: str = "P1"
+    action: str = ""
+
+
+class DecisionRisk(BaseModel):
+    risk: str = ""
+    severity: str = "medium"
+
+
+class DecisionOutputSchema(BaseModel):
+    """Decision 输出 schema（与 DecisionOutput TypedDict 同构，字段全默认值）。"""
+    summary: str = ""
+    findings: list[DecisionFinding] = Field(default_factory=list)
+    root_causes: list[DecisionRootCause] = Field(default_factory=list)
+    recommendations: list[DecisionRecommendation] = Field(default_factory=list)
+    risks: list[DecisionRisk] = Field(default_factory=list)
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
 
 
 class DecisionAgent:
@@ -61,7 +98,7 @@ class DecisionAgent:
             has_feedback=bool(feedback),
         )
         raw = self._synthesize(user_question, department_results, memory, feedback)
-        report = self._parse_and_validate(raw)
+        report = raw if isinstance(raw, dict) else self._parse_and_validate(raw)
         logger.info(
             "decision.run.done",
             confidence=report.get("confidence"),
@@ -79,8 +116,11 @@ class DecisionAgent:
         department_results: dict[str, Any],
         memory: Optional[str] = None,
         feedback: Optional[str] = None,
-    ) -> str:
-        """调用 LLM 生成结构化决策报告（原始文本）。
+    ) -> Union[dict[str, Any], str]:
+        """生成结构化决策报告。
+
+        优先走 with_structured_output（OPT-04：Pydantic 约束输出，返回 dict）；
+        模型不支持 / 调用异常时降级为原始文本（走 _parse_and_validate 旧解析链）。
 
         feedback 非空时在 prompt 中注入"反馈意见"段（考点二十九）：
         quality_gate 判不合格后回炉，本次生成必须针对反馈逐条修正。
@@ -89,7 +129,7 @@ class DecisionAgent:
 
         # 精简部门结果：只保留决策需要的字段，避免上下文爆炸
         slim = self._slim_department_results(department_results)
-        resp = self.model.invoke([
+        messages = [
             SystemMessage(content=DECISION_SYSTEM_PROMPT),
             HumanMessage(content=DECISION_PROMPT.format(
                 user_question=user_question,
@@ -97,8 +137,14 @@ class DecisionAgent:
                 feedback=feedback or "（无）",
                 department_results_json=json.dumps(slim, ensure_ascii=False, default=str),
             )),
-        ])
-        raw = str(resp.content)
+        ]
+        # OPT-04：结构化通道优先（统一封装）
+        d = invoke_structured(self.model, DecisionOutputSchema, messages, logger_name="decision_agent")
+        if d is not None:
+            logger.info("decision.structured.ok", confidence=d.get("confidence"))
+            return d
+        # 降级：普通文本回复 → 旧解析链
+        raw = invoke_text(self.model, messages, logger_name="decision_agent") or ""
         logger.debug("decision.synthesize.llm", raw=raw[:3000])
         return raw
 
@@ -146,23 +192,8 @@ class DecisionAgent:
 # ---------------------------------------------------------------------------
 
 def _parse_decision_json(text: str) -> Optional[dict[str, Any]]:
-    """从 LLM 输出中提取 JSON（容忍 markdown 代码块包裹，与 Operation 的 _parse_analysis_json 一致）。"""
-    t = text.strip()
-    if t.startswith("```"):
-        t = t.strip("`")
-        if t.lower().startswith("json"):
-            t = t[4:].strip()
-    try:
-        obj = json.loads(t)
-        return obj if isinstance(obj, dict) else None
-    except json.JSONDecodeError:
-        start, end = t.find("{"), t.rfind("}")
-        if start >= 0 and end > start:
-            try:
-                return json.loads(t[start:end + 1])
-            except json.JSONDecodeError:
-                return None
-    return None
+    """从 LLM 输出中提取 JSON（统一委托 extract_json：markdown 剥壳 + 花括号截取）。"""
+    return extract_json(text)
 
 
 def _ensure_list_of_dicts(value: Any, keys: tuple[str, ...]) -> list[dict[str, Any]]:

@@ -13,12 +13,14 @@
 
 from __future__ import annotations
 
-import json
 import re
 from typing import Any, Optional
 
+from pydantic import BaseModel, Field
+
 from app.config.settings import settings
 from app.llm import get_chat_model, llm_available
+from app.llm.structured import extract_json, invoke_structured, invoke_text
 from app.memory.profile import upsert_preference, upsert_profile
 from app.memory.semantic import add_memory
 from app.observability.logging import get_logger
@@ -58,22 +60,40 @@ EXTRACT_PROMPT = """你是用户长期记忆提取器。基于以下一轮对话
 
 
 def _parse_extract_json(raw: str) -> dict[str, Any]:
-    t = raw.strip()
-    if t.startswith("```"):
-        t = t.strip("`")
-        if t.lower().startswith("json"):
-            t = t[4:].strip()
-    try:
-        obj = json.loads(t)
-        return obj if isinstance(obj, dict) else {}
-    except json.JSONDecodeError:
-        start, end = t.find("{"), t.rfind("}")
-        if start >= 0 and end > start:
-            try:
-                return json.loads(t[start:end + 1])
-            except json.JSONDecodeError:
-                return {}
-    return {}
+    """从 LLM 输出中提取 JSON（统一委托 extract_json，失败返回空 dict）。"""
+    return extract_json(raw) or {}
+
+
+# ---------------------------------------------------------------------------
+# OPT-04 结构化输出：记忆提取 schema（with_structured_output 用）
+# ---------------------------------------------------------------------------
+
+class ExtractProfileItem(BaseModel):
+    key: str = ""
+    value: str = ""
+    confidence: float = 0.0
+    evidence: str = ""
+
+
+class ExtractPreferenceItem(BaseModel):
+    key: str = ""
+    value: str = ""
+    evidence: str = ""
+
+
+class ExtractMemoryItem(BaseModel):
+    type: str = "fact"
+    content: str = ""
+    department: str = ""
+    confidence: float = 0.0
+    evidence: str = ""
+
+
+class ExtractOutput(BaseModel):
+    """记忆提取输出 schema（与 EXTRACT_PROMPT 要求 JSON 同构）。"""
+    profiles: list[ExtractProfileItem] = Field(default_factory=list)
+    preferences: list[ExtractPreferenceItem] = Field(default_factory=list)
+    memories: list[ExtractMemoryItem] = Field(default_factory=list)
 
 
 def _rule_trigger(question: str, answer: str) -> bool:
@@ -88,11 +108,20 @@ def _extract_once(user_id: str, question: str, answer: str) -> dict[str, Any]:
     model = get_chat_model(tier="medium")
     from langchain_core.messages import HumanMessage, SystemMessage
 
-    resp = model.invoke([
+    messages = [
         SystemMessage(content="你只做长期记忆提取，严格按用户要求输出 JSON。"),
         HumanMessage(content=EXTRACT_PROMPT.format(question=(question or "")[:3000], answer=(answer or "")[:4000])),
-    ])
-    parsed = _parse_extract_json(str(resp.content))
+    ]
+    # OPT-04：结构化通道优先，失败降级文本解析
+    d = invoke_structured(model, ExtractOutput, messages, logger_name="memory_extractor")
+    if d is not None:
+        parsed = d
+    else:
+        text = invoke_text(model, messages, logger_name="memory_extractor")
+        if text is None:
+            logger.warning("memory.extract.failed", user_id=user_id)
+            return {"triggered": True, "reason": "llm_failed", "profiles": 0, "preferences": 0, "memories": 0, "skipped": []}
+        parsed = _parse_extract_json(text)
     stats = {"profiles": 0, "preferences": 0, "memories": 0, "skipped": []}
 
     # 1) 画像：高置信 + evidence 非空

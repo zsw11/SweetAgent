@@ -4,6 +4,9 @@
 - 按 provider（deepseek / openai）创建 ChatOpenAI 实例（OpenAI 兼容协议）
 - 检测 API Key 是否真实可用：占位符 / 空值 / 过短视为"未配置"
 - llm_available() 供上层判断 Key 是否可用（未配置时 Operation Agent 启动即报错）
+
+子模块：
+- structured：LLM 输出通道统一封装（结构化输出 / Function Calling / 文本降级）
 """
 
 from __future__ import annotations

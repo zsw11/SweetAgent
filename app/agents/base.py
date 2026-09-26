@@ -10,11 +10,47 @@ import json
 import re
 from typing import Any, Optional
 
+from pydantic import BaseModel, Field
+
 from app.config.settings import settings
 from app.llm import get_chat_model, llm_available
+from app.llm.structured import extract_json, invoke_structured, invoke_text
 from app.observability.logging import get_logger
 
 logger = get_logger("base_agent")
+
+
+# ---------------------------------------------------------------------------
+# OPT-04 结构化输出：部门分析 schema（with_structured_output 用）
+# ---------------------------------------------------------------------------
+
+class AnalysisMetric(BaseModel):
+    name: str = ""
+    prev: Any = None
+    last21: Any = None
+    change_pct: Any = None
+
+
+class AnalysisAnomaly(BaseModel):
+    sku: str = ""
+    indicator: str = ""
+    change_pct: Any = None
+
+
+class AnalysisOutput(BaseModel):
+    """部门分析输出 schema（与 ANALYSIS_PROMPT 要求的 JSON 同构，字段全默认值）。"""
+    summary: str = ""
+    metrics: list[AnalysisMetric] = Field(default_factory=list)
+    findings: list[str] = Field(default_factory=list)
+    anomalies: list[AnalysisAnomaly] = Field(default_factory=list)
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    enough: bool = True
+    missing: list[str] = Field(default_factory=list)
+
+
+class PlanOutput(BaseModel):
+    """部门规划输出 schema（OPT-04）：数据域名称列表（白名单过滤仍由 _extract_plan 兜底）。"""
+    data_domains: list[str] = Field(default_factory=list)
 
 
 def _get_tool_map() -> dict[str, Any]:
@@ -29,23 +65,8 @@ def _get_tool_map() -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def parse_analysis_json(text: str) -> Optional[dict[str, Any]]:
-    """从 LLM 输出中提取 JSON（容忍 markdown 代码块包裹）。"""
-    t = text.strip()
-    if t.startswith("```"):
-        t = t.strip("`")
-        if t.lower().startswith("json"):
-            t = t[4:].strip()
-    try:
-        obj = json.loads(t)
-        return obj if isinstance(obj, dict) else None
-    except json.JSONDecodeError:
-        start, end = t.find("{"), t.rfind("}")
-        if start >= 0 and end > start:
-            try:
-                return json.loads(t[start:end + 1])
-            except json.JSONDecodeError:
-                return None
-    return None
+    """从 LLM 输出中提取 JSON（统一委托 extract_json：markdown 剥壳 + 花括号截取）。"""
+    return extract_json(text)
 
 
 def collect_metrics(evidence) -> list[dict[str, Any]]:
@@ -162,20 +183,24 @@ class BaseDepartmentAgent:
 
         context 可通过 PLAN_PROMPT 中的 {context} 占位注入
         （如 Product Agent 的跨部门结论，避免重复查询其他部门数据域）。
+
+        OPT-04：结构化通道（PlanOutput）优先，失败降级文本 + _extract_plan。
         """
-        try:
-            from langchain_core.messages import HumanMessage, SystemMessage
-            resp = self.model.invoke([
-                SystemMessage(content=self.PLAN_SYSTEM),
-                HumanMessage(content=self.PLAN_PROMPT.format(task=task, context=_context_text(context))),
-            ])
-            plan = _extract_plan(str(resp.content), self.KNOWN_REQS)
-            if self.FALLBACK_REQ not in plan:
-                plan.insert(0, self.FALLBACK_REQ)
-            return plan
-        except Exception as exc:
-            logger.warning(f"{self.AGENT_NAME}.plan.fallback", error=str(exc))
-            return [self.FALLBACK_REQ]
+        from langchain_core.messages import HumanMessage, SystemMessage
+        messages = [
+            SystemMessage(content=self.PLAN_SYSTEM),
+            HumanMessage(content=self.PLAN_PROMPT.format(task=task, context=_context_text(context))),
+        ]
+        logger_name = f"{self.AGENT_NAME}_agent"
+        d = invoke_structured(self.model, PlanOutput, messages, logger_name=logger_name)
+        if d is not None:
+            plan = _extract_plan("\n".join(d.get("data_domains") or []), self.KNOWN_REQS)
+        else:
+            text = invoke_text(self.model, messages, logger_name=logger_name) or ""
+            plan = _extract_plan(text, self.KNOWN_REQS)
+        if self.FALLBACK_REQ not in plan:
+            plan.insert(0, self.FALLBACK_REQ)
+        return plan
 
     # ------------------------------------------------------------------
     # 通用：构建 schema 上下文
@@ -352,15 +377,20 @@ class BaseDepartmentAgent:
                     "\n\n[知识库检索规则] 本次任务中知识库检索未命中相关内容（confidence=none）。"
                     "你必须如实说明“知识库未收录相关内容”，禁止编造或猜测知识库规则内容。"
                 )
-            resp = self.model.invoke([
+            messages = [
                 SystemMessage(content=system_text),
                 HumanMessage(content=self.ANALYSIS_PROMPT.format(
                     task=task,
                     result_json=json.dumps(observations, ensure_ascii=False, default=str),
                     context=_context_text(context),
                 )),
-            ])
-            raw = str(resp.content)
+            ]
+            # OPT-04：结构化输出通道优先（Pydantic 约束，减少格式幻觉）
+            d = invoke_structured(self.model, AnalysisOutput, messages, logger_name=f"{self.AGENT_NAME}_agent")
+            if d is not None:
+                logger.info(f"{self.AGENT_NAME}.analyze.structured.ok")
+                return self._structured_analysis_to_result(d)
+            raw = invoke_text(self.model, messages, logger_name=f"{self.AGENT_NAME}_agent") or ""
             logger.debug(f"{self.AGENT_NAME}.analyze.llm", raw=raw[:2000])
             parsed = parse_analysis_json(raw)
             if parsed:
@@ -387,6 +417,23 @@ class BaseDepartmentAgent:
             logger.warning(f"{self.AGENT_NAME}.analyze.fallback", error=str(exc))
         analysis = [raw[:2000]] if raw else ["LLM 分析失败，无可用结论。"]
         return analysis, [{"type": "analysis", "summary": analysis[0], "raw": raw[:2000]}], True, []
+
+    def _structured_analysis_to_result(self, d: dict[str, Any]) -> tuple[list[str], list[dict[str, Any]], bool, list[str]]:
+        """把结构化 AnalysisOutput dict 转成 _analyze 同构返回 (analysis, evidence, enough, missing)。"""
+        summary = d.get("summary") or ""
+        if isinstance(summary, dict):
+            summary = summary.get("summary") or ""
+        analysis = [str(summary)] if str(summary).strip() else ["LLM 分析未产生结论。"]
+        evidence: list[dict[str, Any]] = [{"type": "analysis", **d}]
+        for m in d.get("metrics") or []:
+            if isinstance(m, dict):
+                evidence.append({"type": "llm_metric", **m})
+        for a in d.get("anomalies") or []:
+            if isinstance(a, dict):
+                evidence.append({"type": "llm_anomaly", **a})
+        enough = bool(d.get("enough", True))
+        missing = [str(m) for m in d.get("missing") or []] if isinstance(d.get("missing"), list) else []
+        return analysis, evidence, enough, missing
 
     # ------------------------------------------------------------------
     # 通用：组装结果
