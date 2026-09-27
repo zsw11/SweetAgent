@@ -1707,3 +1707,45 @@ class GlobalState(TypedDict, total=False):
 **验证**：py_compile 四文件通过 + 实跑三子图：finance 8.09s（2 域）、operation 4.98s（2 域）、product 10.14s（6 域并行全查），queried/observations/sql_history 完整、按 plan 顺序、enough=True、final_result 正常；日志 `*.query.batch_done` 输出 ok/failed 正常。
 
 **核心一句话**：无依赖数据域并行 = 耗时 sum→max，但必须"as_completed 无序收集 → 按 plan 顺序回填"才能保住下游顺序契约；`_query_one` 纯函数 + 主线程回填 + future 内捕获异常，并发安全与单域失败隔离兼得。
+
+
+### 考点三十九：查询 / RAG 缓存怎么设计？——进程内 TTL 缓存的五个坑（OPT-07 落地，2026-09-27）
+
+**面试官怎么问**：用户重复问同一个问题，你的系统每次都重新查 SQL、重新向量检索吗？怎么加缓存？为什么不用 Redis？缓存放实例上为什么命中率为零？缓存命中时返回的耗时应该显示什么？表数据更新了缓存怎么失效？
+
+**设计（本次落地）**：`app/cache/ttl_cache.py` 进程内 TTL 缓存（线程安全 + LRU 淘汰 + 命中统计），两个集成点：
+- **SQL 结果缓存**（`ReadOnlyExecutor.execute`）：键 = sha256(规范化 SQL + 参数指纹)，TTL 默认 60s（业务表数据随种子/运维变化，短 TTL 止血重复查询）；返回结构新增 `cached` 标记；自动用正则提取 FROM/JOIN 表名维护"表 → key"索引，`invalidate_table(table)` 支持表级失效；
+- **RAG 检索缓存**（`KnowledgeRetriever.search`）：键 = sha256(query + 全部 metadata 过滤 + top_k + min_score + **embedding 模型名**)，TTL 默认 3600s（文档低频变更，靠 ingest 重灌时主动失效兜底）；
+- **失效钩子**：`invalidate_knowledge_cache()` = RAG 全清 + SQL 缓存中涉及 knowledge_* 表的条目，ingest 文档实际重建（非 skipped）后调用；
+- **可观测**：cache.hit / cache.miss / cache.invalidate 全走结构化日志；`cache_stats()` 输出命中率/条目数/失效次数。
+
+**为什么（五个关键坑，面试必问）**：
+- **① 为什么进程内而不是 Redis/DB**：本项目单机部署，DB 往返本身比内存慢几个数量级，引入 Redis/缓存表反而让"查缓存"变成一次 IO + 序列化 + 一致性，收益为负；缓存是加速层不是持久状态，进程重启即失效可接受。**Redis 的价值在于跨进程共享 + 持久化 + 分布式**，单进程场景用它是过度设计；
+- **② 缓存挂实例上 = 零命中**：`execute_readonly_sql` 工具每次注册都 `ReadOnlyExecutor()` 新建实例，缓存若挂实例，每个实例一份空缓存，同问题永远 miss——必须挂**模块级共享单例**（`app/cache/ttl_cache.get_sql_cache()`），同一进程所有实例共享；
+- **③ `cache_ttl` 只控制"写入 TTL"，不参与"读取判断"**：读取时只要条目未过期就命中，不管本次传的 TTL 参数——这是验证脚本实测踩到的坑（先写 60s 缓存再传 cache_ttl=1 查询，直接命中 60s 条目，测不到过期）；语义上正确（缓存已存在且有效就该用），但调用方要理解；
+- **④ 命中时 duration_ms 必须重新计时**：`start` 要在查缓存**之前**取，命中返回 `duration_ms≈0` 而不是缓存里保存的首次实查耗时——否则命中与实查从耗时无法区分，可观测性被破坏（本考点最初的 bug）；
+- **⑤ 缓存键必须覆盖"影响结果的一切"**：SQL 键含 SQL+参数；RAG 键必须含 **embedding 模型名**——mock 与真实模型向量语义不同，模型切换不 miss 会返回错维度的陈旧结果；RAG 键含全部过滤条件，漏一个就串结果。
+
+**为什么深拷贝**：SQL rows / RAG hits 都是共享引用的 dict 列表，set 存副本、get 返副本，任何一方修改都不污染缓存内数据（正确性优先，结果集通常 ≤ 5000 行，拷贝成本可忽略）。
+
+**验证**：`scripts/verify_cache.py` 14 项全过——A 同 SQL 二次命中（耗时 0ms vs 实查 20ms+）且结果一致、B 不同参数 miss、C 表级失效后 miss、D TTL 过期 miss、E cache_ttl=0 每次实查、F 同 query 二次命中（stats hits+1）且结果一致、G 不同过滤 miss、H 失效后 miss、I 命中率可观测（total hit_rate>0）；回归 verify_rag 8/8、verify_logistics_parallel 5/5 全过。
+
+**核心一句话**：进程内 TTL 缓存是单机 LLM 应用的默认解（Redis 留给跨进程共享）；三个必须——挂模块级共享单例（实例级=零命中）、命中时重计时 duration_ms（否则可观测性造假）、RAG 键含 embedding 模型名（模型切换自动 miss）；`cache_ttl` 只管写入不管读取，表级失效靠 FROM/JOIN 提取 + ingest 主动钩子。
+
+### 考点四十：缓存 key 怎么设计？全输入哈希命中率低怎么办？（OPT-07 追问，2026-09-27）
+
+**面试官怎么问**：你缓存 key 是怎么算的？规范化 SQL 具体做了什么？RAG 的 key 是 query+过滤条件原文拼哈希，用户问题措辞稍微变一下就不命中——这样设计是不是很难命中缓存？命中率低是不是说明缓存没用？
+
+**设计（当前实现，全输入精确哈希）**：
+- **SQL key** = `"sql:" + sha256(规范化SQL + "|" + 参数JSON)`：
+  ① 规范化 `" ".join(sql.split())`——所有连续空白（换行/制表/多空格）折叠为单空格，SQL 排版差异不产生不同 key；② 参数 JSON 序列化（`default=str` 兜底 Decimal 等非 JSON 类型，`sort_keys=True` 稳定 dict 键）；③ SHA-256 摘要 + `sql:` 前缀。
+- **RAG key** = `"rag:" + sha256(query原文.strip() + "|" + department/brand/market/document_type + "|" + top_k + "|" + min_score + "|" + embedding模型名)`——全部影响检索结果的输入进键，模型名进键保证 mock↔真实模型切换自动 miss。
+
+**为什么这么设计（命中率低的真相）**：
+- **key 必须覆盖"影响结果的一切"输入**：SQL 结果由 SQL 文本+参数唯一决定，RAG 结果由 query+过滤+top_k+模型唯一决定；漏掉任何一个，就会把不同查询的结果错配给用户 = **错误命中**。错误命中的代价（返回错误数据）远大于 miss 的代价（重查一次几十 ms），所以 key 宁死不模糊；
+- **语义等价无法可靠判定**：程序无法判定 LLM 生成的两条 SQL 语义是否等价（`SELECT a,b` vs `SELECT b,a` 等价、`SELECT a` vs `SELECT count(a)` 不等价）；RAG 同义改写同理（"退货率"与"退款率"检索结果可能真不同）。模糊匹配 = 必然引入错误命中；
+- **缓存的第一原则**：缓存是给"确定性重复"用的，不是给"语义相似"用的。语义相似靠 LLM 每次生成时自然消化（它会重查），缓存只兜住完全重复的调用——定位是**重复查询的加速层**，不是**结果去重层**。同问题重复问（LLM 输出稳定时 SQL 相同）、评估用例重跑、确定性模板 SQL 才是真实命中场景；
+- **提高命中率的可选手段（各有利弊）**：① 粒度上移——缓存"req+task 域结果"而非 SQL 文本，命中率高一个量级，但 task 变化就 miss、要处理分析上下文边界；② RAG embedding 近邻复用——query 向量距离<阈值复用结果，阈值难定，太宽错配太窄无增益；③ query 轻量归一化（小写/去停用词）——收益有限；④ SQL 语法树归一化——工程量大收益不确定。当前选"精确命中+保守安全"是默认正确解，等有实测重复率数据再考虑粒度上移。
+
+**核心一句话**：缓存 key 必须精确到"全输入哈希"——错误命中的代价远大于 miss，程序判定不了语义等价，所以命中率低不是缓存没用，而是缓存只为确定性重复而生；想提高命中率要换缓存粒度（req+task 域结果）而不是模糊 key。
+**性能实测补充（2026-09-27 追问）**：key 计算/命中是否慢？本机实测：SQL key 计算 ≈4.7μs/次、RAG key ≈2.1μs/次；命中返回深拷贝 5 行 ≈10μs、5000 行 ≈12ms；DB 实查同 SQL 28~84ms。命中路径总开销（key 计算+字典查找+深拷贝）≈15~20μs，比实查快约 3 个数量级。结论：key 计算是微秒级线性扫描+sha256，相对 DB 查询（ms 级）可忽略；唯一有感的时间项是深拷贝（大结果集 12ms，仍远小于对应实查），是"缓存与外部隔离"的正确性代价；verify 早期输出"命中 28ms"是计时 bug（命中返回了缓存旧 duration_ms），已修复为命中重计时 ≈0ms。

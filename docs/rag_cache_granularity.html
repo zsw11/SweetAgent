@@ -1,0 +1,75 @@
+<html style="margin:0;padding:0;">
+<title>缓存粒度上移 OPT-11 讲解</title>
+<div style="width:100%;box-sizing:border-box;font-family:-apple-system,'Microsoft YaHei',sans-serif;padding:8px;">
+<svg viewBox="0 0 1020 580" width="100%" style="max-width:1020px;" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="缓存粒度上移讲解图">
+<defs>
+  <marker id="arr" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#4b5563"/></marker>
+  <marker id="arrG" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#1a9e63"/></marker>
+</defs>
+<text x="12" y="26" font-size="20" font-weight="bold" fill="#111827">缓存粒度上移（OPT-11）—— 命中条件从「SQL 逐字节相同」放宽到「同一 req + 同一 task」</text>
+
+<!-- ===== 左列：调用链与两级缓存定位 ===== -->
+<text x="40" y="56" font-size="15" font-weight="bold" fill="#111827">调用链分层 · 缓存挂在哪一层</text>
+
+<rect x="40" y="72" width="420" height="40" rx="8" fill="#eef2ff" stroke="#818cf8" stroke-width="1.5"/>
+<text x="250" y="97" text-anchor="middle" font-size="14" fill="#3730a3">Agent 提问（部门子图 query 节点）</text>
+
+<line x1="250" y1="112" x2="250" y2="132" stroke="#4b5563" stroke-width="2" marker-end="url(#arr)"/>
+
+<rect x="40" y="136" width="420" height="52" rx="8" fill="#ecfdf5" stroke="#1a9e63" stroke-width="2"/>
+<text x="250" y="158" text-anchor="middle" font-size="14" font-weight="bold" fill="#0c6b44">_query_one(req, task, context)   ← 域级缓存挂这里（OPT-11）</text>
+<text x="250" y="178" text-anchor="middle" font-size="12" fill="#0c6b44">key = (部门, req, task) · 命中率最高的一层</text>
+
+<line x1="250" y1="188" x2="250" y2="208" stroke="#4b5563" stroke-width="2" marker-end="url(#arr)"/>
+
+<rect x="40" y="212" width="420" height="40" rx="8" fill="#ffffff" stroke="#d1d5db" stroke-width="1.2"/>
+<text x="250" y="237" text-anchor="middle" font-size="14" fill="#374151">内部通道：SQL 生成 · RAG 检索 · MCP 轨迹</text>
+
+<line x1="250" y1="252" x2="250" y2="272" stroke="#4b5563" stroke-width="2" marker-end="url(#arr)"/>
+
+<rect x="40" y="276" width="420" height="52" rx="8" fill="#f0f9ff" stroke="#1d6fe0" stroke-width="2"/>
+<text x="250" y="298" text-anchor="middle" font-size="14" font-weight="bold" fill="#0b4ea2">executor.execute / retriever.search   ← 文本级缓存挂这里（OPT-07）</text>
+<text x="250" y="318" text-anchor="middle" font-size="12" fill="#0b4ea2">key = SQL 原文+参数 / query 原文 · 命中率最低的一层</text>
+
+<line x1="250" y1="328" x2="250" y2="348" stroke="#4b5563" stroke-width="2" marker-end="url(#arr)"/>
+
+<rect x="40" y="352" width="420" height="40" rx="8" fill="#f9fafb" stroke="#9ca3af" stroke-width="1.5"/>
+<text x="250" y="377" text-anchor="middle" font-size="14" fill="#111827">PostgreSQL / 向量库</text>
+
+<text x="40" y="424" font-size="13" fill="#4b5563">越靠上：缓存管得越粗 → 命中越宽松（但要注意边界）</text>
+<text x="40" y="444" font-size="13" fill="#4b5563">越靠下：缓存管得越细 → 命中越苛刻（但最安全）</text>
+
+<!-- ===== 右列：同问题两次提问实例 ===== -->
+<text x="520" y="56" font-size="15" font-weight="bold" fill="#111827">实例：同一问题问两遍</text>
+
+<rect x="520" y="72" width="460" height="108" rx="8" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.5"/>
+<text x="536" y="94" font-size="13" font-weight="bold" fill="#374151">第 1 次提问：task=「美国市场床垫退货率偏高原因」→ req=product_sales</text>
+<text x="536" y="114" font-size="13" fill="#4b5563">LLM 生成 SQL-A：</text>
+<text x="536" y="132" font-size="12" fill="#6b7280">SELECT date, sku_id, refund_rate ... FROM sales_daily WHERE country='US'</text>
+<text x="536" y="150" font-size="12" fill="#6b7280">        ORDER BY date DESC LIMIT 50</text>
+<text x="536" y="170" font-size="12" fill="#6b7280">（执行后写入：文本级缓存 + 域级缓存）</text>
+
+<rect x="520" y="196" width="460" height="108" rx="8" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.5"/>
+<text x="536" y="218" font-size="13" font-weight="bold" fill="#374151">第 2 次提问：task 同原文 → req 仍 = product_sales</text>
+<text x="536" y="238" font-size="13" fill="#4b5563">LLM 生成 SQL-B（换行/列序微变，不是逐字节相同）：</text>
+<text x="536" y="256" font-size="12" fill="#6b7280">SELECT sku_id, date, refund_rate ... FROM sales_daily</text>
+<text x="536" y="274" font-size="12" fill="#6b7280">        WHERE country = 'US' ORDER BY date DESC LIMIT 50</text>
+
+<rect x="520" y="320" width="460" height="44" rx="8" fill="#fef2f2" stroke="#d64541" stroke-width="1.5"/>
+<text x="750" y="339" text-anchor="middle" font-size="13" font-weight="bold" fill="#9f1239">文本级（OPT-07）：SQL-A ≠ SQL-B → MISS，重查</text>
+<text x="750" y="357" text-anchor="middle" font-size="12" fill="#9f1239">规范化只能吸收空白，吸收不了列序/结构差异</text>
+
+<rect x="520" y="376" width="460" height="44" rx="8" fill="#ecfdf5" stroke="#1a9e63" stroke-width="1.5"/>
+<text x="750" y="395" text-anchor="middle" font-size="13" font-weight="bold" fill="#0c6b44">域级（OPT-11）：req+task 完全相同 → HIT，直接复用</text>
+<text x="750" y="413" text-anchor="middle" font-size="12" fill="#0c6b44">与 LLM 生成什么 SQL 无关 —— 这就是高一个量级的原因</text>
+
+<!-- ===== 底部：边界与代价 ===== -->
+<rect x="40" y="472" width="940" height="92" rx="10" fill="#fffbeb" stroke="#d97706" stroke-width="1.5"/>
+<text x="58" y="494" font-size="14" font-weight="bold" fill="#92400e">域级缓存的边界（为什么不能无限放宽 key）</text>
+<text x="58" y="514" font-size="13" fill="#374151">① task 措辞变化 → miss：同义改写（「退货率」→「退款率」）不命中，安全优先；</text>
+<text x="58" y="532" font-size="13" fill="#374151">② context 不进 key：跨部门结论变化可能复用旧结果 → 短 TTL（60s）+ 幂等兜底；</text>
+<text x="58" y="550" font-size="13" fill="#374151">③ 与 queried 防重互补：queried 管「一次图执行内」，域级缓存管「多次执行/多轮对话间」；</text>
+<text x="58" y="568" font-size="13" fill="#374151">④ 与文本级缓存共存（双层）：域级 miss 时内部仍可命中 SQL 级缓存，省 DB 往返。</text>
+</svg>
+</div>
+</html>

@@ -1,0 +1,97 @@
+<html style="margin:0;padding:0;">
+<title>OPT-07 查询/RAG 缓存架构</title>
+<div style="width:100%;box-sizing:border-box;font-family:-apple-system,'Microsoft YaHei',sans-serif;padding:8px;">
+<svg viewBox="0 0 1020 660" width="100%" style="max-width:1020px;" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="OPT-07 查询/RAG 缓存架构图">
+<defs>
+  <marker id="arrowBlue" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#1d6fe0"/></marker>
+  <marker id="arrowGreen" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#1a9e63"/></marker>
+  <marker id="arrowRed" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#d64541"/></marker>
+  <marker id="arrowGray" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#6b7280"/></marker>
+</defs>
+
+<text x="12" y="26" font-size="20" font-weight="bold" fill="#111827">OPT-07 查询 / RAG 缓存架构 —— 两条查数通道各加一层 TTL 缓存</text>
+<text x="12" y="48" font-size="14" fill="#4b5563">目标：同问题重复提问不再重复查 SQL / 向量检索，降低延迟与 DB/token 成本；命中率可观测</text>
+
+<!-- ===== 输入层 ===== -->
+<rect x="40" y="68" width="940" height="52" rx="8" fill="#eef2ff" stroke="#818cf8" stroke-width="1.5"/>
+<text x="60" y="90" font-size="15" font-weight="bold" fill="#3730a3">部门 Agent query（同问题重复提问）</text>
+<text x="60" y="110" font-size="13" fill="#4f46e5">operation / finance / product / logistics 四个部门子图 · 已并行化（考点三十八）</text>
+
+<!-- 输入 → 两条通道（未命中时向下走） -->
+<line x1="290" y1="120" x2="290" y2="146" stroke="#1d6fe0" stroke-width="2" marker-end="url(#arrowBlue)"/>
+<line x1="710" y1="120" x2="710" y2="146" stroke="#1d6fe0" stroke-width="2" marker-end="url(#arrowBlue)"/>
+<!-- 命中即返回（不查 DB，向上回输入层） -->
+<line x1="316" y1="148" x2="316" y2="124" stroke="#1a9e63" stroke-width="2" marker-end="url(#arrowGreen)"/>
+<line x1="736" y1="148" x2="736" y2="124" stroke="#1a9e63" stroke-width="2" marker-end="url(#arrowGreen)"/>
+<text x="322" y="140" font-size="12" fill="#1a9e63">命中即返回</text>
+<text x="742" y="140" font-size="12" fill="#1a9e63">命中即返回</text>
+
+<!-- ===== 缓存层（左：SQL） ===== -->
+<rect x="40" y="150" width="470" height="190" rx="10" fill="#f0f9ff" stroke="#1d6fe0" stroke-width="1.5"/>
+<text x="58" y="176" font-size="15" font-weight="bold" fill="#0b4ea2">SQL 通道：ReadOnlyExecutor.execute</text>
+<text x="58" y="198" font-size="13" fill="#374151">缓存键 = sha256( 规范化SQL + 参数指纹 )</text>
+<text x="58" y="218" font-size="13" fill="#374151">TTL 60s（业务表变化快 · 短 TTL 止血）</text>
+<text x="58" y="238" font-size="13" fill="#374151">命中返回 cached=True + duration_ms≈0（重计时）</text>
+<text x="58" y="258" font-size="13" fill="#374151">FROM/JOIN 提取表名 → 表级失效索引</text>
+
+<rect x="58" y="272" width="180" height="48" rx="8" fill="#ffffff" stroke="#1d6fe0" stroke-width="1.5"/>
+<text x="148" y="294" text-anchor="middle" font-size="14" font-weight="bold" fill="#0b4ea2">sql_cache</text>
+<text x="148" y="312" text-anchor="middle" font-size="12" fill="#4b5563">模块级共享单例</text>
+<rect x="258" y="272" width="232" height="48" rx="8" fill="#ffffff" stroke="#d1d5db" stroke-width="1.2" stroke-dasharray="4 3"/>
+<text x="374" y="292" text-anchor="middle" font-size="13" fill="#374151">未命中 → 查 DB 并回填</text>
+<text x="374" y="310" text-anchor="middle" font-size="12" fill="#6b7280">（连一次 agent_reader 只读角色）</text>
+
+<!-- ===== 缓存层（右：RAG） ===== -->
+<rect x="510" y="150" width="470" height="190" rx="10" fill="#ecfdf5" stroke="#1a9e63" stroke-width="1.5"/>
+<text x="528" y="176" font-size="15" font-weight="bold" fill="#0c6b44">RAG 通道：KnowledgeRetriever.search</text>
+<text x="528" y="198" font-size="13" fill="#374151">缓存键 = sha256( query + 过滤条件 + top_k/min_score + <tspan font-weight="bold" fill="#b45309">embedding 模型名</tspan> )</text>
+<text x="528" y="218" font-size="13" fill="#374151">TTL 3600s（文档低频变更 · 主动失效兜底）</text>
+<text x="528" y="238" font-size="13" fill="#374151">模型名进键：mock ↔ 真实模型切换 → 自动 miss</text>
+<text x="528" y="258" font-size="13" fill="#374151">深拷贝返回，缓存与外部完全隔离</text>
+
+<rect x="528" y="272" width="180" height="48" rx="8" fill="#ffffff" stroke="#1a9e63" stroke-width="1.5"/>
+<text x="618" y="294" text-anchor="middle" font-size="14" font-weight="bold" fill="#0c6b44">rag_cache</text>
+<text x="618" y="312" text-anchor="middle" font-size="12" fill="#4b5563">模块级共享单例</text>
+<rect x="728" y="272" width="232" height="48" rx="8" fill="#ffffff" stroke="#d1d5db" stroke-width="1.2" stroke-dasharray="4 3"/>
+<text x="844" y="292" text-anchor="middle" font-size="13" fill="#374151">未命中 → 向量+关键词检索</text>
+<text x="844" y="310" text-anchor="middle" font-size="12" fill="#6b7280">（降级式混合检索，考点三十）</text>
+
+<!-- 缓存层 → DB -->
+<line x1="148" y1="320" x2="148" y2="392" stroke="#1d6fe0" stroke-width="2" marker-end="url(#arrowBlue)"/>
+<line x1="618" y1="320" x2="618" y2="392" stroke="#1d6fe0" stroke-width="2" marker-end="url(#arrowBlue)"/>
+
+<!-- ===== 数据层 ===== -->
+<rect x="40" y="396" width="940" height="66" rx="10" fill="#f9fafb" stroke="#9ca3af" stroke-width="1.5"/>
+<text x="60" y="420" font-size="15" font-weight="bold" fill="#111827">PostgreSQL（agent_reader 只读角色 · statement_timeout 30s）</text>
+<text x="60" y="442" font-size="13" fill="#4b5563">业务表：sales_daily / profit_daily / mart_* 等   ·   知识库：knowledge_documents / knowledge_chunks / knowledge_embeddings（pgvector 余弦检索）</text>
+
+<!-- ===== 失效链路 ===== -->
+<rect x="40" y="488" width="540" height="96" rx="10" fill="#fef2f2" stroke="#d64541" stroke-width="1.5"/>
+<text x="58" y="512" font-size="15" font-weight="bold" fill="#9f1239">失效链路：数据变了缓存必须立刻失效</text>
+<text x="58" y="534" font-size="13" fill="#374151">① 知识库重灌（ingest 文档实际重建，非 skipped）→</text>
+<text x="58" y="554" font-size="13" fill="#374151">② invalidate_knowledge_cache() = RAG 全清 + SQL 涉及 knowledge_* 表的条目（表级失效）</text>
+<text x="58" y="574" font-size="13" fill="#374151">③ 业务表更新靠短 TTL（60s）自然过期，或手动 invalidate_table('sales_daily')</text>
+
+<!-- 失效箭头 -->
+<line x1="580" y1="536" x2="940" y2="536" stroke="#d64541" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#arrowRed)"/>
+<text x="760" y="528" text-anchor="middle" font-size="12" fill="#d64541">主动失效（不等 TTL）</text>
+
+<!-- ===== 可观测 ===== -->
+<rect x="590" y="488" width="390" height="96" rx="10" fill="#fffbeb" stroke="#d97706" stroke-width="1.5"/>
+<text x="608" y="512" font-size="15" font-weight="bold" fill="#92400e">可观测（命中率指标）</text>
+<text x="608" y="534" font-size="13" fill="#374151">cache.hit / cache.miss / cache.invalidate 结构化日志</text>
+<text x="608" y="554" font-size="13" fill="#374151">cache_stats() → 命中率 = hits / (hits + misses)</text>
+<text x="608" y="574" font-size="13" fill="#374151">命中时 duration_ms≈0，与实查可从耗时区分</text>
+
+<!-- ===== 图例 ===== -->
+<text x="40" y="622" font-size="14" font-weight="bold" fill="#111827">图例</text>
+<line x1="88" y1="618" x2="128" y2="618" stroke="#1d6fe0" stroke-width="2" marker-end="url(#arrowBlue)"/>
+<text x="136" y="622" font-size="13" fill="#374151">未命中：查库/检索后回填</text>
+<line x1="300" y1="618" x2="340" y2="618" stroke="#1a9e63" stroke-width="2" marker-end="url(#arrowGreen)"/>
+<text x="348" y="622" font-size="13" fill="#374151">命中：直接返回</text>
+<line x1="462" y1="618" x2="502" y2="618" stroke="#d64541" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#arrowRed)"/>
+<text x="510" y="622" font-size="13" fill="#374151">主动失效</text>
+<text x="640" y="622" font-size="13" fill="#6b7280">注：进程内缓存（单机部署默认解，Redis 留给跨进程共享）</text>
+</svg>
+</div>
+</html>

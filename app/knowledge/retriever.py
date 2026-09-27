@@ -17,11 +17,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 from typing import Any, Optional
 
+from app.cache.ttl_cache import get_rag_cache
 from app.config.settings import settings
-from app.knowledge.embedder import embed_query
+from app.knowledge.embedder import current_embedding_model, embed_query
 from app.memory.embeddings import vector_to_sql
 from app.observability.logging import get_logger
 from app.tools.sql.executor import ReadOnlyExecutor
@@ -91,7 +93,15 @@ def _evidence_confidence(similarity: float, hit_count: Optional[int], method: st
 
 
 class KnowledgeRetriever:
-    """企业知识库检索器（向量 + 关键词混合）。"""
+    """企业知识库检索器（向量 + 关键词混合）。
+
+    OPT-07（2026-09-27）检索缓存：
+    - 键 = query + 全部 metadata 过滤 + top_k + min_score + embedding 模型；
+      embedding 模型进键是关键——mock 与真实模型向量语义不同，模型切换必须自动 miss；
+    - TTL = settings.RAG_CACHE_TTL_SECONDS（长 TTL，知识库低频变更）；
+    - 失效：知识库重灌后调用 invalidate()（全清最简，见 app.knowledge.ingest）；
+    - 缓存挂模块级共享实例：每个 KnowledgeRetriever 实例共享同一份缓存。
+    """
 
     def __init__(
         self,
@@ -102,6 +112,34 @@ class KnowledgeRetriever:
         self.executor = executor or ReadOnlyExecutor()
         self.top_k = top_k
         self.min_score = min_score
+
+    @staticmethod
+    def invalidate() -> int:
+        """知识库内容变更后清空 RAG 检索缓存（幂等，可反复调用）。"""
+        return get_rag_cache().clear()
+
+    @staticmethod
+    def _cache_key(
+        query: str,
+        *,
+        department: Optional[str],
+        brand: Optional[str],
+        market: Optional[str],
+        document_type: Optional[str],
+        top_k: int,
+        min_score: float,
+    ) -> Optional[str]:
+        """检索缓存键：query + 全部过滤条件 + 参数 + embedding 模型指纹。"""
+        if not settings.CACHE_ENABLED:
+            return None
+        parts = [
+            (query or "").strip(),
+            department or "", brand or "", market or "", document_type or "",
+            str(top_k), str(min_score),
+            current_embedding_model(),  # 向量模型变化 → 缓存自动失效
+        ]
+        digest = hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
+        return f"rag:{digest}"
 
     # ------------------------------------------------------------------
     # 公开入口
@@ -127,11 +165,22 @@ class KnowledgeRetriever:
 
         Returns:
             [{"chunk_id", "document_id", "chunk_index", "title", "source_type",
-              "department", "brand", "market", "content", "similarity", "method"}]
+              "department", "brand", "market", "content", "similarity", "method",
+              "confidence"}]
             method ∈ {"vector", "keyword"}，标识命中来源（可观测）。
         """
         top_k = top_k or self.top_k
         min_score = self.min_score if min_score is None else min_score
+        cache_key = self._cache_key(
+            query, department=department, brand=brand, market=market,
+            document_type=document_type, top_k=top_k, min_score=min_score,
+        )
+        if cache_key is not None:
+            cached = get_rag_cache().get(cache_key)
+            if cached is not None:
+                logger.debug("knowledge.retrieve.cache_hit", query=(query or "")[:60])
+                return cached
+
         qvec = embed_query(query)
         hits = self._vector_search(qvec, query, department=department, brand=brand,
                                    market=market, document_type=document_type, top_k=top_k)
@@ -156,7 +205,10 @@ class KnowledgeRetriever:
                     best_score=round(hits[0]["similarity"], 3),
                 )
                 return []
-        return [self._stamp_confidence(h) for h in hits]
+        result = [self._stamp_confidence(h) for h in hits]
+        if cache_key is not None:
+            get_rag_cache().set(cache_key, result, settings.RAG_CACHE_TTL_SECONDS)
+        return result
 
     @staticmethod
     def _stamp_confidence(hit: dict[str, Any]) -> dict[str, Any]:
@@ -317,3 +369,11 @@ def search_knowledge(
         top_k=top_k,
         min_score=min_score,
     )
+
+
+def invalidate_knowledge_cache() -> int:
+    """知识库变更后统一失效缓存（RAG 全清 + SQL 涉及 knowledge_* 表的结果缓存）。"""
+    n = KnowledgeRetriever.invalidate()
+    for table in ("knowledge_documents", "knowledge_chunks", "knowledge_embeddings"):
+        n += ReadOnlyExecutor.invalidate_table(table)
+    return n

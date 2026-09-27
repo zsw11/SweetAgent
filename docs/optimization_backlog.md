@@ -53,13 +53,21 @@
 - **预估工作量**：M
 - **验收标准**：注入用例被标记且不污染决策；脱敏规则覆盖 3 类敏感字段。
 
-### OPT-07 查询 / RAG 缓存
-- **现状**：同问题重复查询重复走 SQL / 向量检索，无缓存。
-- **目标**：降低延迟与 token/DB 成本。
-- **做法**：SQL 结果缓存（task hash + 表级失效）与 RAG 检索缓存（query embedding hash + top-k 缓存），TTL 可配；监控命中率。
-- **涉及范围**：`app/tools/sql/executor.py`、`app/knowledge/retriever.py`。
+### OPT-07 查询 / RAG 缓存（**✅ 已完成 2026-09-27**）
+- **落地**：新增 `app/cache/ttl_cache.py` 进程内 TTL 缓存（线程安全 + LRU + 命中统计，模块级共享单例）：
+  - SQL 结果缓存（`executor.py`）：键 = sha256(规范化 SQL + 参数)，TTL 60s；自动提取 FROM/JOIN 表名维护表级失效索引，`invalidate_table()`；命中返回 `cached=True` + 重计时 duration_ms；
+  - RAG 检索缓存（`retriever.py`）：键 = query + 全部过滤 + top_k/min_score + **embedding 模型名**，TTL 3600s；`invalidate()` 全清；
+  - 失效钩子：`invalidate_knowledge_cache()` 挂 ingest 重建成功后（RAG 全清 + SQL 涉及 knowledge_* 表）；
+  - 可观测：`cache_stats()` 命中率 / 日志 cache.hit/miss。
+- **验证**：`scripts/verify_cache.py` 14 项全过（命中/参数区分/表级失效/TTL/禁用/统计）；回归 verify_rag 8/8、verify_logistics_parallel 5/5。详见 development_log.md 考点三十九。
+- **待办（可选）**：schema 元数据缓存（list_tables/schema_search 每次 query 重复探索）；跨进程共享缓存（Redis，多实例部署时再评估）。
+
+### OPT-11 缓存粒度上移：req+task 域结果缓存（**⬜ 待办**，2026-09-27 立项）
+- **现状**：OPT-07 缓存粒度 = SQL 文本级 / RAG query 原文级，命中条件苛刻（逐字节相同）；同任务内重复查询已靠 `queried` 防重挡住，但跨轮次/多轮重复提问时文本级命中率有限。
+- **目标**：把命中率提高一个量级——从"SQL 逐字节相同"放宽到"同一 req + 同一 task 描述"。
+- **做法**：部门 agent 的 `_query_one(req, task)` 输出按 `(req, task)` 缓存 observations，同 req 同 task 直接复用整个域查询结果（SQL+RAG+MCP 统一收益）；需处理分析上下文边界（task 措辞变化即 miss，语义相似不命中）。
 - **预估工作量**：S~M
-- **验收标准**：同问重复调用命中缓存（日志可证）；命中率指标可观测。
+- **验收标准**：同 task 重复提问命中域结果缓存（日志可证）；命中率显著高于 OPT-07 文本级。
 
 ---
 
@@ -108,7 +116,8 @@
 | OPT-04 | 结构化输出强化 | P1 | S~M | ✅（2026-09-24） |
 | OPT-05 | Function Calling 原生化 | P1 | M | ✅（2026-09-24） |
 | OPT-06 | 提示注入/输出安全 | P1 | M | ⬜ |
-| OPT-07 | 查询/RAG 缓存 | P1 | S~M | ⬜ |
+| OPT-07 | 查询/RAG 缓存 | P1 | S~M | ✅（2026-09-27） |
+| OPT-11 | 缓存粒度上移（req+task 域结果） | P1 | S~M | ⬜ |
 | OPT-08 | 容器化 | P2 | M | ⬜ |
 | OPT-09 | 异步任务化 | P2 | L | ⬜ |
 | OPT-10 | Skills / A2A | P2 | L | ⬜ |

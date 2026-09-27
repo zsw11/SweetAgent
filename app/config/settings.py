@@ -87,6 +87,14 @@ class Settings(BaseSettings):
     LANGSMITH_API_KEY: str = ""
     LANGSMITH_PROJECT: str = "sweetagent"
 
+    # ---------- 查询 / RAG 缓存（OPT-07，2026-09-27） ----------
+    # SQL 结果缓存短 TTL（业务表数据随种子/运维变化，秒级过期即可止血重复查询）；
+    # RAG 检索缓存长 TTL（知识库文档低频变更，靠 ingest 重灌时的表级失效钩子主动失效）。
+    CACHE_ENABLED: bool = True
+    SQL_CACHE_TTL_SECONDS: int = 60
+    RAG_CACHE_TTL_SECONDS: int = 3600
+    CACHE_MAX_ENTRIES: int = 512
+
 
 @lru_cache
 def get_settings() -> Settings:

@@ -119,6 +119,12 @@ def ingest_document(
         document_id=doc_id, title=title, department=department,
         chunks=len(chunks), model=model, dim=dim,
     )
+    # OPT-07：内容实际重建（非 skipped）→ 知识库表数据变更，主动失效 RAG 检索缓存
+    # 与 SQL 结果缓存中涉及 knowledge_* 表的条目（表级失效，不等 TTL 自然过期）。
+    from app.knowledge.retriever import invalidate_knowledge_cache
+
+    invalidated = invalidate_knowledge_cache()
+    logger.info("knowledge.ingest.cache_invalidated", entries=invalidated, title=title)
     return {
         "document_id": doc_id, "chunk_count": len(chunks),
         "model": model, "dimension": dim,
