@@ -79,6 +79,7 @@ class DecisionAgent:
         department_results: dict[str, Any],
         memory: Optional[str] = None,
         feedback: Optional[str] = None,
+        injection_warning: str = "",
     ) -> DecisionOutput:
         """执行一次决策分析，返回结构化 DecisionOutput。
 
@@ -89,6 +90,8 @@ class DecisionAgent:
                 回答"用户自身相关"问题（如负责哪个市场）时注入，无则 None。
             feedback: 质量门反馈（考点二十九）——上一次回答的偏差诊断或用户纠正意见，
                 quality_gate 评估不合格后回炉重生成时注入，指导本次修正；无则 None。
+            injection_warning: 入口注入检测命中的边界警告（OPT-06），非空时作为
+                独立 System 消息注入，要求忽略用户输入中的指令性内容。
         """
         logger.info(
             "decision.run.start",
@@ -96,8 +99,9 @@ class DecisionAgent:
             departments=list(department_results.keys()),
             has_memory=bool(memory),
             has_feedback=bool(feedback),
+            injection_flagged=bool(injection_warning),
         )
-        raw = self._synthesize(user_question, department_results, memory, feedback)
+        raw = self._synthesize(user_question, department_results, memory, feedback, injection_warning)
         report = raw if isinstance(raw, dict) else self._parse_and_validate(raw)
         logger.info(
             "decision.run.done",
@@ -116,6 +120,7 @@ class DecisionAgent:
         department_results: dict[str, Any],
         memory: Optional[str] = None,
         feedback: Optional[str] = None,
+        injection_warning: str = "",
     ) -> Union[dict[str, Any], str]:
         """生成结构化决策报告。
 
@@ -138,6 +143,9 @@ class DecisionAgent:
                 department_results_json=json.dumps(slim, ensure_ascii=False, default=str),
             )),
         ]
+        # OPT-06：注入检测命中时追加边界警告（系统级约束，独立消息不被用户输入稀释）
+        if injection_warning:
+            messages.append(SystemMessage(content=injection_warning))
         # OPT-04：结构化通道优先（统一封装）
         d = invoke_structured(self.model, DecisionOutputSchema, messages, logger_name="decision_agent")
         if d is not None:

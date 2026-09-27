@@ -57,13 +57,15 @@ def build_main_graph(
         """Manager 节点：理解问题 -> 任务拆解 -> 依赖 DAG。"""
         user_question = state.get("user_question", "")
         user_id = state.get("user_id", "default")
-        logger.info("main.manager.start", question=user_question[:100])
+        injection_warning = state.get("injection_warning") or ""
+        logger.info("main.manager.start", question=user_question[:100], injection_flagged=bool(injection_warning))
         try:
             # 长期记忆注入（用户级：画像 + 偏好 + 通用非结构化 top-k，设计文档 34-35 节）
             memory = build_manager_memory(user_id, user_question)
             task_plan = mgr.run(
                 user_question,
                 memory=json.dumps(memory, ensure_ascii=False) if memory else None,
+                injection_warning=injection_warning,
             )
             logger.info(
                 "main.manager.done",
@@ -131,6 +133,7 @@ def build_main_graph(
         """
         user_question = state.get("user_question", "")
         user_id = state.get("user_id", "default")
+        injection_warning = state.get("injection_warning") or ""
         department_results = state.get("department_results") or {}
         feedback = state.get("quality_feedback") or ""
         skipped = state.get("skipped_tasks") or []
@@ -148,6 +151,7 @@ def build_main_graph(
                 department_results,
                 memory=json.dumps(memory, ensure_ascii=False) if memory else None,
                 feedback=feedback or None,
+                injection_warning=injection_warning,
             )
             logger.info("main.decision.done", confidence=report.get("confidence"))
             return {
@@ -358,6 +362,17 @@ def run_question(
         human_in_the_loop 触发暂停时，结果含 __interrupt__ 键（见 quality_gate）。
     """
     logger.info("run_question.start", thread_id=thread_id, question=question[:100], hilt=human_in_the_loop)
+    # OPT-06 A：入口提示注入检测（只标记+注入边界警告，不阻断主链路）
+    from app.security.injection import INJECTION_WARNING, detect_injection
+
+    injection = detect_injection(question)
+    if injection["flagged"]:
+        logger.warning(
+            "injection.flagged",
+            thread_id=thread_id,
+            categories=injection["categories"],
+            matches=injection["matches"],
+        )
     # OPT-02 LangSmith：任何 LLM/图调用前同步环境变量并挂载自动 tracer（幂等，失败仅降级）
     init_langsmith()
     if checkpointer is None:
@@ -368,6 +383,7 @@ def run_question(
         "thread_id": thread_id,
         "user_id": user_id,
         "user_question": question,
+        "injection_warning": INJECTION_WARNING if injection["flagged"] else "",
         "current_stage": "planning",
         "department_results": {},
         "completed_tasks": [],
@@ -390,6 +406,25 @@ def run_question(
         initial_state,
         config=invoke_config,
     )
+    # OPT-06 B：输出脱敏——decision_result 全字段递归掩码 + final_answer 同步
+    # （回答出口统一处理，DB/记忆原文不变，仅返回给用户的内容脱敏）
+    if settings.OUTPUT_MASKING_ENABLED:
+        from app.security.masking import mask_object
+
+        dr = result.get("decision_result")
+        if isinstance(dr, dict):
+            dr_masked, applied = mask_object(dr)
+            result["decision_result"] = dr_masked
+            summary = dr_masked.get("summary", "")
+            if summary:
+                result["final_answer"] = summary
+            if applied:
+                logger.info("masking.applied", thread_id=thread_id, applied=applied)
+        elif isinstance(result.get("final_answer"), str):
+            masked, applied = mask_object(result["final_answer"])
+            result["final_answer"] = masked
+            if applied:
+                logger.info("masking.applied", thread_id=thread_id, applied=applied)
     # trace 链接回业务：失败/未启用返回空串，不影响主链路
     trace_url = get_run_url_by_id(str(run_id))
     result["trace_url"] = trace_url

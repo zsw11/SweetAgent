@@ -57,13 +57,20 @@ class ManagerAgent:
     # ------------------------------------------------------------------
     # 对外入口
     # ------------------------------------------------------------------
-    def run(self, user_question: str, memory: Optional[str] = None) -> dict[str, Any]:
+    def run(
+        self,
+        user_question: str,
+        memory: Optional[str] = None,
+        injection_warning: str = "",
+    ) -> dict[str, Any]:
         """执行一次任务规划，返回 task_plan（含 tasks / required_agents / intent）。
 
         memory: 用户长期记忆文本（画像/偏好/通用记忆，注入规划 prompt）。
+        injection_warning: 入口注入检测命中的边界警告（OPT-06），非空时作为
+            独立 System 消息注入，要求忽略用户输入中的指令性内容。
         """
         logger.info("manager.run.start", question=user_question[:100])
-        result = self._plan(user_question, memory=memory)
+        result = self._plan(user_question, memory=memory, injection_warning=injection_warning)
         if isinstance(result, dict):
             # 结构化通道：仍须过公共 DAG 校验（过滤未知 agent、补 decision、环检测）
             plan = self._validate_plan(result, user_question)
@@ -80,7 +87,12 @@ class ManagerAgent:
     # ------------------------------------------------------------------
     # 内部步骤
     # ------------------------------------------------------------------
-    def _plan(self, user_question: str, memory: Optional[str] = None) -> Union[dict[str, Any], str]:
+    def _plan(
+        self,
+        user_question: str,
+        memory: Optional[str] = None,
+        injection_warning: str = "",
+    ) -> Union[dict[str, Any], str]:
         """生成任务 DAG：结构化通道（OPT-04）优先返回 dict；失败降级原始文本。"""
         from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -91,6 +103,9 @@ class ManagerAgent:
                 memory=memory or "（无）",
             )),
         ]
+        # OPT-06：注入检测命中时追加边界警告（系统级约束，独立消息不被用户输入稀释）
+        if injection_warning:
+            messages.append(SystemMessage(content=injection_warning))
         d = invoke_structured(self.model, ManagerPlanOutput, messages, logger_name="manager_agent")
         if d is not None:
             logger.info("manager.plan.structured.ok", task_count=len(d.get("tasks") or []))

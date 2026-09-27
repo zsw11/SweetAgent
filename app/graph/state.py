@@ -33,6 +33,9 @@ class GlobalState(TypedDict, total=False):
     # 用户问题
     user_question: str
 
+    # 安全（OPT-06）：入口注入检测命中后注入各 Agent 的边界警告文本（空串=未命中）
+    injection_warning: str
+
     # 规划结果
     task_plan: dict[str, Any]
     required_agents: list[str]

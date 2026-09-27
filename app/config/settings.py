@@ -95,6 +95,10 @@ class Settings(BaseSettings):
     RAG_CACHE_TTL_SECONDS: int = 3600
     CACHE_MAX_ENTRIES: int = 512
 
+    # ---------- 输入/输出安全（OPT-06，2026-09-27） ----------
+    INJECTION_DETECTION_ENABLED: bool = True   # 入口提示注入检测（只标记+注入边界警告，不阻断）
+    OUTPUT_MASKING_ENABLED: bool = True        # 输出 PII 脱敏（手机号/邮箱/长数字串，回答出口统一处理）
+
 
 @lru_cache
 def get_settings() -> Settings:

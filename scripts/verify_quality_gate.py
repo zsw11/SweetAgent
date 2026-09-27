@@ -44,7 +44,7 @@ class MockDecision:
         self.responses = list(responses)
         self.calls = []  # 每次调用的 feedback 记录
 
-    def run(self, user_question, department_results, memory=None, feedback=None):
+    def run(self, user_question, department_results, memory=None, feedback=None, injection_warning=""):
         self.calls.append(feedback)
         summary = self.responses.pop(0)
         return {
