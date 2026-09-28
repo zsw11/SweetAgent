@@ -73,6 +73,20 @@
 
 ---
 
+### OPT-12 多轮会话上下文：历史存储 / query 改写 / 压缩（**✅ 已完成 2026-09-28**）
+- **背景**：此前每轮 user_question 独立传入，图内不注入对话历史（thread_id 仅用于 checkpoint 中断恢复，不是历史）；第 2 轮"那物流呢"Manager 只收到 4 个字，指代无法消解。
+- **分两期落地**：
+  - **一期（指代消解核心收益）**：历史存储 + query 改写 + 历史注入——解决"那物流呢"承接上文的问题；
+  - **二期（长会话治理）**：35k 阈值压缩（保留最近 3 轮 + 摘要）+ 记忆提取传真实 token（此前传 0 空转，16k 触发，先提取后压缩）。
+- **落地**：
+  - 新表 `conversation_messages`（`db/02-schema.sql`，按 thread_id 存 user/assistant/summary + tokens + seq），区别于 checkpoints（图执行快照，仅供恢复）；
+  - `app/memory/conversation.py`：append/get/recent/history_token_count/build_conversation_context（历史摘要 + 最近 N 轮）、compress_history（保留最近 3 轮，更早压成 summary；LLM 不可用降级硬截断）；
+  - `app/memory/rewrite.py`：入口有历史时用 small 模型做指代消解改写（"那物流呢"→"美国床垫的物流时效分析"），首轮零开销；原文保留供记忆提取/审计；
+  - `main_graph`：入口读历史 + 改写，Manager/Decision 注入（改写问题 + 历史上下文），结束落历史；历史 token 达 `MEMORY_EXTRACT_THRESHOLD` 触发记忆提取（传真实 token，此前传 0 空转），达 `HISTORY_COMPRESSION_THRESHOLD` 触发压缩（**先提取后压缩**，关键事实不丢）。
+- **开关**：`CONVERSATION_HISTORY_ENABLED` / `QUERY_REWRITE_ENABLED`（默认开）。
+- **代码优化（2026-09-28）**：`append_turn` 单事务写一轮（user+assistant）并返回 history_tokens（每轮 DB 往返 5→1 次）；上下文构造合并为单连接读取；`connect` 复用 `app/memory/db.py`。
+- **验证**：`verify_conversation.py` 45/45；回归 security 28/28、quality_gate、cache 14/14、rag 8/8、opt04_05（含真实冒烟）全过。详见 development_log.md 考点四十二。
+
 ## P2 —— 底座补齐（可后续做）
 
 ### OPT-08 容器化
@@ -120,6 +134,7 @@
 | OPT-06 | 提示注入/输出安全 | P1 | M | ✅（2026-09-27） |
 | OPT-07 | 查询/RAG 缓存 | P1 | S~M | ✅（2026-09-27） |
 | OPT-11 | 缓存粒度上移（req+task 域结果） | P1 | S~M | ⬜ |
+| OPT-12 | 多轮会话上下文（历史/改写/压缩） | P1 | L | ✅（2026-09-28） |
 | OPT-08 | 容器化 | P2 | M | ⬜ |
 | OPT-09 | 异步任务化 | P2 | L | ⬜ |
 | OPT-10 | Skills / A2A | P2 | L | ⬜ |

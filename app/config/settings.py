@@ -55,6 +55,11 @@ class Settings(BaseSettings):
     MEMORY_RECALL_TOP_K: int = 5                 # 记忆向量检索 top-k 条数
     MEMORY_INJECT_TOKEN_BUDGET: int = 1_500      # 注入 Manager/部门的记忆 token 上限
 
+    # ---------- 多轮会话上下文（OPT-12：历史注入 / query 改写 / 压缩） ----------
+    CONVERSATION_HISTORY_ENABLED: bool = True    # 总开关：是否存/读会话历史（关闭则每轮完全独立）
+    CONVERSATION_KEEP_RECENT_TURNS: int = 3      # 注入上下文保留最近 N 轮原文（更早的依赖压缩摘要）
+    QUERY_REWRITE_ENABLED: bool = True           # 入口是否做指代消解改写（有历史才触发，small 模型）
+
     # ---------- 向量 / 知识库 ----------
     EMBEDDING_MODEL: str = "text-embedding-3-small"
     VECTOR_DIM: int = 1536

@@ -33,7 +33,7 @@ GOOD_SUMMARY = "美国市场六月销售额环比下降 8.2%，主因头部 SKU 
 class MockManager:
     """规划器 mock：不派任何部门任务，直接到 decision（隔离质量门逻辑）。"""
 
-    def run(self, question, memory=None):
+    def run(self, question, memory=None, injection_warning="", conversation_context=""):
         return {"intent": "test", "required_agents": [], "tasks": []}
 
 
@@ -44,7 +44,8 @@ class MockDecision:
         self.responses = list(responses)
         self.calls = []  # 每次调用的 feedback 记录
 
-    def run(self, user_question, department_results, memory=None, feedback=None, injection_warning=""):
+    def run(self, user_question, department_results, memory=None, feedback=None,
+            injection_warning="", conversation_context=""):
         self.calls.append(feedback)
         summary = self.responses.pop(0)
         return {

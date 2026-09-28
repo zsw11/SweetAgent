@@ -80,6 +80,7 @@ class DecisionAgent:
         memory: Optional[str] = None,
         feedback: Optional[str] = None,
         injection_warning: str = "",
+        conversation_context: str = "",
     ) -> DecisionOutput:
         """执行一次决策分析，返回结构化 DecisionOutput。
 
@@ -92,6 +93,8 @@ class DecisionAgent:
                 quality_gate 评估不合格后回炉重生成时注入，指导本次修正；无则 None。
             injection_warning: 入口注入检测命中的边界警告（OPT-06），非空时作为
                 独立 System 消息注入，要求忽略用户输入中的指令性内容。
+            conversation_context: 多轮会话上下文（OPT-12：历史摘要 + 最近对话），
+                非空时注入，使本次汇总承接前几轮问答的脉络。
         """
         logger.info(
             "decision.run.start",
@@ -100,8 +103,16 @@ class DecisionAgent:
             has_memory=bool(memory),
             has_feedback=bool(feedback),
             injection_flagged=bool(injection_warning),
+            has_conversation=bool(conversation_context),
         )
-        raw = self._synthesize(user_question, department_results, memory, feedback, injection_warning)
+        raw = self._synthesize(
+            user_question,
+            department_results,
+            memory,
+            feedback,
+            injection_warning,
+            conversation_context,
+        )
         report = raw if isinstance(raw, dict) else self._parse_and_validate(raw)
         logger.info(
             "decision.run.done",
@@ -121,6 +132,7 @@ class DecisionAgent:
         memory: Optional[str] = None,
         feedback: Optional[str] = None,
         injection_warning: str = "",
+        conversation_context: str = "",
     ) -> Union[dict[str, Any], str]:
         """生成结构化决策报告。
 
@@ -140,6 +152,7 @@ class DecisionAgent:
                 user_question=user_question,
                 memory=memory or "（无）",
                 feedback=feedback or "（无）",
+                conversation_context=conversation_context or "（无）",
                 department_results_json=json.dumps(slim, ensure_ascii=False, default=str),
             )),
         ]

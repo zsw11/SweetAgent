@@ -58,14 +58,18 @@ def build_main_graph(
         user_question = state.get("user_question", "")
         user_id = state.get("user_id", "default")
         injection_warning = state.get("injection_warning") or ""
-        logger.info("main.manager.start", question=user_question[:100], injection_flagged=bool(injection_warning))
+        conversation_context = state.get("conversation_context") or ""
+        # 规划以改写后的自包含问题为准（首轮=原文）；记忆检索同样用它，实体更明确
+        effective_question = state.get("rewritten_question") or user_question
+        logger.info("main.manager.start", question=effective_question[:100], injection_flagged=bool(injection_warning))
         try:
             # 长期记忆注入（用户级：画像 + 偏好 + 通用非结构化 top-k，设计文档 34-35 节）
-            memory = build_manager_memory(user_id, user_question)
+            memory = build_manager_memory(user_id, effective_question)
             task_plan = mgr.run(
-                user_question,
+                effective_question,
                 memory=json.dumps(memory, ensure_ascii=False) if memory else None,
                 injection_warning=injection_warning,
+                conversation_context=conversation_context,
             )
             logger.info(
                 "main.manager.done",
@@ -93,7 +97,7 @@ def build_main_graph(
             return build_department_memory(
                 state.get("user_id", "default"),
                 agent_name,
-                state.get("user_question", ""),
+                state.get("rewritten_question") or state.get("user_question", ""),
             ) or None
         return builder
 
@@ -117,7 +121,9 @@ def build_main_graph(
                     "confidence": r.get("confidence", 0.0),
                 }
         mem = build_department_memory(
-            state.get("user_id", "default"), "product", state.get("user_question", "")
+            state.get("user_id", "default"),
+            "product",
+            state.get("rewritten_question") or state.get("user_question", ""),
         )
         if mem:
             ctx.update(mem)
@@ -134,6 +140,9 @@ def build_main_graph(
         user_question = state.get("user_question", "")
         user_id = state.get("user_id", "default")
         injection_warning = state.get("injection_warning") or ""
+        conversation_context = state.get("conversation_context") or ""
+        # 汇总以改写后的自包含问题为准（首轮=原文），承接多轮脉络
+        effective_question = state.get("rewritten_question") or user_question
         department_results = state.get("department_results") or {}
         feedback = state.get("quality_feedback") or ""
         skipped = state.get("skipped_tasks") or []
@@ -145,13 +154,14 @@ def build_main_graph(
             # 决策阶段注入用户级记忆（画像/偏好/通用记忆）：
             # Manager 只在规划时看到记忆，最终回答由 Decision 生成，
             # 若用户问"我负责哪个市场"这类自身相关问题，Decision 需能读到画像。
-            memory = build_manager_memory(user_id, user_question)
+            memory = build_manager_memory(user_id, effective_question)
             report = dec.run(
-                user_question,
+                effective_question,
                 department_results,
                 memory=json.dumps(memory, ensure_ascii=False) if memory else None,
                 feedback=feedback or None,
                 injection_warning=injection_warning,
+                conversation_context=conversation_context,
             )
             logger.info("main.decision.done", confidence=report.get("confidence"))
             return {
@@ -373,6 +383,17 @@ def run_question(
             categories=injection["categories"],
             matches=injection["matches"],
         )
+    # OPT-12：多轮会话上下文——读历史（摘要 + 最近 N 轮），有历史时做指代消解改写
+    conversation_context = ""
+    rewritten_question = question
+    if settings.CONVERSATION_HISTORY_ENABLED:
+        from app.memory.conversation import build_conversation_context
+
+        conversation_context = build_conversation_context(thread_id)
+        if settings.QUERY_REWRITE_ENABLED and conversation_context:
+            from app.memory.rewrite import rewrite_question
+
+            rewritten_question = rewrite_question(question, conversation_context)
     # OPT-02 LangSmith：任何 LLM/图调用前同步环境变量并挂载自动 tracer（幂等，失败仅降级）
     init_langsmith()
     if checkpointer is None:
@@ -384,6 +405,8 @@ def run_question(
         "user_id": user_id,
         "user_question": question,
         "injection_warning": INJECTION_WARNING if injection["flagged"] else "",
+        "conversation_context": conversation_context,
+        "rewritten_question": rewritten_question,
         "current_stage": "planning",
         "department_results": {},
         "completed_tasks": [],
@@ -437,6 +460,23 @@ def run_question(
         trace_url=trace_url,
     )
 
+    # OPT-12：落本轮会话历史（仅成功完成 stage=done 时写；interrupt/error 不写）
+    history_tokens = 0
+    try:
+        if settings.CONVERSATION_HISTORY_ENABLED and result.get("current_stage") == "done":
+            # 一个事务写入 user+assistant 并返回追加后的历史总 token
+            # （落库的是脱敏后的 final_answer，PII 不出库；用户原始问题保留供审计）
+            from app.memory.conversation import append_turn
+
+            answer_for_history = result.get("final_answer", "") or str(
+                (result.get("decision_result") or {}).get("summary", "")
+            )
+            saved = append_turn(thread_id, question, answer_for_history, user_id=user_id)
+            history_tokens = saved["history_tokens"]
+            logger.info("conversation.turn.saved", thread_id=thread_id, history_tokens=history_tokens)
+    except Exception as exc:
+        logger.warning("run_question.conversation_append.fail", error=str(exc))
+
     # 长期记忆提取钩子（两级触发：规则命中 / 历史阈值；写入失败不影响主流程）
     try:
         from app.memory.extractor import maybe_extract_memories
@@ -450,8 +490,22 @@ def run_question(
             thread_id=thread_id,
             user_question=question,
             final_answer=answer,
+            history_tokens=history_tokens,
         )
     except Exception as exc:
         logger.warning("run_question.memory_extract.fail", error=str(exc))
+
+    # OPT-12：历史 token 超压缩阈值 → 压缩上下文（先提取后压缩，关键事实已落长期记忆）
+    try:
+        if (
+            settings.CONVERSATION_HISTORY_ENABLED
+            and history_tokens >= settings.HISTORY_COMPRESSION_THRESHOLD
+        ):
+            from app.memory.conversation import compress_history
+
+            cr = compress_history(thread_id)
+            logger.info("conversation.compress.triggered", thread_id=thread_id, result=cr)
+    except Exception as exc:
+        logger.warning("run_question.compress.fail", error=str(exc))
 
     return result

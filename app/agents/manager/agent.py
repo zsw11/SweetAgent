@@ -62,15 +62,23 @@ class ManagerAgent:
         user_question: str,
         memory: Optional[str] = None,
         injection_warning: str = "",
+        conversation_context: str = "",
     ) -> dict[str, Any]:
         """执行一次任务规划，返回 task_plan（含 tasks / required_agents / intent）。
 
         memory: 用户长期记忆文本（画像/偏好/通用记忆，注入规划 prompt）。
         injection_warning: 入口注入检测命中的边界警告（OPT-06），非空时作为
             独立 System 消息注入，要求忽略用户输入中的指令性内容。
+        conversation_context: 多轮会话上下文（OPT-12：历史摘要 + 最近对话），
+            非空时注入规划 prompt，使本轮规划承接前几轮主题。
         """
         logger.info("manager.run.start", question=user_question[:100])
-        result = self._plan(user_question, memory=memory, injection_warning=injection_warning)
+        result = self._plan(
+            user_question,
+            memory=memory,
+            injection_warning=injection_warning,
+            conversation_context=conversation_context,
+        )
         if isinstance(result, dict):
             # 结构化通道：仍须过公共 DAG 校验（过滤未知 agent、补 decision、环检测）
             plan = self._validate_plan(result, user_question)
@@ -92,6 +100,7 @@ class ManagerAgent:
         user_question: str,
         memory: Optional[str] = None,
         injection_warning: str = "",
+        conversation_context: str = "",
     ) -> Union[dict[str, Any], str]:
         """生成任务 DAG：结构化通道（OPT-04）优先返回 dict；失败降级原始文本。"""
         from langchain_core.messages import HumanMessage, SystemMessage
@@ -101,6 +110,7 @@ class ManagerAgent:
             HumanMessage(content=MANAGER_PLAN_PROMPT.format(
                 user_question=user_question,
                 memory=memory or "（无）",
+                conversation_context=conversation_context or "（无）",
             )),
         ]
         # OPT-06：注入检测命中时追加边界警告（系统级约束，独立消息不被用户输入稀释）

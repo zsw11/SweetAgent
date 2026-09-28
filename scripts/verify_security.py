@@ -142,7 +142,7 @@ def test_integration() -> None:
         def __init__(self):
             self.received_warnings: list[str] = []
 
-        def run(self, user_question, memory=None, injection_warning=""):
+        def run(self, user_question, memory=None, injection_warning="", conversation_context=""):
             self.received_warnings.append(injection_warning)
             return {
                 "intent": "business_analysis",
@@ -157,7 +157,8 @@ def test_integration() -> None:
         def __init__(self):
             self.received_warnings: list[str] = []
 
-        def run(self, user_question, department_results, memory=None, feedback=None, injection_warning=""):
+        def run(self, user_question, department_results, memory=None, feedback=None,
+                injection_warning="", conversation_context=""):
             self.received_warnings.append(injection_warning)
             # 故意在多个字段输出 PII，验证脱敏覆盖所有文本出口
             return {

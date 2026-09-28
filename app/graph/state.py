@@ -36,6 +36,12 @@ class GlobalState(TypedDict, total=False):
     # 安全（OPT-06）：入口注入检测命中后注入各 Agent 的边界警告文本（空串=未命中）
     injection_warning: str
 
+    # 多轮会话（OPT-12）：
+    # conversation_context = 历史摘要 + 最近 N 轮原文（注入 Manager/Decision，解决多轮指代）
+    # rewritten_question   = 结合历史改写后的自包含问题（首轮=原文；规划/汇总以它为准）
+    conversation_context: str
+    rewritten_question: str
+
     # 规划结果
     task_plan: dict[str, Any]
     required_agents: list[str]

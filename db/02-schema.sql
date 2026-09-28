@@ -704,6 +704,26 @@ CREATE INDEX IF NOT EXISTS user_memories_user_idx ON user_memories(user_id);
 CREATE INDEX IF NOT EXISTS user_memories_dept_idx ON user_memories(department);
 
 -- ============================================================
+-- 34.1 多轮会话历史（OPT-12：上下文注入 / query 改写 / token 统计 / 压缩）
+-- ============================================================
+
+-- 会话消息流：按 thread_id 存"用户问 + 系统答"，区别于 checkpoints（图执行快照，仅供中断恢复）
+-- role: user=用户问题 / assistant=系统最终答案 / summary=历史压缩摘要（旧消息压缩后的产物）
+-- seq: 会话内单调递增序号，用于排序与压缩定位（保留最近 N 轮、更早的压成 summary）
+CREATE TABLE IF NOT EXISTS conversation_messages (
+    id         BIGSERIAL PRIMARY KEY,           -- 主键ID
+    thread_id  VARCHAR(128) NOT NULL,            -- 会话ID（与 API thread_id 一致，核心隔离维度）
+    user_id    VARCHAR(128) NOT NULL DEFAULT 'default',  -- 用户ID（字符串，轻量，不强制 FK users）
+    role       VARCHAR(16) NOT NULL,             -- 角色（user/assistant/summary）
+    content    TEXT NOT NULL,                    -- 消息内容
+    tokens     INTEGER NOT NULL DEFAULT 0,       -- 该消息 token 数（压缩/提取阈值统计）
+    seq        INTEGER NOT NULL,                 -- 会话内序号（单调递增）
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),  -- 创建时间
+    UNIQUE (thread_id, seq)                      -- 同一会话内序号唯一
+);
+CREATE INDEX IF NOT EXISTS conv_thread_idx ON conversation_messages(thread_id, seq);
+
+-- ============================================================
 -- 35-38. 知识库（PGVector）向量召回 - 多个关键词兜底（混合检索）
 -- ============================================================
 
