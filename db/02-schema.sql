@@ -684,7 +684,8 @@ CREATE TABLE IF NOT EXISTS business_preferences (
 );
 select * from user_memories where user_id = 14;
 -- 用户非结构化记忆（设计文档 35 节：语义长期记忆）
--- 存：偏好语义 / 事实 / 历史结论 / 业务规则（自由文本 + 向量），用户私有，检索优先选向量相近且执行度高的记忆top5
+-- 存：偏好语义 / 事实 / 历史结论 / 业务规则（自由文本 + 向量），用户私有，检索优先强约束（memory_type=rule（规则），preference（偏好））；弱记忆（fact（事实） conclusion（历史结论））
+-- 选向量相近且执行度高的记忆top5
 -- department 标签用于"检索按任务过滤"（无标签 = 通用记忆，不参与粗筛淘汰）
 CREATE TABLE IF NOT EXISTS user_memories (
     id            BIGSERIAL PRIMARY KEY,           -- 主键ID

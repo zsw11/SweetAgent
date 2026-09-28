@@ -55,6 +55,9 @@ class Settings(BaseSettings):
     MEMORY_RECALL_TOP_K: int = 5                 # 记忆向量检索 top-k 条数
     MEMORY_INJECT_TOKEN_BUDGET: int = 1_500      # 注入 Manager/部门的记忆 token 上限
 
+    # ---------- 记忆时效（块B：弱记忆 TTL 软过期，强约束常驻） ----------
+    MEMORY_WEAK_TTL_DAYS: int = 90               # 弱记忆（fact/conclusion）TTL 天数；强约束（preference/rule）常驻不参与过期
+
     # ---------- 多轮会话上下文（OPT-12：历史注入 / query 改写 / 压缩） ----------
     CONVERSATION_HISTORY_ENABLED: bool = True    # 总开关：是否存/读会话历史（关闭则每轮完全独立）
     CONVERSATION_KEEP_RECENT_TURNS: int = 3      # 注入上下文保留最近 N 轮原文（更早的依赖压缩摘要）

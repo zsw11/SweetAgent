@@ -1832,3 +1832,100 @@ class GlobalState(TypedDict, total=False):
 **明日任务（2026-09-28 记录）**：复习本考点话术，能脱稿按"分层归因 → 对症下药 → 评估验证"顺序答出 RAG 检索精度问题；可选实操：给项目补 RAG 召回评测用例（Recall@k + 命中方法分布）。
 
 **核心一句话**：关键词兜底是降级态不是方案——先救活向量通道（真 embedding 重灌），再把"二选一兜底"升级为 RRF 混合融合 + 全文索引/分词，最后用评估集决定是否上 Multi-Query/HyDE/Rerank。
+
+
+---
+
+### 考点四十四：RAG 真实化三阶段方案（方案设计，2026-09-28，待用户确认后实施）
+
+**面试官怎么问**：你的 RAG 向量是 mock 的吗？检索效果怎么量化？混合检索为什么用 RRF？检索不准怎么定位该改哪层？
+
+**设计（三阶段，合计 1.5~2.5 天，每阶段独立可交付、各有 verify）**：
+- **阶段 1 真实向量通道**：`embedder.py` 重构为 provider 工厂（mock / local_bge / openai 三态），默认**本地 bge-m3**（1024 维，免费、数据不出域）；有 OpenAI key 可走 text-embedding-3-small（1536 维零表改动）。`knowledge_chunks.embedding` 与 `knowledge_embeddings.embedding` 迁移 vector(1536)→vector(1024)；重灌脚本复用 `embed_batch()`；模型懒加载单例（首次 embed 才加载，避免启动慢）；RAG 缓存键已含 `current_embedding_model()` → 切换模型自动 miss（现成设计零改动）；
+- **阶段 2 RRF 混合检索**：取消 0.20 阈值"二选一"分流，向量 top-8 + 关键词 top-8 **并行**，RRF 排名融合（k=60），`method` 返回 `rrf` 并标记双路来源；关键词通道 jieba 分词替代 2-gram（可选 GIN 索引）；缓存键拼入"检索策略版本"防旧缓存污染；
+- **阶段 3 评测闭环**：`scripts/eval_rag_cases.py` 15~30 条（术语精确 / 口语化 / 同义改写 / 带过滤条件），输出 **Recall@5 + 命中方法分布 + bad case 归因** 到 `docs/eval/`，并做 mock vs 真实向量对比。
+
+**为什么**：
+- mock 向量语义无效是"地基缺失"，任何检索优化都绕不开先救活向量——先治本再增强；
+- RRF 优于二选一：分流互斥丢信息（向量差就完全放弃向量信号），融合让两路互为补充；
+- RRF 用排名不用分数：cosine 相似度与关键词命中数**不同量纲**不可加权，排名是唯一跨通道可比量；k=60 惯例（太大拉平差异、太小放大低位排名噪声）；
+- 先建评测集再动刀：改哪层由 bad case 归因决定，评估驱动避免盲改。
+
+**验收标准**：`current_embedding_model()` 返回真实模型名；检索返回 `method=rrf`；eval_rag 报告可复现且真实向量 Recall@5 ≥ mock；回归 verify_rag / verify_cache / verify_opt04_05 全过。
+
+**核心一句话**：RAG 真实化 = 治本（真 embedding 重灌）→ 增强（RRF 排名融合替代二选一兜底）→ 可证（Recall@k 评测闭环），三步分别回答"向量是不是真的 / 混合检索怎么做 / 效果怎么量化"三个面试必问题。
+
+---
+
+### 考点四十五：记忆注入分级（OPT：记忆体系深化·块A，2026-09-28 已实现）
+
+**面试官怎么问**：长期记忆怎么注入给 LLM？为什么不能只按相似度取 top-k？强约束记忆（用户明确要求）被弱记忆挤掉怎么办？注入 token 预算怎么控制？
+
+**记忆分类（先厘清概念）**：memory_type 按"答错代价"分两档——
+- **强约束 rule/preference**（漏了会答错）：业务规则/明确要求（"GMV 口径含退款前金额"）、用户稳定偏好（"报告默认用美元""我负责日本市场"）。语义=该怎么做，置信度高、长期有效，缺失→方向性错误（币种/口径/市场错）；
+- **弱记忆 fact/conclusion**（漏了只是少佐证）：客观事实（"美国床垫 9 月销量下滑 26%"）、历史结论（"上次认为时效是退货主因"）。语义=是什么/发生了什么，会过期、置信度相对低，缺失→少背景。
+- 注意：user_preferences 表（key-value）已全量注入不参与分级；分级的对象是 user_memories 表里 type∈{preference,rule} 的自由文本。
+
+**设计（最小改动实现）**：
+- **强约束全量注入**：memory_type ∈ {preference, rule} 不参与相似度竞争、存在就注入（分部门范围：Manager 取无标签通用，部门取本部门∪无标签）；极端超预算按注入顺序截断兜底；
+- **弱记忆按相似度 top-k**：memory_type ∈ {fact, conclusion} 照旧相似度召回，top_k= MEMORY_RECALL_TOP_K；
+- **token 预算真正生效**：`MEMORY_INJECT_TOKEN_BUDGET=1500`（此前是死配置，全项目无引用）接入注入侧 `_fit_budget`：强约束在前、弱记忆在后，累计 `count_tokens`（复用 conversation.py 公共函数）超预算截断——**保强弃弱**；
+- **改动点**：`semantic.py` search_memories 加 `exclude_types` 参数（SQL 一个条件）；`injection.py` 两个 builder 统一走"强全量 + 弱 top-k + 预算截断"；新增 `scripts/verify_memory_injection.py`。
+
+**为什么**：
+- 相似度是"检索"标准，约束强度是"重要性"标准，两个维度——只按相似度 top-k 会把答错代价高的强约束挤出，漏 rule/preference 是硬错误；
+- token 有限，丢弃策略按重要性而非随机/时间；弱记忆是弹性部分，先保强弃弱；
+- 分级解决的是"注入选择性"，与向量质量正交——即使 mock 向量相似度排序粗糙，强约束全量也能兜底，成本低收益确定；
+- 两个消费方（Manager/部门）共用同一分级规则，避免行为漂移。
+
+**验证**：verify_memory_injection.py——强约束低相似度仍注入 / 弱记忆只 top-k / 预算超限保强弃弱 / 两入口一致 / exclude_types 真实 SQL 生效；回归 verify_conversation、verify_opt04_05 全过。
+
+**核心一句话**：记忆注入不能只按相似度 top-k——rule/preference（答错代价高）必须全量注入、fact/conclusion（少个佐证）才按相似度取 top-k，并在 token 预算内"保强弃弱"；分级与向量质量正交，是低成本高确定收益的注入优化。
+### 考点四十六：记忆时效与遗忘——TTL 惰性软过期（块B）
+
+**面试官怎么问**：长期记忆会无限膨胀，过期的信息还老被召回，你怎么给 Agent 的记忆加遗忘机制？
+**设计**：
+- 类型级 TTL：弱记忆（fact/conclusion）默认 90 天（settings.MEMORY_WEAK_TTL_DAYS），强约束（preference/rule）常驻不参与过期
+- 惰性软过期：新增 `expire_stale_memories(user_id)`，在 add_memory / search_memories 入口批量执行 `UPDATE user_memories SET superseded_at=now() WHERE memory_type IN ('fact','conclusion') AND updated_at < now() - make_interval(days=>90)`；不引入后台任务/调度器
+- 软删除保历史：过期置 superseded_at 而非物理 DELETE，既有 `superseded_at IS NULL` 过滤自然不召回；物理行保留、版本链可追溯（也为后续记忆整理合并弱记忆保留原始证据）
+- 幂等：重复调用 rowcount=0，日志 memory.expire.stale（count/ttl_days）
+**为什么**：
+- 惰性触发：查询/写入路径天然到达，省去后台任务与运维；单用户低频下额外一次空 UPDATE 成本可忽略
+- 类型级 TTL：与块A分级语义一致——强约束答错代价高必须常驻，弱记忆价值随时间递减
+- 软删除而非物理删：历史可追溯是审计与记忆整理的前提；同表只加时间戳判断，改动最小
+**验证**：verify_memory_injection 新增场景6（真实 DB）：100 天前 fact 过期（superseded_at 非空、检索不再返回）、100 天前 rule 常驻（superseded_at 为空）、新 fact 不过期、物理行保留；全量 28/28 + conversation 45/45 + cache 14/14 + rag 8/8
+**核心一句话**：遗忘不是删数据，而是弱记忆按类型设 TTL、过期即软删除（superseded_at），查询入口惰性触发批量标记——强约束常驻、弱记忆 90 天失效，零后台任务、历史可追溯。
+### 考点四十七：用户显式纠错——提示词判断 + add_memory 以用户为准（块C·M档）
+
+**面试官怎么问**：用户在对话里说"不对，应该是 X"，你怎么把它落成记忆更新，而不是和旧记忆并存？怎么定位要被替代的旧记忆？
+**设计**：
+- 信号判断放提示词：Manager 结构化输出加可选字段 memory_correction（corrected/content/target/memory_type），仅用户明确纠正/更正之前给出的信息时才 corrected=true，普通提问默认 false；Manager 每轮必经、结构化通道已存在，成本≈0
+- 以用户为准（add_memory 新增 user_correction 模式）：跳过 LLM 裁判，命中旧条即版本化取代（旧条 superseded + 插入纠正内容）
+- 定位旧记忆分两步：① 优先用 target（被纠对象原话，由 LLM 输出——它上轮自己说的最清楚）召回定位，相似度天然高；② target 未命中回退 content 相似度匹配（阈值 _CORRECTION_THRESHOLD=0.5）；③ 均未命中 → 以用户纠正内容新增（旧条未取代属残余风险，记日志）
+- 阈值 0.5 的依据：纠错内容常反转（下滑→回升），语义相似度天然低于常规更新 0.7；0.5 下同主体仍命中、完全无关（广告ROAS vs 床垫销量）落空
+- 复用：_recall（召回逻辑抽取，content 与 target 各召一回）、_versioned_replace（版本链 superseded_by_id）、块B 软删、块A 分级注入——纠错写入 rule/preference 自动进强约束全量注入，fact 正常走 TTL
+- 审计：metadata 记 source=user_correction / decided_by=user / correction_target
+**为什么**：
+- 显式纠错是用户亲口给的最高置信度信号，不该再交给低置信的 LLM 裁判（judge 的 conflict/negation 是隐式猜测，可能误判并存）；"以用户为准"= 强制版本化取代而非新增并存，否则旧错误条仍会被相似度检索捞回来，纠正落空
+- target 定位解决反转场景：纠正内容与旧条结论相反，纯相似度匹配会吃亏；target 是旧内容本身，命中准（实测 sim=1.0）
+- 与 Human-in-the-loop 闭环互补：quality_gate interrupt 纠"当前回答"，显式纠错纠"长期记忆"
+**验证**：verify_memory_injection 场景7（真实 DB）：A) target 精确命中（sim=1.0）→ 旧条 superseded、插入反转 content（下滑26%→回升5%）、检索只返回新条、metadata 记 user_correction+target；B) target 未命中回退未命中 → 新增（source=user_correction）、无关旧条不被误伤；C) user_correction=False 普通模式 exact duplicate → refresh 不变。全量 36/36 + conversation 45/45 + opt04_05（含 DeepSeek 冒烟）+ cache 14/14 + rag 8/8
+**核心一句话**：用户显式纠错 = 提示词让 LLM 判"是否纠错"并给出被纠对象原话（target），add_memory 以 user_correction 模式跳过裁判、用 target 精准定位旧记忆并版本化取代——"以用户为准"不并存，与块A分级、块B TTL、版本链无缝衔接。
+### 考点四十八：Manager 规划兜底——LLM 输出无部门任务时注入默认 operation
+
+**面试官怎么问**：你的多 Agent 系统里，Manager 的 LLM 规划输出不可靠（空任务/只出 decision/全是未知 agent），你怎么保证系统还能跑？
+**设计**：_validate_plan 步骤2：从合法任务里筛部门任务（dept_tasks = agent ∈ _KNOWN_DEPARTMENTS，排除 decision 汇总任务）；若为空 → 重置为最小闭环 operation_analysis + decision（同一兜底形态也用于 _fallback_plan），覆盖 valid_tasks 后由后续依赖重建逻辑无感知接住
+**为什么**：
+- decision 汇总依赖部门任务，无部门任务时进 decision 是"无数据可汇总"的空转，必须保证 DAG 至少有一个可执行部门节点
+- 兜底选 operation 因为它覆盖"怎么卖/卖得怎么样"通用运营分析，不依赖其他部门，正是 Phase 1 最小闭环（Manager→Operation→Decision）的固定部门
+- LLM 规划是概率输出，确定性兜底层（过滤未知 agent + 空表重置 + 环检测）保证系统级可靠性
+**核心一句话**：LLM 规划只负责"想"，DAG 校验层负责"兜"——筛掉非法 agent、部门任务为空就重置为 operation→decision 最小闭环，任何规划输出都能落成可执行图。
+### 考点四十九：记忆裁判是"一次判断"不是"逐条循环"——一条新记忆 vs 多条候选
+
+**面试官怎么问**：你裁判新记忆和候选旧记忆的关系时，是循环候选逐条判断吗？返回是多个结果吗？
+**设计**：不是循环。一条新记忆 + 全部候选（top-5）拼接进同一个 JUDGE_PROMPT，LLM 一次调用输出一个结果 {"relation", "target_id", "event", "new_content", "reason"}；relation 指明关系类型，target_id 是指向候选列表某条的"指针"（prompt 约束必须来自候选真实 id），unrelated 时 target_id=null
+**为什么**：
+- 成本：一次 small 模型调用 vs 5 次，延迟和成本差 5 倍
+- 语义上一条新记忆只与最多一条旧记忆有确定关系（duplicate/conflict/supplement 的 target 是单一 id），不存在"同时和 5 条都有关系"；候选给多条是让 LLM 在更大上下文里选/排除，防止召回只留 1 条导致漏判
+- 消费侧（add_memory）：target_id in valid_ids 校验指针合法性，命中哪条就对哪条版本化/刷新，unrelated 或指针非法则新增
+**核心一句话**：裁判是"一条新记忆 × 全部候选"的一次性 LLM 判断，返回单条结果 + target_id 指针——候选多条提供上下文，指针精确定位被取代的那条，既省调用又防漏判。

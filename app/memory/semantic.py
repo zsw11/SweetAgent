@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 from typing import Any, Optional
 
+from app.config.settings import settings
 from app.memory.db import connect, resolve_user_id
 from app.memory.embeddings import (
     cosine_similarity,
@@ -41,12 +42,40 @@ logger = get_logger("memory_semantic")
 _RECALL_THRESHOLD = 0.25  # 召回门槛：最高相似度高于此值才调 LLM 裁判（成本控制，明显无关不问）。
 # 0.25 依据：语义变更"用户负责美国市场运营"→"不再负责…转负责欧洲市场" sim≈0.30 需进裁判；完全无关 sim≈0 跳过
 _FALLBACK_THRESHOLD = 0.7  # 降级阈值（无 LLM）：最高相似度高于此值版本化更新，否则新增
+_CORRECTION_THRESHOLD = 0.5  # 块C 用户显式纠错匹配阈值：纠错内容常反转（下滑→回升），低于常规更新 0.7
 _RECALL_TOP_K = 5          # 召回候选数（一次 LLM 调用处理全部候选）
 
 
 # ---------------------------------------------------------------------------
 # 写入
 # ---------------------------------------------------------------------------
+
+# 时效遗忘（块B）：弱记忆（fact/conclusion）超 TTL 惰性软过期；强约束（preference/rule）常驻
+_TTL_WEAK_TYPES = ("fact", "conclusion")
+
+
+def expire_stale_memories(user_id: str) -> int:
+    """惰性软过期：弱记忆超过 MEMORY_WEAK_TTL_DAYS 未更新 → superseded_at=now()（软删除，物理行保留可追溯）。
+
+    在 add_memory / search_memories 入口触发，零后台任务；强约束（preference/rule）不参与。
+    Returns: 本次过期的条数（幂等，重复调用返回 0）。
+    """
+    uid = resolve_user_id(user_id)
+    ttl_days = int(getattr(settings, "MEMORY_WEAK_TTL_DAYS", 90))
+    with connect() as conn:
+        cur = conn.execute(
+            "UPDATE user_memories SET superseded_at = now() "
+            "WHERE user_id = %s AND superseded_at IS NULL "
+            f"AND memory_type IN ({','.join(['%s'] * len(_TTL_WEAK_TYPES))}) "
+            "AND updated_at < now() - make_interval(days => %s)",
+            (uid, *_TTL_WEAK_TYPES, ttl_days),
+        )
+        conn.commit()
+        n = cur.rowcount
+    if n:
+        logger.info("memory.expire.stale", user_id=uid, count=n, ttl_days=ttl_days)
+    return n
+
 
 def add_memory(
     user_id: str,
@@ -56,32 +85,60 @@ def add_memory(
     metadata: Optional[dict[str, Any]] = None,
     confidence: Optional[float] = None,
     evidence: Optional[str] = None,
+    user_correction: bool = False,
+    correction_target: Optional[str] = None,
 ) -> int:
     """写入一条非结构化记忆（召回 → LLM 裁判 → 版本化执行）。
 
     department 写独立列（空=通用记忆）；metadata 存扩展标签 + 决策痕迹。
     返回记忆 id（新增返回新 id；duplicate 返回被刷新的旧条 id；UPDATE/MERGE 返回新条 id）。
+
+    user_correction（块C·M档，用户显式纠错）：True 时"以用户为准"——跳过 LLM 裁判，
+        1) 优先用 correction_target（被纠对象原话，相似度天然高）召回定位旧条 → 版本化取代；
+        2) target 未命中 → 回退 content 相似度匹配（阈值 _CORRECTION_THRESHOLD）；
+        3) 仍不命中 → 以用户纠正内容新增（旧条未取代属残余风险，记日志）。
+        metadata 记 source=user_correction / decided_by=user / correction_target，供审计。
+    correction_target：被纠正旧内容的原话要点（由提示词判断层的 LLM 输出），用于精准定位旧记忆。
     """
     uid = resolve_user_id(user_id)
     content = (content or "").strip()
     if not content:
         return -1
+    # 块B：写入前惰性软过期弱记忆，避免与已过期记忆比较/召回
+    expire_stale_memories(user_id)
     vec = mock_embedding(content)
     meta = dict(metadata or {})
 
     with connect() as conn:
         # 1) 召回：未取代记忆按相似度排序取 top-5（相似度只用于召回）
-        rows = conn.execute(
-            """
-            SELECT id, memory_type, content, confidence, embedding FROM user_memories
-            WHERE user_id = %s AND superseded_at IS NULL
-            """,
-            (uid,),
-        ).fetchall()
-        scored = [(cosine_similarity(vec, vector_from_sql(r[4])), r) for r in rows]
-        scored.sort(key=lambda x: x[0], reverse=True)
-        top = scored[:_RECALL_TOP_K]
-        best_sim = top[0][0] if top else 0.0
+        top, best_sim = _recall(conn, uid, vec)
+
+        # 块C：用户显式纠错（M档）——高置信信号，跳过 LLM 裁判，以用户为准：
+        if user_correction:
+            meta["source"] = "user_correction"
+            meta["decided_by"] = "user"
+            # a) 优先用 target（被纠对象原话）定位旧条：target 即旧内容本身，相似度天然高，命中准
+            if correction_target and correction_target.strip():
+                meta["correction_target"] = correction_target.strip()[:200]
+                t_top, t_best = _recall(conn, uid, mock_embedding(correction_target.strip()))
+                if t_best >= _CORRECTION_THRESHOLD:
+                    logger.info(
+                        "memory.correction.target_hit", user_id=uid,
+                        target_sim=round(t_best, 3), old_id=t_top[0][1][0],
+                    )
+                    return _versioned_replace(conn, uid, t_top[0][1], memory_type, content,
+                                              department, meta, confidence, evidence, vec)
+            # b) target 未命中 → 回退 content 相似度匹配（纠错内容与旧条主体相同仍应命中）
+            if best_sim >= _CORRECTION_THRESHOLD:
+                logger.info(
+                    "memory.correction.content_hit", user_id=uid,
+                    sim=round(best_sim, 3), old_id=top[0][1][0],
+                )
+                return _versioned_replace(conn, uid, top[0][1], memory_type, content,
+                                          department, meta, confidence, evidence, vec)
+            # c) 均未命中 → 以用户纠正内容新增（旧条未被取代属残余风险，由 TTL/后续整理兜底）
+            logger.info("memory.correction.no_match_add", user_id=uid, best_sim=round(best_sim, 3))
+            return _insert(conn, uid, memory_type, content, department, meta, confidence, evidence, vec)
 
         # 2) 门槛：明显无关 → 直接新增（零 LLM 成本）
         if best_sim <= _RECALL_THRESHOLD:
@@ -151,6 +208,26 @@ def add_memory(
         # target_id 非法：保守新增
         logger.warning("memory.judge.bad_target", user_id=uid, target_id=target_id, mtype=memory_type)
         return _insert(conn, uid, memory_type, content, department, meta, confidence, evidence, vec)
+
+
+def _recall(conn, uid: int, vec: list[float]) -> tuple[list, float]:
+    """召回候选：该用户全部未取代记忆（superseded_at IS NULL）按向量相似度降序取 top-5。
+
+    抽成独立函数：块C 纠错用 correction_target 二次召回时复用（content 与 target 各召一回）。
+    Returns: (top 候选列表 [(sim, row), ...], 最高相似度)。
+    """
+    rows = conn.execute(
+        """
+        SELECT id, memory_type, content, confidence, embedding FROM user_memories
+        WHERE user_id = %s AND superseded_at IS NULL
+        """,
+        (uid,),
+    ).fetchall()
+    scored = [(cosine_similarity(vec, vector_from_sql(r[4])), r) for r in rows]
+    scored.sort(key=lambda x: x[0], reverse=True)
+    top = scored[:_RECALL_TOP_K]
+    best_sim = top[0][0] if top else 0.0
+    return top, best_sim
 
 
 def _insert(conn, uid: int, mtype: str, content: str, department: Optional[str],
@@ -231,13 +308,18 @@ def search_memories(
     departments: Optional[list[str]] = None,
     top_k: int = 5,
     memory_type: Optional[str] = None,
+    exclude_types: Optional[list[str]] = None,
 ) -> list[dict[str, Any]]:
     """检索用户非结构化记忆。
 
     departments: 问题意图部门列表；粗筛规则 = department ∈ departments ∪ 无标签通用记忆。
                  为 None 时跳过粗筛（全局检索）。
+    memory_type: 只返回该类型的记忆（单值）。
+    exclude_types: 排除这些类型的记忆（注入分级用：弱记忆检索时排除 rule/preference）。
     """
     uid = resolve_user_id(user_id)
+    # 块B：检索前惰性软过期弱记忆，过期记忆 superseded 后自然不返回
+    expire_stale_memories(user_id)
     qvec = mock_embedding(query_text)
     with connect() as conn:
         sql = (
@@ -248,6 +330,9 @@ def search_memories(
         if memory_type:
             sql += " AND memory_type = %s"
             params.append(memory_type)
+        if exclude_types:
+            sql += " AND NOT (memory_type = ANY(%s))"
+            params.append(list(exclude_types))
         if departments:
             sql += " AND (department = ANY(%s) OR department IS NULL)"
             params.append(departments)

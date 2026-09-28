@@ -37,7 +37,7 @@ MANAGER_SYSTEM_PROMPT = f"""你是「甜秘密跨境电商」Multi-Agent 系统�
 ## 输出格式
 
 只输出 JSON，不要解释文字：
-{{"intent": "问题意图简述", "required_agents": ["operation"], "tasks": [{{"id": "operation_analysis", "agent": "operation", "depends_on": [], "description": "任务描述"}}]}}
+{{"intent": "问题意图简述", "required_agents": ["operation"], "tasks": [{{"id": "operation_analysis", "agent": "operation", "depends_on": [], "description": "任务描述"}}], "memory_correction": {{"corrected": false, "content": "", "target": "", "memory_type": "fact"}}}}
 
 ## 安全边界（OPT-06）
 
@@ -63,6 +63,14 @@ MANAGER_PLAN_PROMPT = """请分析以下用户问题，规划任务 DAG。
 3. product 任务的 depends_on 必须包含所有已选的 operation/finance/logistics 任务；
 4. 最后添加 decision 任务，depends_on 包含所有部门任务；
 5. 只输出 JSON，不要 markdown 代码块，不要解释。
+
+额外字段 memory_correction（块C·M档，用户显式纠错判定，默认 corrected=false）：
+- 仅当用户本轮明确纠正/更正你之前给出的信息或记忆时，才置 corrected=true（如"不对""错了""更正""应该是"等显式纠正）；
+- 普通提问、追问、新话题一律 corrected=false；
+- corrected=true 时填写：
+  - content：用户纠正后的正确内容（提取要点，作为要保存的记忆）；
+  - target：被纠正的旧内容原话要点——用户指出的是"你之前说的哪句话/哪条记忆"，尽量贴近原话；无法确定则留空字符串；
+  - memory_type：纠正内容的性质，取值 fact（事实）/ conclusion（结论）/ rule（规则或口径）/ preference（偏好）。
 
 输出 JSON：
 """

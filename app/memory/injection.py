@@ -1,11 +1,15 @@
 """长期记忆分层注入（设计文档 34-35 节）。
 
 分层原则（讨论确认）：
-- Manager（规划）：只注入用户级信息——user_profiles + user_preferences 全量 + user_memories 无部门标签的通用 top-k
-- 部门子 Agent（执行）：注入本部门上下文——business_preferences（scope=本部门∪global）+ user_memories（department=本部门）top-k
+- Manager（规划）：只注入用户级信息——user_profiles + user_preferences 全量 + user_memories 无部门标签的通用分级注入（强约束全量 + 弱记忆 top-k）
+- 部门子 Agent（执行）：注入本部门上下文——business_preferences（scope=本部门∪global）+ user_memories（department=本部门∪无标签）分级注入
   （知识库 knowledge_chunks 检索由部门 Agent 内部已有逻辑负责；跨部门结论由 main_graph 的 context_builder 注入）
 
 注入产物统一为 dict，经 BaseDepartmentAgent._context_text() 序列化进 prompt 的 {context} 占位。
+
+分级规则（考点四十五）：memory_type ∈ {preference, rule} 是强约束（答错代价高）→ 全量注入；
+memory_type ∈ {fact, conclusion} 是弱记忆（少个佐证）→ 按相似度 top-k；
+token 预算 MEMORY_INJECT_TOKEN_BUDGET 内"保强弃弱"（_fit_budget）。
 """
 
 from __future__ import annotations
@@ -13,6 +17,7 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from app.config.settings import settings
+from app.memory.conversation import count_tokens
 from app.memory.profile import (
     get_business_preferences,
     get_preferences,
@@ -34,11 +39,53 @@ _TYPE_LABEL = {
     "rule": "规则",
 }
 
+# 记忆分级：强约束（答错代价高，全量注入）vs 弱记忆（少个佐证，按相似度 top-k）
+_STRONG_TYPES = ("preference", "rule")
+_WEAK_TYPES = ("fact", "conclusion")
+_STRONG_CAP = 100  # 强约束单类型检索上限（实际量小，兜底防极端）
+
 
 def _annotate(m: dict) -> str:
     """记忆注入文本：带类型标注（如（偏好）用户要求用美元结算）。"""
     label = _TYPE_LABEL.get(m.get("memory_type") or "", "")
     return f"（{label}）{m['content']}" if label else m["content"]
+
+
+def _search_strong(user_id: str, query: str, departments: Optional[list[str]]) -> list[dict]:
+    """强约束（preference/rule）全量检索：不受相似度 top-k 限制，按 id 合并去重。"""
+    merged: dict[int, dict] = {}
+    for t in _STRONG_TYPES:
+        for m in search_memories(user_id, query, departments=departments, top_k=_STRONG_CAP, memory_type=t):
+            merged.setdefault(m["id"], m)
+    return sorted(merged.values(), key=lambda m: m["similarity"], reverse=True)
+
+
+def _search_weak(user_id: str, query: str, departments: Optional[list[str]], top_k: int) -> list[dict]:
+    """弱记忆（fact/conclusion）按相似度 top-k 检索（排除强类型）。"""
+    return search_memories(
+        user_id, query, departments=departments, top_k=top_k,
+        exclude_types=list(_STRONG_TYPES),
+    )
+
+
+def _fit_budget(strong: list[dict], weak: list[dict], budget: int) -> tuple[list[dict], int, int]:
+    """token 预算内"保强弃弱"：强约束在前、弱记忆按相似度在后，超预算截断。
+
+    Returns: (注入列表, 被丢弃的弱记忆条数, 实际占用 token)
+    """
+    ordered = list(strong) + list(weak)
+    used = 0
+    kept: list[dict] = []
+    dropped = 0
+    for m in ordered:
+        cost = count_tokens(_annotate(m))
+        if used + cost > budget:
+            if m["memory_type"] in _WEAK_TYPES:
+                dropped += 1
+            continue  # 强约束超预算兜底：按相似度顺序截断（极端情况）
+        kept.append(m)
+        used += cost
+    return kept, dropped, used
 
 # 轻量意图部门预判关键词（Manager 规划前粗筛用，零成本；不精确，只求淘汰明显无关）
 _INTENT_KEYWORDS: dict[str, tuple[str, ...]] = {
@@ -61,20 +108,18 @@ def guess_intent_departments(question: str) -> list[str]:
 # ---------------------------------------------------------------------------
 
 def build_manager_memory(user_id: str, user_question: str) -> dict[str, Any]:
-    """Manager 规划前注入的用户记忆（用户级信息 + 通用非结构化 top-k）。"""
+    """Manager 规划前注入的用户记忆（用户级信息 + 分级非结构化记忆）。"""
     profiles = get_profiles(user_id)
     preferences = get_preferences(user_id)
-    # 通用记忆：无部门标签（department 为空）——粗筛传空部门集合会全部返回，
-    # 这里手动按"无标签"过滤：先全局检索再在注入侧剔除带标签的
-    generic = [
-        m for m in search_memories(user_id, user_question, departments=None, top_k=settings.MEMORY_RECALL_TOP_K * 2)
-        if not m["department"]
-    ][:settings.MEMORY_RECALL_TOP_K]
+    # 通用记忆：无部门标签（department 为空）——注入侧过滤带标签的
+    strong = [m for m in _search_strong(user_id, user_question, None) if not m["department"]]
+    weak = [m for m in _search_weak(user_id, user_question, None, settings.MEMORY_RECALL_TOP_K) if not m["department"]]
+    memories, dropped, used = _fit_budget(strong, weak, settings.MEMORY_INJECT_TOKEN_BUDGET)
 
     memory = {
         "profiles": profiles,
         "preferences": preferences,
-        "memories": [_annotate(m) for m in generic],
+        "memories": [_annotate(m) for m in memories],
     }
     if not any(memory.values()):
         return {}
@@ -83,7 +128,11 @@ def build_manager_memory(user_id: str, user_question: str) -> dict[str, Any]:
         user_id=user_id,
         profiles=len(profiles),
         preferences=len(preferences),
-        generic_memories=len(generic),
+        strong=len(strong),
+        weak=len(weak),
+        injected=len(memories),
+        dropped_weak=dropped,
+        tokens=used,
     )
     return memory
 
@@ -97,17 +146,14 @@ def build_department_memory(user_id: str, agent_name: str, user_question: str) -
 
     返回 dict（可直接并入 context_builder 的 context）：
       business_rules: business_preferences（scope=本部门 ∪ global）
-      department_memories: user_memories（department=本部门）top-k
+      department_memories: user_memories（department=本部门 ∪ 无标签）分级注入
     """
     if agent_name not in KNOWN_DEPARTMENTS:
         return {}
     rules = get_business_preferences(scope=agent_name)
-    memories = search_memories(
-        user_id,
-        user_question,
-        departments=[agent_name],
-        top_k=settings.MEMORY_RECALL_TOP_K,
-    )
+    strong = _search_strong(user_id, user_question, [agent_name])
+    weak = _search_weak(user_id, user_question, [agent_name], settings.MEMORY_RECALL_TOP_K)
+    memories, dropped, used = _fit_budget(strong, weak, settings.MEMORY_INJECT_TOKEN_BUDGET)
     ctx: dict[str, Any] = {}
     if rules:
         ctx["business_rules"] = rules
@@ -119,6 +165,10 @@ def build_department_memory(user_id: str, agent_name: str, user_question: str) -
             user_id=user_id,
             agent=agent_name,
             rules=len(rules),
-            memories=len(memories),
+            strong=len(strong),
+            weak=len(weak),
+            injected=len(memories),
+            dropped_weak=dropped,
+            tokens=used,
         )
     return ctx

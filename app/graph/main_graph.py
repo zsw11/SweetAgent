@@ -76,6 +76,34 @@ def build_main_graph(
                 intent=task_plan.get("intent"),
                 required_agents=task_plan.get("required_agents"),
             )
+
+            # 块C·M档：用户显式纠错落库（提示词判断命中 → add_memory 以用户为准）。
+            # Manager 每轮必经且已结构化输出，成本≈0；纠错后下一轮注入即用新记忆。
+            correction = task_plan.get("memory_correction") or {}
+            if correction.get("corrected") and str(correction.get("content") or "").strip():
+                try:
+                    from app.memory.semantic import add_memory
+
+                    _CORRECTION_TYPES = {"fact", "conclusion", "rule", "preference"}
+                    mtype = str(correction.get("memory_type") or "fact").strip().lower()
+                    if mtype not in _CORRECTION_TYPES:
+                        mtype = "fact"  # 非法类型兜底（LLM 输出不规范时）
+                    mid = add_memory(
+                        user_id,
+                        mtype,
+                        str(correction["content"]).strip(),
+                        user_correction=True,
+                        correction_target=str(correction.get("target") or "").strip() or None,
+                        evidence=user_question[:500],
+                    )
+                    logger.info(
+                        "memory.correction.saved", user_id=user_id,
+                        memory_id=mid, memory_type=mtype,
+                    )
+                except Exception as exc:
+                    # 纠错落库失败不阻断主流程（记忆是增强，回答照常）
+                    logger.warning("memory.correction.fail", error=str(exc)[:200])
+
             return {
                 "task_plan": task_plan,
                 "required_agents": task_plan.get("required_agents", []),

@@ -36,10 +36,26 @@ class ManagerTaskItem(BaseModel):
     description: str = ""
 
 
+class MemoryCorrectionOutput(BaseModel):
+    """块C·M档：用户显式纠错判定输出（提示词判断）。
+
+    corrected: 用户本轮是否明确纠正/更正 Agent 之前给出的信息或记忆（仅显式纠错才 True）。
+    content:   用户纠正后的正确内容（作为要保存的记忆，提取要点）。
+    target:    被纠正的旧内容原话要点（LLM 上轮自己说的，用于精准定位旧记忆；无法确定留空）。
+    memory_type: 纠正内容性质：fact（事实）/ conclusion（结论）/ rule（规则口径）/ preference（偏好）。
+    """
+
+    corrected: bool = False
+    content: str = ""
+    target: str = ""
+    memory_type: str = "fact"
+
+
 class ManagerPlanOutput(BaseModel):
     """Manager 规划输出 schema（与 MANAGER_PLAN_PROMPT 要求 JSON 同构）。"""
     intent: str = "business_analysis"
     tasks: list[ManagerTaskItem] = Field(default_factory=list)
+    memory_correction: MemoryCorrectionOutput = Field(default_factory=MemoryCorrectionOutput)
 
 
 class ManagerAgent:
@@ -202,6 +218,8 @@ class ManagerAgent:
             "intent": str(parsed.get("intent", "")).strip() or "business_analysis",
             "required_agents": required_agents,
             "tasks": valid_tasks,
+            # 块C·M档：透传用户显式纠错判定（结构化 dict 与文本解析共用；默认无纠错）
+            "memory_correction": parsed.get("memory_correction") or {},
         }
 
 
@@ -239,7 +257,7 @@ def _has_cycle(tasks: list[dict[str, Any]]) -> bool:
 
 
 def _fallback_plan(user_question: str) -> dict[str, Any]:
-    """LLM 输出无法解析时的降级计划：单部门 operation + decision。"""
+    """LLM 输出无法解析时的降级计划：单部门 operation + decision（无纠错判定）。"""
     return {
         "intent": "business_analysis",
         "required_agents": ["operation"],
@@ -247,6 +265,7 @@ def _fallback_plan(user_question: str) -> dict[str, Any]:
             {"id": "operation_analysis", "agent": "operation", "depends_on": [], "description": "运营数据分析"},
             {"id": "decision", "agent": "decision", "depends_on": ["operation_analysis"], "description": "跨部门结果汇总与决策建议"},
         ],
+        "memory_correction": {},
     }
 
 
