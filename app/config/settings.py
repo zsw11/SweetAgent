@@ -67,6 +67,18 @@ class Settings(BaseSettings):
     EMBEDDING_MODEL: str = "text-embedding-3-small"
     VECTOR_DIM: int = 1536
 
+    # ---------- RAG 检索流水线（查询优化 + 多路召回 + 重排序，2026-09-29） ----------
+    # 三级流水线：检索前查询优化（改写/HyDE）→ 多路召回（向量×N 路 + 关键词 ILIKE）
+    # → RRF + 特征融合重排。开关都支持 LLM 不可用时自动降级（等价旧的"仅原 query 向量"行为）。
+    RAG_QUERY_REWRITE_ENABLED: bool = True   # 查询改写：LLM 补全指代/实体，产出第二路向量召回
+    RAG_HYDE_ENABLED: bool = True            # HyDE：LLM 生成"假想答案文档"做一路向量召回
+    RAG_RECALL_N_PER_ROUTE: int = 40         # 每路召回条数（多路合并去重后形成 50~100 候选）
+    RAG_RECALL_MAX_CANDIDATES: int = 100     # 候选集上限（保护重排阶段的计算量）
+    RAG_RERANK_W_RRF: float = 0.5            # 重排权重：RRF 融合分（只吃名次，跨路可比）
+    RAG_RERANK_W_SIM: float = 0.3            # 重排权重：归一化向量相似度
+    RAG_RERANK_W_HIT: float = 0.2            # 重排权重：关键词命中词数（0~1 归一）
+    RAG_RERANK_MULTI_ROUTE_BONUS: float = 0.05  # 多路命中加分（同一 chunk 被多路召回 = 更可信）
+
     # ---------- Agent 运行限制（设计文档 42 节） ----------
     MAX_AGENT_ITERATIONS: int = 10
     MAX_SQL_RETRIES: int = 3
