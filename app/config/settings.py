@@ -128,6 +128,21 @@ class Settings(BaseSettings):
     INJECTION_DETECTION_ENABLED: bool = True   # 入口提示注入检测（只标记+注入边界警告，不阻断）
     OUTPUT_MASKING_ENABLED: bool = True        # 输出 PII 脱敏（手机号/邮箱/长数字串，回答出口统一处理）
 
+    # ---------- 定时任务调度（NL2Cron，2026-10-02，考点六十四） ----------
+    # 能力域模板 + 三档置信兜底 + 审核流 + 审计/限流/幂等/重试/防雪崩。
+    # 默认启用调度器；各限制项是确定性安全边界，不依赖 LLM。
+    SCHEDULER_ENABLED: bool = True               # 总开关：False 时不启动 APScheduler 也不恢复任务
+    SCHEDULER_TIMEZONE: str = "Asia/Shanghai"    # 调度时区
+    SCHEDULER_CONFIDENCE_HIGH: float = 0.8       # 三档置信：≥此值直接创建
+    SCHEDULER_CONFIDENCE_MID: float = 0.5        # ≥此值对话澄清；低于走目录引导
+    SCHEDULER_MIN_INTERVAL_MINUTES: int = 15     # 最小触发间隔（防"每秒钟跑一次"滥用）
+    SCHEDULER_MAX_JOBS_PER_USER: int = 20        # 每用户任务数上限（限流）
+    SCHEDULER_MAX_JOBS_TOTAL: int = 200          # 全局任务数上限（限流）
+    SCHEDULER_MAX_CONCURRENCY: int = 4           # 最大并行执行数（防雪崩，信号量排队）
+    SCHEDULER_MAX_RETRIES: int = 3               # 执行失败指数退避重试次数
+    SCHEDULER_LOCK_TTL_SECONDS: int = 120        # 任务级幂等锁 TTL（防死锁/重复触发）
+    SCHEDULER_FAIL_AUTO_PAUSE: int = 3           # 连续失败达此值自动暂停（防持续烧钱）
+
 
 @lru_cache
 def get_settings() -> Settings:

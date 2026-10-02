@@ -97,6 +97,10 @@ def main() -> int:
     with psycopg.connect(_dsn(SUPERUSER, SUPERUSER_PASSWORD, DB_NAME), autocommit=True) as conn:
         run_sql_file(conn, DB_DIR / "03-grants.sql")
 
+    print("[5.5/6] 定时任务调度表（db/04-scheduler.sql，NL2Cron）...")
+    with psycopg.connect(_dsn(APP_USER, APP_PASSWORD, DB_NAME), autocommit=True) as conn:
+        run_sql_file(conn, DB_DIR / "04-scheduler.sql")
+
     with psycopg.connect(_dsn(APP_USER, APP_PASSWORD, DB_NAME)) as conn:
         with conn.cursor() as cur:
             cur.execute(

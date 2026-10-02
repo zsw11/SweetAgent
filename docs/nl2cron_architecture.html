@@ -1,0 +1,74 @@
+<html style="margin:0;padding:0;">
+<title>NL2Cron用户口述生成定时任务架构（示意）</title>
+<div style="width:100%;box-sizing:border-box;font-family:'Microsoft YaHei',system-ui,sans-serif;background:#fafbfc;padding:16px;">
+<div style="text-align:center;color:#666;font-size:13px;margin-bottom:10px;">NL2Cron：用户口述生成定时任务（示意）——LLM 解析意图，确定性校验锁边界</div>
+<svg viewBox="0 0 960 780" width="100%" xmlns="http://www.w3.org/2000/svg" style="display:block;">
+  <defs>
+    <marker id="n1" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M0,0 L10,4 L0,8 Z" fill="#555"/></marker>
+    <marker id="n2" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M0,0 L10,4 L0,8 Z" fill="#c62828"/></marker>
+    <marker id="n3" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M0,0 L10,4 L0,8 Z" fill="#2e7d32"/></marker>
+  </defs>
+
+  <!-- 用户口述 -->
+  <rect x="300" y="10" width="360" height="50" rx="10" fill="#1a237e" opacity="0.92"/>
+  <text x="480" y="32" text-anchor="middle" fill="#fff" font-size="15" font-weight="bold">用户口述</text>
+  <text x="480" y="52" text-anchor="middle" fill="#c5cae9" font-size="12">"每天早上 9 点把美国市场销售日报发我"</text>
+
+  <!-- 意图识别 -->
+  <rect x="300" y="84" width="360" height="56" rx="10" fill="#e3f2fd" stroke="#1e88e5" stroke-width="2"/>
+  <text x="480" y="108" text-anchor="middle" fill="#0d47a1" font-size="14.5" font-weight="bold">① 意图识别</text>
+  <text x="480" y="128" text-anchor="middle" fill="#333" font-size="12">是"创建定时任务"还是"普通查询"？（复用 Manager）</text>
+  <path d="M480,60 L480,80" stroke="#555" stroke-width="2" marker-end="url(#n1)"/>
+
+  <!-- LLM 结构化解析 -->
+  <rect x="300" y="164" width="360" height="90" rx="10" fill="#f3e5f5" stroke="#8e24aa" stroke-width="2"/>
+  <text x="480" y="188" text-anchor="middle" fill="#6a1b9a" font-size="14.5" font-weight="bold">② 结构化解析（LLM，invoke_structured）</text>
+  <text x="480" y="212" text-anchor="middle" fill="#333" font-size="12">template_id: "daily_report"（从注册表里选）</text>
+  <text x="480" y="232" text-anchor="middle" fill="#333" font-size="12">time_expr: "每天早上9点"（自然语言，不直接出 cron）</text>
+  <text x="480" y="248" text-anchor="middle" fill="#333" font-size="12">params: {"market": "US"}</text>
+  <path d="M480,140 L480,160" stroke="#555" stroke-width="2" marker-end="url(#n1)"/>
+
+  <!-- 校验闸 -->
+  <rect x="160" y="280" width="640" height="140" rx="10" fill="#ffebee" stroke="#c62828" stroke-width="2"/>
+  <text x="480" y="304" text-anchor="middle" fill="#c62828" font-size="15" font-weight="bold">③ 确定性校验闸（三道，不信任 LLM）</text>
+  <rect x="180" y="316" width="200" height="50" rx="8" fill="#fff" stroke="#ef9a9a"/>
+  <text x="280" y="338" text-anchor="middle" fill="#333" font-size="12.5" font-weight="bold">模板白名单</text>
+  <text x="280" y="356" text-anchor="middle" fill="#777" font-size="11.5">template_id 必须已注册</text>
+  <rect x="390" y="316" width="200" height="50" rx="8" fill="#fff" stroke="#ef9a9a"/>
+  <text x="490" y="338" text-anchor="middle" fill="#333" font-size="12.5" font-weight="bold">时间解析 + 频率上限</text>
+  <text x="490" y="356" text-anchor="middle" fill="#777" font-size="11.5">"每天早上9点"→cron；最小间隔15分钟</text>
+  <rect x="600" y="316" width="180" height="50" rx="8" fill="#fff" stroke="#ef9a9a"/>
+  <text x="690" y="338" text-anchor="middle" fill="#333" font-size="12.5" font-weight="bold">参数枚举校验</text>
+  <text x="690" y="356" text-anchor="middle" fill="#777" font-size="11.5">market/brand 白名单</text>
+  <text x="480" y="396" text-anchor="middle" fill="#c62828" font-size="12">失败 → 拒绝 + 提示修正（如"每秒钟"→超频拒绝）</text>
+  <path d="M480,254 L480,276" stroke="#555" stroke-width="2" marker-end="url(#n1)"/>
+
+  <!-- 注册 -->
+  <rect x="300" y="446" width="360" height="74" rx="10" fill="#e8f5e9" stroke="#2e7d32" stroke-width="2"/>
+  <text x="480" y="470" text-anchor="middle" fill="#1b5e20" font-size="14.5" font-weight="bold">④ 注册</text>
+  <text x="480" y="492" text-anchor="middle" fill="#333" font-size="12">写 scheduler_jobs 表（持久化，重启可恢复）</text>
+  <text x="480" y="510" text-anchor="middle" fill="#333" font-size="12">+ 动态注册进 APScheduler</text>
+  <path d="M480,420 L480,442" stroke="#555" stroke-width="2" marker-end="url(#n1)"/>
+
+  <!-- 执行与管理 -->
+  <rect x="160" y="546" width="300" height="96" rx="10" fill="#e8f5e9" stroke="#2e7d32" stroke-width="2"/>
+  <text x="310" y="570" text-anchor="middle" fill="#1b5e20" font-size="14.5" font-weight="bold">⑤ 定时触发执行</text>
+  <text x="310" y="592" text-anchor="middle" fill="#333" font-size="12">调用模板 handler：</text>
+  <text x="310" y="610" text-anchor="middle" fill="#333" font-size="12">日报 → run_question 主图</text>
+  <text x="310" y="628" text-anchor="middle" fill="#333" font-size="12">监控 → 规则 SQL（只读）</text>
+  <path d="M360,520 L310,542" stroke="#2e7d32" stroke-width="2" marker-end="url(#n3)"/>
+
+  <rect x="500" y="546" width="300" height="96" rx="10" fill="#e3f2fd" stroke="#1e88e5" stroke-width="2"/>
+  <text x="650" y="570" text-anchor="middle" fill="#0d47a1" font-size="14.5" font-weight="bold">⑥ 管理（API）</text>
+  <text x="650" y="592" text-anchor="middle" fill="#333" font-size="12">GET /scheduler/jobs 列我的任务</text>
+  <text x="650" y="610" text-anchor="middle" fill="#333" font-size="12">DELETE 删除 / 暂停 / 恢复</text>
+  <text x="650" y="628" text-anchor="middle" fill="#333" font-size="12">执行结果落库可回溯</text>
+  <path d="M600,520 L650,542" stroke="#1565c0" stroke-width="2" marker-end="url(#n1)"/>
+
+  <!-- 底部模板层 -->
+  <rect x="160" y="672" width="640" height="86" rx="10" fill="#fff8e1" stroke="#f9a825" stroke-width="1.5"/>
+  <text x="480" y="696" text-anchor="middle" fill="#e65100" font-size="14" font-weight="bold">与预置模板的关系：两层结构，一套执行器</text>
+  <text x="480" y="720" text-anchor="middle" fill="#333" font-size="12.5">预置 4 个固定任务（日报/异常监控/知识同步/评估回归）= 模板 + 默认调度</text>
+  <text x="480" y="742" text-anchor="middle" fill="#333" font-size="12.5">用户口述创建 = 同一模板 + 自定义时间/参数实例 —— 模板注册表是唯一权威源</text>
+</svg>
+</div>

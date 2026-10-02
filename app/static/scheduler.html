@@ -1,0 +1,652 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>定时任务管理台 · NL2Cron</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Ccircle cx='12' cy='12' r='9' fill='%230f766e'/%3E%3Cpath d='M12 7v5l3 2' stroke='%23fff' stroke-width='2' fill='none' stroke-linecap='round'/%3E%3C/svg%3E">
+<style>
+  :root {
+    --ink: #1e293b;
+    --ink-2: #475569;
+    --ink-3: #94a3b8;
+    --bg: #f1f5f9;
+    --card: #ffffff;
+    --line: #e2e8f0;
+    --teal: #0f766e;
+    --teal-deep: #115e59;
+    --teal-bg: #ccfbf1;
+    --amber: #b45309;
+    --amber-bg: #fef3c7;
+    --red: #b91c1c;
+    --red-bg: #fee2e2;
+    --green: #15803d;
+    --green-bg: #dcfce7;
+    --blue: #1d4ed8;
+    --blue-bg: #dbeafe;
+    --slate: #475569;
+    --slate-bg: #e2e8f0;
+    --radius: 10px;
+    --shadow: 0 1px 3px rgba(15,23,42,.08), 0 4px 14px rgba(15,23,42,.06);
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+    background: var(--bg); color: var(--ink); font-size: 14px; line-height: 1.55;
+  }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 20px 20px 48px; }
+
+  /* ===== 顶栏 ===== */
+  header {
+    background: linear-gradient(135deg, #134e4a 0%, #0f766e 100%);
+    color: #fff; border-radius: var(--radius); padding: 22px 26px;
+    display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
+    gap: 14px; box-shadow: var(--shadow); margin-bottom: 20px;
+  }
+  header h1 { font-size: 21px; font-weight: 700; letter-spacing: .5px; display: flex; align-items: center; gap: 10px; }
+  header h1 svg { flex: none; }
+  header .sub { font-size: 12.5px; color: #a7f3d0; margin-top: 3px; }
+  .who { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .who label { font-size: 12px; color: #a7f3d0; }
+  .who input {
+    background: rgba(255,255,255,.14); border: 1px solid rgba(255,255,255,.28);
+    color: #fff; border-radius: 8px; padding: 7px 11px; font-size: 13px; width: 120px;
+  }
+  .who input::placeholder { color: rgba(255,255,255,.55); }
+
+  /* ===== 卡片 ===== */
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); margin-bottom: 20px; overflow: hidden; }
+  .card-hd { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 15px 20px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+  .card-hd h2 { font-size: 15.5px; font-weight: 700; }
+  .card-hd .hint { font-size: 12px; color: var(--ink-3); }
+  .card-bd { padding: 18px 20px; }
+
+  /* ===== 口述创建 ===== */
+  .nl-row { display: flex; gap: 10px; flex-wrap: wrap; }
+  .nl-row textarea {
+    flex: 1 1 360px; min-height: 62px; resize: vertical; border: 1px solid var(--line);
+    border-radius: 8px; padding: 10px 12px; font-size: 14px; font-family: inherit; color: var(--ink);
+  }
+  .nl-row textarea:focus { outline: 2px solid var(--teal); border-color: transparent; }
+  .btn {
+    border: none; border-radius: 8px; padding: 9px 18px; font-size: 13.5px; font-weight: 600;
+    cursor: pointer; display: inline-flex; align-items: center; gap: 6px; transition: filter .15s;
+    background: var(--slate-bg); color: var(--slate);
+  }
+  .btn:hover { filter: brightness(.95); }
+  .btn:disabled { opacity: .5; cursor: not-allowed; }
+  .btn-primary { background: var(--teal); color: #fff; }
+  .btn-danger { background: var(--red-bg); color: var(--red); }
+  .btn-ghost { background: transparent; border: 1px solid var(--line); color: var(--ink-2); }
+  .btn-sm { padding: 5px 11px; font-size: 12.5px; border-radius: 7px; }
+
+  /* ===== 解析结果 ===== */
+  #nlResult { margin-top: 14px; display: none; }
+  .res { border-radius: 8px; padding: 14px 16px; border: 1px solid var(--line); background: #f8fafc; }
+  .res .res-title { font-weight: 700; font-size: 14px; margin-bottom: 8px; display: flex; align-items: center; gap: 8px; }
+  .res .res-body { font-size: 13.5px; color: var(--ink-2); }
+  .res .kv { display: flex; flex-wrap: wrap; gap: 6px 18px; margin: 8px 0; }
+  .res .kv span { background: #fff; border: 1px solid var(--line); border-radius: 6px; padding: 3px 9px; font-size: 12.5px; }
+  .res .kv b { color: var(--ink); }
+  .res-actions { margin-top: 12px; display: flex; gap: 8px; flex-wrap: wrap; }
+  .tag { display: inline-block; border-radius: 999px; padding: 2px 10px; font-size: 12px; font-weight: 600; }
+  .tag-low { background: var(--green-bg); color: var(--green); }
+  .tag-mid { background: var(--amber-bg); color: var(--amber); }
+  .tag-high { background: var(--red-bg); color: var(--red); }
+  .st-pending { background: var(--amber-bg); color: var(--amber); }
+  .st-approved { background: var(--blue-bg); color: var(--blue); }
+  .st-rejected { background: var(--red-bg); color: var(--red); }
+  .st-active { background: var(--green-bg); color: var(--green); }
+  .st-paused { background: var(--slate-bg); color: var(--slate); }
+  .st-disabled { background: var(--slate-bg); color: var(--slate); }
+  .st-deleted { background: var(--slate-bg); color: var(--slate); }
+
+  /* ===== 能力域目录 ===== */
+  .dom-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }
+  .dom {
+    border: 1px solid var(--line); border-radius: 9px; padding: 13px 14px; cursor: pointer;
+    transition: border-color .15s, box-shadow .15s;
+  }
+  .dom:hover { border-color: var(--teal); box-shadow: 0 2px 8px rgba(15,118,110,.12); }
+  .dom .dom-name { font-weight: 700; font-size: 14px; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .dom .dom-desc { font-size: 12.5px; color: var(--ink-2); margin: 6px 0 8px; }
+  .dom .dom-ex { font-size: 11.5px; color: var(--ink-3); }
+  .dom .dom-ex b { color: var(--ink-3); font-weight: 600; }
+
+  /* ===== 任务表格 ===== */
+  .tbl-wrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; table-layout: fixed; min-width: 920px; }
+  colgroup col:nth-child(1){width:52px}   /* ID */
+  colgroup col:nth-child(2){width:16%}    /* 名称 */
+  colgroup col:nth-child(3){width:11%}    /* 能力域 */
+  colgroup col:nth-child(4){width:12%}    /* 触发 */
+  colgroup col:nth-child(5){width:64px}   /* 风险 */
+  colgroup col:nth-child(6){width:86px}   /* 状态 */
+  colgroup col:nth-child(7){width:70px}   /* 运行 */
+  colgroup col:nth-child(8){width:130px}  /* 上次运行 */
+  colgroup col:nth-child(9){width:auto}   /* 操作 */
+  thead th {
+    background: #f8fafc; text-align: left; padding: 10px 12px; font-size: 12px; color: var(--ink-3);
+    font-weight: 600; border-bottom: 1px solid var(--line); white-space: nowrap;
+  }
+  tbody td { padding: 10px 12px; border-bottom: 1px solid var(--line); font-size: 13px; vertical-align: top; }
+  tbody tr:hover { background: #f8fafc; }
+  .op { display: flex; flex-wrap: wrap; gap: 6px; }
+  .mono { font-family: "Cascadia Code", Consolas, monospace; font-size: 12px; color: var(--ink-2); }
+  .empty { padding: 34px; text-align: center; color: var(--ink-3); font-size: 13.5px; }
+
+  /* ===== 日志抽屉 ===== */
+  .mask { position: fixed; inset: 0; background: rgba(15,23,42,.45); display: none; align-items: center; justify-content: center; z-index: 50; padding: 20px; }
+  .mask.show { display: flex; }
+  .drawer {
+    background: #fff; border-radius: 12px; width: 100%; max-width: 780px; max-height: 82vh;
+    display: flex; flex-direction: column; box-shadow: 0 20px 50px rgba(15,23,42,.25);
+  }
+  .drawer-hd { display: flex; align-items: center; justify-content: space-between; padding: 15px 20px; border-bottom: 1px solid var(--line); }
+  .drawer-hd h3 { font-size: 15px; font-weight: 700; }
+  .drawer-bd { padding: 14px 20px; overflow-y: auto; }
+  .log-item { border: 1px solid var(--line); border-radius: 8px; padding: 9px 12px; margin-bottom: 8px; font-size: 12.5px; }
+  .log-item .lg-ev { font-weight: 700; }
+  .log-item .lg-tm { float: right; color: var(--ink-3); font-size: 11.5px; }
+  .log-item .lg-dt { color: var(--ink-2); margin-top: 4px; word-break: break-all; }
+  .close-x { background: none; border: none; font-size: 20px; cursor: pointer; color: var(--ink-3); line-height: 1; }
+
+  /* ===== 提示条 ===== */
+  .toast-wrap { position: fixed; top: 18px; right: 18px; z-index: 99; display: flex; flex-direction: column; gap: 8px; }
+  .toast { background: var(--ink); color: #fff; padding: 10px 16px; border-radius: 8px; font-size: 13px; box-shadow: 0 4px 16px rgba(15,23,42,.25); animation: slidein .2s ease-out; max-width: 380px; }
+  .toast.err { background: var(--red); }
+  .toast.ok { background: var(--green); }
+  @keyframes slidein { from { transform: translateX(24px); opacity: 0; } to { transform: none; opacity: 1; } }
+
+  /* ===== 响应式 ===== */
+  @media (max-width: 720px) {
+    .wrap { padding: 12px 10px 40px; }
+    header { padding: 18px; }
+    .dom-grid { grid-template-columns: 1fr; }
+    .card-bd { padding: 14px; }
+    table { min-width: 780px; }
+  }
+  .spin { display: inline-block; width: 13px; height: 13px; border: 2px solid rgba(255,255,255,.35); border-top-color: #fff; border-radius: 50%; animation: rot .7s linear infinite; vertical-align: -2px; }
+  @keyframes rot { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <div>
+      <h1>
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="9" stroke="#fff" stroke-width="2"/><path d="M12 7v5l3 2" stroke="#fff" stroke-width="2" stroke-linecap="round"/></svg>
+        定时任务管理台
+      </h1>
+      <div class="sub">NL2Cron · 口述创建 / 能力域模板 / 审核流 / 审计 · 甜秘密跨境 Multi-Agent</div>
+    </div>
+    <div class="who">
+      <label for="userId">操作人</label>
+      <input id="userId" value="default" placeholder="用户名">
+      <label for="reviewerId">审核人(开发)</label>
+      <input id="reviewerId" value="admin" placeholder="如 admin/dev">
+    </div>
+  </header>
+
+  <!-- ===== 1 口述创建 ===== -->
+  <section class="card">
+    <div class="card-hd">
+      <h2>口述创建任务</h2>
+      <span class="hint">自然语言描述：什么时候、做什么。例如「每天早上9点分析美国市场销量」</span>
+    </div>
+    <div class="card-bd">
+      <div class="nl-row">
+        <textarea id="nlText" placeholder="说一句想定时做的事，例如：每天下班前看一遍库存天数低于12天的SKU"></textarea>
+        <button class="btn btn-primary" id="btnParse">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
+          解析
+        </button>
+      </div>
+      <div id="nlResult"></div>
+    </div>
+  </section>
+
+  <!-- ===== 2 能力域目录 ===== -->
+  <section class="card">
+    <div class="card-hd">
+      <h2>能力域目录</h2>
+      <span class="hint">点击卡片可把示例填入上方输入框；LLM 只能从这些能力域中选择</span>
+    </div>
+    <div class="card-bd">
+      <div class="dom-grid" id="domGrid"><span class="empty">加载中…</span></div>
+    </div>
+  </section>
+
+  <!-- ===== 3 任务列表 ===== -->
+  <section class="card">
+    <div class="card-hd">
+      <h2>任务列表 <span id="jobCount" class="hint"></span></h2>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <input id="filterUser" placeholder="按用户过滤(空=全部)" style="border:1px solid var(--line);border-radius:7px;padding:6px 10px;font-size:12.5px;width:160px;">
+        <button class="btn btn-ghost btn-sm" id="btnRefresh">刷新</button>
+      </div>
+    </div>
+    <div class="card-bd" style="padding:0;">
+      <div class="tbl-wrap">
+        <table>
+          <colgroup>
+            <col><col><col><col><col><col><col><col><col>
+          </colgroup>
+          <thead>
+            <tr>
+              <th>ID</th><th>名称</th><th>能力域</th><th>触发</th><th>风险</th><th>状态</th>
+              <th>运行</th><th>上次运行</th><th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="jobTbody"><tr><td colspan="9" class="empty">加载中…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 4 失败案例池（用户点踩回流，考点六十六） ===== -->
+  <section class="card">
+    <div class="card-hd">
+      <h2>失败案例池 <span id="harvestCount" class="hint"></span></h2>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <select id="filterHarvest" style="border:1px solid var(--line);border-radius:7px;padding:6px 10px;font-size:12.5px;">
+          <option value="">全部状态</option>
+          <option value="pending">pending</option>
+          <option value="promoted">promoted</option>
+          <option value="discarded">discarded</option>
+        </select>
+        <button class="btn btn-ghost btn-sm" id="btnHarvestRefresh">刷新</button>
+      </div>
+    </div>
+    <div class="card-bd" style="padding:0;">
+      <div class="tbl-wrap">
+        <table>
+          <colgroup>
+            <col style="width:52px"><col style="width:22%"><col style="width:20%">
+            <col style="width:100px"><col style="width:120px"><col>
+          </colgroup>
+          <thead>
+            <tr>
+              <th>ID</th><th>问题</th><th>被点踩的回答</th><th>信号</th><th>状态</th><th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="harvestTbody"><tr><td colspan="6" class="empty">加载中…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+</div>
+
+<!-- ===== 转正草稿抽屉 ===== -->
+<div class="mask" id="draftMask">
+  <div class="drawer">
+    <div class="drawer-hd">
+      <h3 id="draftTitle">转正草稿</h3>
+      <button class="close-x" id="draftClose">&times;</button>
+    </div>
+    <div class="drawer-bd" id="draftBody"></div>
+  </div>
+</div>
+
+<!-- ===== 日志抽屉 ===== -->
+<div class="mask" id="logMask">
+  <div class="drawer">
+    <div class="drawer-hd">
+      <h3 id="logTitle">执行记录</h3>
+      <button class="close-x" id="logClose">&times;</button>
+    </div>
+    <div class="drawer-bd" id="logBody"><span class="empty">加载中…</span></div>
+  </div>
+</div>
+
+<div class="toast-wrap" id="toastWrap"></div>
+
+<script>
+(function () {
+  'use strict';
+  var $ = function (id) { return document.getElementById(id); };
+  var state = { pendingCreate: null };
+
+  // ---------- 工具 ----------
+  function toast(msg, type) {
+    var t = document.createElement('div');
+    t.className = 'toast' + (type === 'err' ? ' err' : type === 'ok' ? ' ok' : '');
+    t.textContent = msg;
+    $('toastWrap').appendChild(t);
+    setTimeout(function () { t.remove(); }, 3600);
+  }
+  async function api(path, opts) {
+    var res = await fetch(path, Object.assign({ headers: { 'Content-Type': 'application/json' } }, opts || {}));
+    var data;
+    try { data = await res.json(); } catch (e) { data = { detail: res.statusText }; }
+    if (!res.ok) { throw new Error(data.detail || ('HTTP ' + res.status)); }
+    return data;
+  }
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+  function statusTag(st) { return '<span class="tag st-' + esc(st) + '">' + esc(st) + '</span>'; }
+  function riskTag(r) { return '<span class="tag tag-' + esc(r) + '">' + esc(r) + '</span>'; }
+
+  // ---------- 1 口述创建 ----------
+  $('btnParse').addEventListener('click', async function () {
+    var text = $('nlText').value.trim();
+    if (!text) { toast('请先输入一句话', 'err'); return; }
+    var btn = $('btnParse');
+    btn.disabled = true; btn.innerHTML = '<span class="spin"></span> 解析中';
+    try {
+      var data = await api('/scheduler/nl2cron', { method: 'POST', body: JSON.stringify({ text: text, user_id: $('userId').value || 'default' }) });
+      renderNlResult(data);
+    } catch (e) { toast('解析失败：' + e.message, 'err'); }
+    btn.disabled = false; btn.innerHTML = '解析';
+  });
+
+  function renderNlResult(data) {
+    var box = $('nlResult');
+    box.style.display = 'block';
+    var html = '';
+    if (data.branch === 'create') {
+      state.pendingCreate = data;
+      html =
+        '<div class="res" style="border-color:#99f6e4;background:#f0fdfa;">' +
+        '<div class="res-title">' + esc(data.message || '识别成功，确认创建') + '</div>' +
+        '<div class="kv">' +
+          '<span>能力域 <b>' + esc(data.domain_name) + '</b></span>' +
+          '<span>触发 <b>' + esc(data.cron_human) + '</b></span>' +
+          '<span>cron <b class="mono">' + esc(data.cron) + '</b></span>' +
+          '<span>风险 ' + riskTag(data.risk) + '</span>' +
+          '<span>置信度 <b>' + Math.round(data.confidence * 100) + '%</b></span>' +
+        '</div>' +
+        '<div class="res-body">参数：<b class="mono">' + esc(JSON.stringify(data.params)) + '</b></div>' +
+        '<div class="res-actions"><button class="btn btn-primary" id="btnConfirmCreate">确认创建</button>' +
+        '<button class="btn btn-ghost" id="btnClearResult">取消</button></div></div>';
+      box.innerHTML = html;
+      $('btnConfirmCreate').addEventListener('click', confirmCreate);
+      $('btnClearResult').addEventListener('click', function () { box.style.display = 'none'; state.pendingCreate = null; });
+    } else if (data.branch === 'clarify') {
+      html = '<div class="res">' +
+        '<div class="res-title">' + esc(data.message || '需要澄清') + '</div>' +
+        '<div class="res-body">识别到能力域「' + esc(data.domain_name) + '」，触发 ' + esc(data.cron_human) +
+        '，参数 <b class="mono">' + esc(JSON.stringify(data.params)) + '</b>。请补充具体指标或问题后重试，或直接确认创建。</div>' +
+        '<div class="res-actions"><button class="btn btn-primary" id="btnForceCreate">按以上信息创建</button>' +
+        '<button class="btn btn-ghost" id="btnClearResult2">取消</button></div></div>';
+      box.innerHTML = html;
+      state.pendingCreate = data;
+      $('btnForceCreate').addEventListener('click', confirmCreate);
+      $('btnClearResult2').addEventListener('click', function () { box.style.display = 'none'; state.pendingCreate = null; });
+    } else {
+      html = '<div class="res">' +
+        '<div class="res-title">' + esc(data.message || '没能匹配到能力域') + '</div>' +
+        '<div class="res-body">以下是我能定时帮你做的事，请换一种说法，或直接从上方目录点选示例。</div>' +
+        '<div class="res-body" style="margin-top:6px;">' + (data.domains || []).map(function (d) {
+          return '<b>' + esc(d.name) + '</b>（' + esc(d.key) + '）：' + esc(d.description);
+        }).join('<br>') + '</div></div>';
+      box.innerHTML = html;
+    }
+  }
+
+  async function confirmCreate() {
+    var p = state.pendingCreate;
+    if (!p) return;
+    try {
+      var r = await api('/scheduler/jobs', {
+        method: 'POST',
+        body: JSON.stringify({
+          capability: p.capability, time_expr: p.time_expr || p.cron_human, params: p.params,
+          user_id: $('userId').value || 'default'
+        })
+      });
+      if (r.ok) {
+        toast('已创建任务 #' + r.job_id + '，等待开发人员审核', 'ok');
+        $('nlResult').style.display = 'none'; state.pendingCreate = null;
+        loadJobs();
+      } else {
+        toast('创建失败：' + (r.reason || '未知'), 'err');
+      }
+    } catch (e) { toast('创建失败：' + e.message, 'err'); }
+  }
+
+  // ---------- 2 能力域目录 ----------
+  async function loadDomains() {
+    try {
+      var data = await api('/scheduler/domains');
+      $('domGrid').innerHTML = (data.domains || []).map(function (d) {
+        return '<div class="dom" data-example="' + esc((d.examples && d.examples[0]) || '') + '" data-key="' + esc(d.key) + '">' +
+          '<div class="dom-name">' + esc(d.name) + ' ' + riskTag(d.risk_level) + '</div>' +
+          '<div class="dom-desc">' + esc(d.description) + '</div>' +
+          '<div class="dom-ex"><b>示例：</b>' + (d.examples || []).map(esc).join('；') + '</div></div>';
+      }).join('');
+      Array.prototype.forEach.call(document.querySelectorAll('.dom'), function (el) {
+        el.addEventListener('click', function () {
+          $('nlText').value = el.getAttribute('data-example');
+          $('nlText').focus();
+        });
+      });
+    } catch (e) { $('domGrid').innerHTML = '<span class="empty">目录加载失败：' + esc(e.message) + '</span>'; }
+  }
+
+  // ---------- 3 任务列表 ----------
+  async function loadJobs() {
+    var u = $('filterUser').value.trim();
+    var qs = u ? '?user_id=' + encodeURIComponent(u) : '';
+    try {
+      var data = await api('/scheduler/jobs' + qs);
+      var jobs = data.jobs || [];
+      $('jobCount').textContent = '共 ' + jobs.length + ' 条';
+      if (!jobs.length) {
+        $('jobTbody').innerHTML = '<tr><td colspan="9" class="empty">暂无任务——用上方口述创建第一个定时任务</td></tr>';
+        return;
+      }
+      $('jobTbody').innerHTML = jobs.map(function (j) {
+        var ops = [];
+        if (j.status === 'pending' || j.status === 'rejected') {
+          ops.push('<button class="btn btn-sm btn-primary" data-act="approve" data-id="' + j.id + '">通过</button>');
+          ops.push('<button class="btn btn-sm btn-danger" data-act="reject" data-id="' + j.id + '">拒绝</button>');
+        }
+        if (j.status === 'approved' || j.status === 'active' || j.status === 'paused') {
+          var act = (j.status === 'paused') ? 'active' : 'paused';
+          ops.push('<button class="btn btn-sm btn-ghost" data-act="' + act + '" data-id="' + j.id + '">' + (act === 'paused' ? '暂停' : '恢复') + '</button>');
+          ops.push('<button class="btn btn-sm btn-ghost" data-act="disabled" data-id="' + j.id + '">禁用</button>');
+        }
+        ops.push('<button class="btn btn-sm btn-ghost" data-act="logs" data-id="' + j.id + '" data-name="' + esc(j.name) + '">日志</button>');
+        ops.push('<button class="btn btn-sm btn-danger" data-act="delete" data-id="' + j.id + '">删除</button>');
+        var lastRun = j.last_run_at ? String(j.last_run_at).replace('T', ' ').slice(0, 19) : '—';
+        var fails = j.consecutive_fail ? ' <span style="color:var(--red)">(连续失败' + j.consecutive_fail + ')</span>' : '';
+        return '<tr>' +
+          '<td>' + j.id + '</td>' +
+          '<td>' + esc(j.name) + '</td>' +
+          '<td>' + esc(j.capability_domain) + '</td>' +
+          '<td><span class="mono">' + esc(j.cron_expr) + '</span>' + (j.risk_level ? '<br>' + riskTag(j.risk_level) : '') + '</td>' +
+          '<td>' + riskTag(j.risk_level) + '</td>' +
+          '<td>' + statusTag(j.status) + '</td>' +
+          '<td>' + j.run_count + fails + '</td>' +
+          '<td>' + lastRun + '</td>' +
+          '<td><div class="op">' + ops.join('') + '</div></td></tr>';
+      }).join('');
+      Array.prototype.forEach.call(document.querySelectorAll('#jobTbody button[data-act]'), function (b) {
+        b.addEventListener('click', onJobAction);
+      });
+    } catch (e) {
+      $('jobTbody').innerHTML = '<tr><td colspan="9" class="empty">加载失败：' + esc(e.message) + '</td></tr>';
+    }
+  }
+
+  function onJobAction(ev) {
+    var b = ev.currentTarget;
+    var id = b.getAttribute('data-id');
+    var act = b.getAttribute('data-act');
+    var uid = $('userId').value || 'default';
+    var reviewer = $('reviewerId').value || 'admin';
+    if (act === 'approve' || act === 'reject') {
+      if (!confirm('确认' + (act === 'approve' ? '通过' : '拒绝') + '任务 #' + id + '？审核人：' + reviewer)) return;
+      api('/scheduler/jobs/' + id + '/review', {
+        method: 'POST',
+        body: JSON.stringify({ user_id: reviewer, decision: act, note: 'UI 审核' })
+      }).then(function (r) {
+        toast(act === 'approve' ? '已通过，任务进入调度' : '已拒绝', 'ok'); loadJobs();
+      }).catch(function (e) { toast('审核失败：' + e.message, 'err'); });
+    } else if (act === 'paused' || act === 'active' || act === 'disabled') {
+      api('/scheduler/jobs/' + id + '/status', {
+        method: 'POST',
+        body: JSON.stringify({ user_id: uid, status: act })
+      }).then(function (r) { toast('已设为 ' + act, 'ok'); loadJobs(); })
+        .catch(function (e) { toast('操作失败：' + e.message, 'err'); });
+    } else if (act === 'delete') {
+      if (!confirm('确认删除任务 #' + id + '？记录保留在审计日志。')) return;
+      api('/scheduler/jobs/' + id + '/delete', { method: 'POST', body: JSON.stringify({ user_id: uid }) })
+        .then(function (r) { toast('已删除', 'ok'); loadJobs(); })
+        .catch(function (e) { toast('删除失败：' + e.message, 'err'); });
+    } else if (act === 'logs') {
+      openLogs(id, b.getAttribute('data-name'));
+    }
+  }
+
+  // ---------- 日志 ----------
+  async function openLogs(id, name) {
+    $('logTitle').textContent = '执行记录 · #' + id + (name ? ' ' + name : '');
+    $('logMask').classList.add('show');
+    $('logBody').innerHTML = '<span class="empty">加载中…</span>';
+    try {
+      var data = await api('/scheduler/jobs/' + id + '/logs');
+      var logs = data.logs || [];
+      if (!logs.length) { $('logBody').innerHTML = '<span class="empty">暂无记录</span>'; return; }
+      $('logBody').innerHTML = logs.map(function (l) {
+        var ev = esc(l.event_type);
+        var cls = ev.indexOf('fail') >= 0 || ev === 'rejected' ? ' color:var(--red)' : ev === 'exec_success' || ev === 'approved' ? ' color:var(--green)' : '';
+        return '<div class="log-item">' +
+          '<span class="lg-ev" style="' + cls + '">' + ev + '</span>' +
+          '<span class="lg-tm">' + esc((l.run_at || '').replace('T', ' ').slice(0, 19)) + (l.duration_ms != null ? ' · ' + l.duration_ms + 'ms' : '') + '</span>' +
+          '<div class="lg-dt">' + esc(JSON.stringify(l.detail || {})) + '</div>' +
+          (l.result ? '<div class="lg-dt">' + esc(l.result.slice(0, 300)) + '</div>' : '') +
+          '</div>';
+      }).join('');
+    } catch (e) { $('logBody').innerHTML = '<span class="empty">加载失败：' + esc(e.message) + '</span>'; }
+  }
+  $('logClose').addEventListener('click', function () { $('logMask').classList.remove('show'); });
+  $('logMask').addEventListener('click', function (e) { if (e.target === $('logMask')) $('logMask').classList.remove('show'); });
+
+  // ---------- 刷新 ----------
+  $('btnRefresh').addEventListener('click', function () { loadJobs(); });
+  $('filterUser').addEventListener('keydown', function (e) { if (e.key === 'Enter') loadJobs(); });
+
+  // ---------- 4 失败案例池（用户点踩回流，考点六十六） ----------
+  async function loadHarvest() {
+    var st = $('filterHarvest').value;
+    var qs = st ? '?status=' + encodeURIComponent(st) : '';
+    try {
+      var data = await api('/scheduler/harvest' + qs);
+      var items = data.items || [];
+      $('harvestCount').textContent = '共 ' + items.length + ' 条（用户点踩自动采集）';
+      if (!items.length) {
+        $('harvestTbody').innerHTML = '<tr><td colspan="6" class="empty">暂无失败案例——用户在回答界面点"没用"后会出现在这里</td></tr>';
+        return;
+      }
+      $('harvestTbody').innerHTML = items.map(function (h) {
+        var ops = '';
+        if (h.status === 'pending') {
+          ops += '<button class="btn btn-sm btn-primary" data-hact="draft" data-id="' + h.id + '">转正草稿</button>';
+          ops += '<button class="btn btn-sm btn-danger" data-hact="discard" data-id="' + h.id + '">弃用</button>';
+        } else if (h.status === 'promoted') {
+          ops += '<span class="tag tag-low">case#' + h.promoted_case_id + '</span>';
+        }
+        var q = h.question || '';
+        var a = h.answer || '';
+        var cm = h.comment ? '<div class="dom-ex"><b>用户说：</b>' + esc(h.comment) + '</div>' : '';
+        return '<tr>' +
+          '<td>' + h.id + '</td>' +
+          '<td>' + esc(q.length > 60 ? q.slice(0, 60) + '…' : q) + '</td>' +
+          '<td>' + esc(a.length > 60 ? a.slice(0, 60) + '…' : a) + cm + '</td>' +
+          '<td><span class="tag tag-mid">' + esc(h.signal_type) + '</span></td>' +
+          '<td>' + statusTag(h.status) + '</td>' +
+          '<td><div class="op">' + ops + '</div></td></tr>';
+      }).join('');
+      Array.prototype.forEach.call(document.querySelectorAll('#harvestTbody button[data-hact]'), function (b) {
+        b.addEventListener('click', onHarvestAction);
+      });
+    } catch (e) {
+      $('harvestTbody').innerHTML = '<tr><td colspan="6" class="empty">加载失败：' + esc(e.message) + '</td></tr>';
+    }
+  }
+
+  function onHarvestAction(ev) {
+    var b = ev.currentTarget;
+    var id = b.getAttribute('data-id');
+    var act = b.getAttribute('data-hact');
+    var reviewer = $('reviewerId').value || 'admin';
+    if (act === 'discard') {
+      if (!confirm('确认弃用案例 #' + id + '？')) return;
+      api('/scheduler/harvest/' + id + '/discard', { method: 'POST', body: JSON.stringify({ user_id: reviewer }) })
+        .then(function (r) { toast('已弃用', 'ok'); loadHarvest(); })
+        .catch(function (e) { toast('操作失败：' + e.message, 'err'); });
+    } else if (act === 'draft') {
+      openDraft(id);
+    }
+  }
+
+  async function openDraft(id) {
+    $('draftTitle').textContent = '转正草稿 · 案例 #' + id;
+    $('draftMask').classList.add('show');
+    $('draftBody').innerHTML = '<span class="empty">正在请 LLM 预填期望值草稿…</span>';
+    var reviewer = $('reviewerId').value || 'admin';
+    try {
+      var data = await api('/scheduler/harvest/' + id + '/draft', { method: 'POST', body: JSON.stringify({ user_id: reviewer }) });
+      if (!data.ok) { $('draftBody').innerHTML = '<span class="empty">草稿生成失败：' + esc(data.reason) + '</span>'; return; }
+      renderDraftForm(id, data.draft);
+    } catch (e) {
+      $('draftBody').innerHTML = '<span class="empty">草稿生成失败：' + esc(e.message) + '</span>';
+    }
+  }
+
+  function renderDraftForm(id, d) {
+    var agents = (d.expected_agents || []).join(', ');
+    $('draftBody').innerHTML =
+      '<div class="res">' +
+      '<div class="res-body">这是 LLM 预填的草稿，请开发人员核对修正后确认转正。修正后可编辑：</div>' +
+      '<div style="margin:12px 0 4px;font-size:12.5px;color:var(--ink-3);">维度 category</div>' +
+      '<input id="dCat" value="' + esc(d.category || '') + '" style="width:100%;border:1px solid var(--line);border-radius:7px;padding:8px 10px;font-size:13px;margin-bottom:10px;">' +
+      '<div style="font-size:12.5px;color:var(--ink-3);">期望 Agent（逗号分隔）</div>' +
+      '<input id="dAgents" value="' + esc(agents) + '" style="width:100%;border:1px solid var(--line);border-radius:7px;padding:8px 10px;font-size:13px;margin-bottom:10px;">' +
+      '<div style="font-size:12.5px;color:var(--ink-3);">期望 SQL 模式</div>' +
+      '<input id="dSql" value="' + esc(d.expected_sql_pattern || '') + '" style="width:100%;border:1px solid var(--line);border-radius:7px;padding:8px 10px;font-size:13px;margin-bottom:10px;">' +
+      '<div style="font-size:12.5px;color:var(--ink-3);">期望答案关键词</div>' +
+      '<textarea id="dKey" style="width:100%;min-height:54px;border:1px solid var(--line);border-radius:7px;padding:8px 10px;font-size:13px;margin-bottom:12px;">' + esc(d.expected_answer_key || '') + '</textarea>' +
+      '<div class="res-actions">' +
+      '<button class="btn btn-primary" id="btnPromote">确认转正</button>' +
+      '<button class="btn btn-ghost" id="btnDraftCancel">取消</button></div></div>';
+    $('btnPromote').addEventListener('click', function () {
+      var expected = {
+        category: $('dCat').value.trim() || 'online',
+        expected_agents: $('dAgents').value.split(',').map(function (s) { return s.trim(); }).filter(Boolean),
+        expected_sql_pattern: $('dSql').value.trim() || '-',
+        expected_answer_key: $('dKey').value.trim()
+      };
+      api('/scheduler/harvest/' + id + '/promote', {
+        method: 'POST',
+        body: JSON.stringify({ user_id: $('reviewerId').value || 'admin', expected: expected })
+      }).then(function (r) {
+        if (r.ok) {
+          toast('已转正为用例 #' + r.case_id + '，将进入回归', 'ok');
+          $('draftMask').classList.remove('show');
+          loadHarvest(); loadJobs();
+        } else { toast('转正失败：' + (r.reason || ''), 'err'); }
+      }).catch(function (e) { toast('转正失败：' + e.message, 'err'); });
+    });
+    $('btnDraftCancel').addEventListener('click', function () { $('draftMask').classList.remove('show'); });
+  }
+
+  $('draftClose').addEventListener('click', function () { $('draftMask').classList.remove('show'); });
+  $('draftMask').addEventListener('click', function (e) { if (e.target === $('draftMask')) $('draftMask').classList.remove('show'); });
+  $('btnHarvestRefresh').addEventListener('click', function () { loadHarvest(); });
+  $('filterHarvest').addEventListener('change', function () { loadHarvest(); });
+
+  // ---------- 启动 ----------
+  loadDomains();
+  loadJobs();
+  loadHarvest();
+})();
+</script>
+</body>
+</html>
