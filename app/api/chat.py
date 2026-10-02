@@ -50,6 +50,22 @@ class ResumeRequest(BaseModel):
     feedback: Optional[str] = Field(None, description='action="revise" 时必填：用户纠正意见')
 
 
+class FeedbackRequest(BaseModel):
+    """回答反馈请求体（用户点踩回流，开发日志考点六十六）。"""
+    thread_id: str = Field(..., description="会话 ID")
+    user_id: str = Field("default", description="用户 ID")
+    rating: str = Field(..., description='"up"=有用 / "down"=没用（down 触发失败案例采集）')
+    question: Optional[str] = Field(None, description="原始问题（点踩时用于入库/去重）")
+    answer: Optional[str] = Field(None, description="回答快照（点踩时入库，脱敏后）")
+    comment: Optional[str] = Field(None, description="用户点踩时填的'哪里不对'")
+
+
+class FeedbackResponse(BaseModel):
+    ok: bool
+    reason: Optional[str] = None
+    harvest_id: Optional[int] = None
+
+
 class ChatResponse(BaseModel):
     """聊天响应体。"""
     thread_id: str
@@ -231,3 +247,48 @@ def resume_chat(thread_id: str, body: ResumeRequest) -> ChatResponse:
         quality_check=response.quality_check,
     )
     return response
+
+
+@router.post("/feedback", response_model=FeedbackResponse)
+def feedback(body: FeedbackRequest) -> FeedbackResponse:
+    """回答反馈（用户点踩回流，考点六十六）。
+
+    rating="down"：把问题/回答（脱敏后）写入 evaluation_harvest 采集池，
+    由开发人员半自动转正为回归用例（quality_gate 防机器认为不行，
+    点踩是用户认为不行——后者才是评估体系该回归的信号）。
+    rating="up"：仅计数（满意度统计），不采集。
+    """
+    if body.rating not in ("up", "down"):
+        return FeedbackResponse(ok=False, reason="invalid_rating")
+
+    if body.rating == "up":
+        logger.info("api.chat.feedback.up", thread_id=body.thread_id, user_id=body.user_id)
+        return FeedbackResponse(ok=True)
+
+    # down：脱敏后落采集池（幂等去重：同人同题只采第一条）
+    from app.scheduler.harvest import harvest_downvote
+    from app.security.masking import mask_object
+
+    question = body.question or ""
+    answer = body.answer or ""
+    try:
+        q_masked, _ = mask_object(question)
+        a_masked, _ = mask_object(answer)
+    except Exception:
+        q_masked, a_masked = question, answer
+
+    result = harvest_downvote(
+        user_id=body.user_id,
+        thread_id=body.thread_id,
+        question=q_masked or "(未记录问题)",
+        answer=a_masked,
+        comment=body.comment,
+    )
+    if not result.get("ok"):
+        if result.get("reason") == "duplicate":
+            return FeedbackResponse(ok=False, reason="duplicate",
+                                    harvest_id=result.get("harvest_id"))
+        return FeedbackResponse(ok=False, reason=result.get("reason", "harvest_failed"))
+    logger.info("api.chat.feedback.down", thread_id=body.thread_id,
+                harvest_id=result["harvest_id"])
+    return FeedbackResponse(ok=True, harvest_id=result["harvest_id"])
