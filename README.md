@@ -2,7 +2,8 @@
 
 面向甜秘密（SweetNight、Novilla、Avenco 等品牌）的企业级跨境电商运营智能决策系统。
 
-
+# 任务：
+corn 定时任务，， 项目上线怎么部署，docker沙箱隔离，利用skill节省token 
 
 
 * 核心技术：Python + LangGraph + LangChain + DeepSeek / OpenAI + PostgreSQL + PGVector + Docker

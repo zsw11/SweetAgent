@@ -74,6 +74,12 @@ def get_operation_tools() -> list[dict[str, Any]]:
             "只读执行单条 SELECT（agent_reader 角色 + statement_timeout），返回 {columns, rows, row_count}。",
             ReadOnlyExecutor().execute,
         ),
+        # 预留：模板 SQL 通道（考点五十八/五十九，未实现）——
+        # 分层混合路由：模板兜高频固定口径（零成本）→ LLM 兜开放问答 → 成功 SQL 回流模板。
+        # 将来如需把模板命中暴露给 LLM 可在此注册，例如：
+        #   _tool("match_sql_template", "按任务匹配预置 SQL 模板，命中返回参数化 SQL。", match_template)
+        # 注意：模板路由由 BaseDepartmentAgent._try_template 在 _query_one 前置调用，
+        # 命中直出 observations、miss 走 generate_sql——不依赖本注册表即可工作。
     ]
 
 

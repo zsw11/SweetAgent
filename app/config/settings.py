@@ -79,6 +79,15 @@ class Settings(BaseSettings):
     RAG_RERANK_W_HIT: float = 0.2            # 重排权重：关键词命中词数（0~1 归一）
     RAG_RERANK_MULTI_ROUTE_BONUS: float = 0.05  # 多路命中加分（同一 chunk 被多路召回 = 更可信）
 
+    # ---------- 模板 SQL 路由（预留通道，考点五十八/五十九，未实现） ----------
+    # 分层混合路由：模板兜高频固定口径（零成本、确定性）→ LLM 兜开放问答 →
+    # 成功 SQL 固化回流模板库形成正循环；两条通道共用同一道安全闸
+    # （sqlglot 校验 + 数据域白名单 + 只读执行器）。
+    # 开关默认关闭：False 时 _query_one 行为与现在完全一致，仅多一次开关判断。
+    SQL_TEMPLATE_ROUTER_ENABLED: bool = False        # 总开关：开启后 _query_one 先做模板命中判定
+    SQL_TEMPLATE_CONFIDENCE_THRESHOLD: float = 0.8   # 路由置信度阈值：命中且置信 ≥ 阈值才走模板通道
+    SQL_TEMPLATE_MAX_MATCHES: int = 3                # 模板匹配候选数（召回候选后取最高置信度）
+
     # ---------- Agent 运行限制（设计文档 42 节） ----------
     MAX_AGENT_ITERATIONS: int = 10
     MAX_SQL_RETRIES: int = 3

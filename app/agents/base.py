@@ -244,6 +244,23 @@ class BaseDepartmentAgent:
         sub_task = f"{task}（本次查询关注：{req}）"
         return self.tools["generate_sql"](sub_task, context, model=self.model)
 
+    # ------------------------------------------------------------------
+    # 预留：模板 SQL 通道（考点五十八/五十九，未实现）
+    # ------------------------------------------------------------------
+    def _try_template(self, req: str, task: str, context: dict[str, Any]) -> Optional[dict[str, Any]]:
+        """预留：模板 SQL 路由判定与执行（当前恒返回 None）。
+
+        将来实现（app/tools/sql/template_router.py）：
+            1. match = match_template(f"{task}（本次查询关注：{req}）")  # 路由判定，未命中返回 None
+            2. 命中 → 参数填充后的 SQL 仍走统一安全闸
+               （validate_and_bind_limit + 数据域白名单 + 只读执行器，与 LLM 链路同一套）
+            3. 返回与 _query_one 同构的 observations；未命中返回 None 继续走 LLM 生成链
+        """
+        if not settings.SQL_TEMPLATE_ROUTER_ENABLED:
+            return None
+        # TODO(模板路由): 接入 app/tools/sql/template_router.match_template，实现后删掉下一行
+        return None
+
     def _query_one(self, req: str, task: str, context: dict[str, Any]) -> dict[str, Any]:
         """执行一个数据需求：生成 SQL -> 校验 -> 执行；失败/空结果自动 repair。
 
@@ -254,6 +271,14 @@ class BaseDepartmentAgent:
             return self._query_knowledge(task)
         if req == "tracking":
             return self._query_tracking(task)
+        # ---- 预留：模板 SQL 通道（考点五十八/五十九，未实现）----
+        # 分层混合路由：模板兜高频固定口径（零成本）→ LLM 兜开放问答 →
+        # 成功 SQL 固化回流模板库形成正循环；两条通道共用同一道安全闸。
+        # 命中模板时直接返回与 SQL 查询同构的 observations；未命中继续走 LLM 生成链。
+        # 当前 _try_template 恒返回 None（开关默认关闭），行为与旧版完全一致。
+        matched = self._try_template(req, task, context)
+        if matched is not None:
+            return matched
         schema_ctx = self._build_schema_context(req, context)
         sql = self._generate_sql(req, task, schema_ctx)
         logger.debug(f"{self.AGENT_NAME}.query.sql", requirement=req, sql=sql)
@@ -271,6 +296,9 @@ class BaseDepartmentAgent:
                         model=self.model,
                     )
                     continue
+                # TODO(模板路由): 回流固化预留点——LLM 成功跑通的 SQL 可在此时
+                # 交给 template_router.solidify_sql() 做"可固化判定 + 去参数化"，
+                # 通过后入模板库形成正循环（默认不启用，见考点五十八/五十九）。
                 return {
                     "requirement": req,
                     "columns": result.get("columns", []),
