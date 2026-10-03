@@ -2208,7 +2208,8 @@ class GlobalState(TypedDict, total=False):
 - **频率上限防滥用**：用户口述"每秒钟"是恶意或手误，必须规则层拦截而不是信任 LLM
 - **持久化 + 重启恢复**：APScheduler 内存任务重启即失，scheduler_jobs 表是唯一权威源，启动时重放注册
 - **与预置模板的关系**：预置 4 个固定任务 = 模板 + 默认调度；用户口述创建 = 同一模板 + 自定义调度/参数实例——两层结构，一套执行器
-**与 sweetAgent 的映射**：解析复用 pp/llm/structured.py::invoke_structured（OPT-04/05 原生结构化通道）；模板白名单放 pp/scheduler/registry.py；时间解析器为纯函数（可单测）；执行器复用现有 un_question / 只读 SQL 链路；管理 API 挂 FastAPI。
+**与 sweetAgent 的映射**：解析复用 pp/llm/structured.py::invoke_structured（OPT-04/05 原生结构化通道）；模板白名单放 pp/scheduler/registry.py；时间解析器为纯函数（可单测）；执行器复用现有 
+un_question / 只读 SQL 链路；管理 API 挂 FastAPI。
 **核心一句话**：NL2Cron 的正确姿势是"模板白名单 + 参数填充"——LLM 把口语解析成 {模板, 时间, 参数}，确定性校验闸（模板白名单/频率上限/枚举参数）锁安全边界，持久化到 scheduler_jobs 重启恢复；LLM 只做意图解析不做任务发明，与 SQL 模板通道同一安全哲学。
 ### 考点六十四补：NL2Cron 能力域模板 + 三档置信兜底 + 审核（2026-10-02 补充，已确认设计）
 
@@ -2262,7 +2263,9 @@ class GlobalState(TypedDict, total=False):
 4. 反馈条的问题自动取该回答前最近一条用户消息（历史会话无 question 字段）
 **验证**：后端 TestClient（threads 列表/messages 回读/空用户/清理）全过；AppTest 三连——页面渲染、预置消息流后 👍/👎 出现、点 👎 后"提交 👎 反馈"按钮+评论框出现（状态机生效）。
 **核心一句话**：Streamlit 里"点击后展开"不能靠嵌套按钮（rerun 后条件失效），要靠 session_state 标志位在按钮外渲染——这也是聊天窗口历史回读依赖"存储层已有 + 补读 API"的典型增量改造。
-**2026-10-02 补充（三处收尾修复）**：① 重构时 ender_answer_card 签名漏了 ase 参数但函数体调用 ender_feedback_bar(base,...) → 展开"查看完整决策报告"即 NameError（用户实测截图发现）——补上 ase 形参；② 聊天窗口视觉优化：注入 CSS 让用户消息右对齐蓝气泡、助手左对齐浅灰气泡（Streamlit 默认 chat_message 样式不明显）；③ 侧边栏新增管理台入口 st.link_button("📋 定时任务管理台（含失败案例池）", {base}/scheduler-ui)——聊天页(8501)与管理台(8000)是两个端口，此前无入口用户不知道去哪点转正。验证：AppTest 渲染带 detail 完整回答卡片无异常 + 管理台 link 存在。
+**2026-10-02 补充（三处收尾修复）**：① 重构时 
+ender_answer_card 签名漏了 ase 参数但函数体调用 
+ender_feedback_bar(base,...) → 展开"查看完整决策报告"即 NameError（用户实测截图发现）——补上 ase 形参；② 聊天窗口视觉优化：注入 CSS 让用户消息右对齐蓝气泡、助手左对齐浅灰气泡（Streamlit 默认 chat_message 样式不明显）；③ 侧边栏新增管理台入口 st.link_button("📋 定时任务管理台（含失败案例池）", {base}/scheduler-ui)——聊天页(8501)与管理台(8000)是两个端口，此前无入口用户不知道去哪点转正。验证：AppTest 渲染带 detail 完整回答卡片无异常 + 管理台 link 存在。
 ### 考点六十八：多轮历史承接修复 + 无部门问题聊天直答（2026-10-02，已实现）
 
 **面试官怎么问**：① 用户问"上个问题是什么"却答"会话历史为空"，为什么？② 不涉及任何部门数据的问题（闲聊/元问题），Multi-Agent 系统该怎么处理？
@@ -2359,3 +2362,117 @@ WHERE job_id = :job_id AND lock_token = :token AND expires_at > now();
 | 续期失败容忍 | 误停风险高（宁可漏跑） | 双实例并发风险高 |
 **当前不加续期的合理性**：无续期方案成立的前提是"TTL > 任务最长执行时间"——当前业务任务（规则 SQL、单次查询）都远小于 120s，TTL 能全覆盖，所以不加也对；引入续期的判据 = 出现执行时间接近/超过 TTL 的任务（LLM 链式调用、多部门 Agent 编排、外部 API），届时再上"短 TTL + 高频心跳"。
 **核心一句话**：过期与续期不是二选一，而是"活着续、死了过期"的同一机制；真正取舍的是 TTL / 心跳频率 / 恢复速度三个参数，无续期只适合"任务时长 < TTL"的场景。
+
+### 考点七十一：项目上线部署 + Docker 沙箱隔离（2026-10-03 方案讨论，待确认）
+
+**面试官怎么问**：你的 AI Multi-Agent 系统怎么上线？LLM 生成的 SQL / 代码执行，怎么防止它干坏事？
+**现状盘点**：
+- 应用未 Docker 化：docker-compose.yml 只编排 postgres（pgvector/pg16）+ 可选 redis；FastAPI(:8000 含内嵌 APScheduler)、webui.py(Streamlit :8501) 在宿主机直接跑
+- 已有安全基础：agent_reader 只读角色 + sqlglot 校验 + 表/列白名单 + statement_timeout + SQL 结果缓存；app/tools/python 只有 docstring（"受控沙箱中执行"），代码执行沙箱未实现
+**部署架构（单机 Docker Compose 生产编排，推荐起步形态）**：
+- 服务拆分：api（FastAPI+scheduler）、webui（Streamlit）、postgres、redis（可选）、sandbox-runner（代码执行沙箱）
+- 网络：compose 内部网络，仅暴露 80/443（前置 caddy/nginx 反代），8000/8501 不直接对外
+- 可靠：healthcheck + restart: unless-stopped + pg_data 卷 + alembic 迁移 + 定时 pg_dump 备份
+**沙箱隔离（两层，按威胁面分）**：
+1. **数据库层（已做 = 软沙箱）**：只读角色 + sqlglot + 白名单 + 超时——SQL 永远到不了写路径，数据库容器本身也是隔离边界
+2. **执行层（要补 = 硬沙箱）**：若允许 LLM 生成 Python 统计/计算代码 → 每请求起一次性 Docker 容器：--network none（禁外联，防数据外泄/挖矿/SSRF）、--memory/--cpus/--pids-limit 配额、--read-only 根文件系统、非 root 用户、timeout 超时强杀
+3. **网络层**：沙箱无网络 = 最重要的一条（有网络 = 数据可被偷走）
+**为什么不直接上 K8s**：单机 Compose 足够；K8s 是多实例/高可用/弹性才需要的复杂度，现阶段过度设计
+**待确认决策点**：① 部署环境（单机 VPS / 公司服务器 / 云主机）；② 沙箱范围（仅 SQL 现状够用？还是要执行 LLM 生成的 Python 代码 → 需建 sandbox-runner 服务）
+**核心一句话**：上线 = 应用容器化（Compose 多服务 + 反代 + 备份）+ 双层沙箱（DB 只读角色软隔离已就位，代码执行上一次性容器硬隔离——无网络 + 配额 + 超时强杀三件套）。
+
+**追问澄清（2026-10-03）：沙箱怎么理解？**
+**本质**：沙箱 = 把"不可信代码/输入"放进受限环境执行，限制它的**权限 / 资源 / 接触面 / 生命周期**——即使它想干坏事也干不成、干不坏、跑不远、不留痕。比喻：儿童沙坑——小孩（不可信代码）只能在坑里玩（执行），玩不出坑（隔离），沙子脏了倒掉换新（可销毁）。
+**四个隔离维度（所有沙箱的共同框架）**：
+1. **权限最小化**：只给完成正常任务所需的最小权限（只读 vs 读写）
+2. **资源限制**：内存 / CPU / 时间 / 进程数上限——失控也跑不爆
+3. **接触面隔离**：网络 / 文件系统 / 其他进程——被攻破也影响不到外部
+4. **可销毁回收**：用完即弃（一次性容器 / 临时节点），污染不残留
+**为什么 AI Agent 必须沙箱**：LLM 输出不可信——不能保证它生成的 SQL/代码"不会干坏事"，只能限制它的能力（与白名单同一哲学：代码定边界，LLM 定方向）。沙箱防的是"LLM 出错 / 提示注入 / 工具链漏洞"，不是外部黑客（那是反代 / 防火墙的事）。
+**项目两层映射**：SQL 软沙箱 = 只读角色（权限）+ sqlglot/白名单（校验）+ statement_timeout（资源）+ DB 容器（接触面）；代码硬沙箱 = 一次性 Docker 容器：--network none（接触面：无网络=数据出不去）+ 配额（资源）+ --read-only/非 root（权限）+ --rm + timeout（生命周期）。
+**层级谱系**：逻辑校验 → 最小权限角色 → 容器（Docker/gVisor）→ 微虚机（Firecracker）/VM——越往下隔离越强、成本越高；纵深防御是叠加不是二选一。
+**核心一句话**：沙箱的本质是"不信任内容、限制能力"——四个维度（权限/资源/接触面/生命周期）让不可信代码干不成坏事、干不坏系统、跑不远、不留痕。
+
+**追问澄清（2026-10-03）：沙箱隔离会影响 Agent 本身的功能吗？**
+**核心答案：正确设计的沙箱不影响功能**——沙箱遵循最小特权，按"步骤/边界"隔离，不是把整个系统关起来。把 Agent 流程拆成**可信区**（编排 / LLM 调用 / DB 写 / 记忆 / RAG）与**不可信区**（LLM 生成的 SQL / 代码执行），只隔离不可信区；可信区照常联网、照常读写。
+**区分两个对象**：Agent 编排进程（自己的可信代码）≠ 不可信内容（LLM 生成的 SQL/代码）。沙箱的对象是后者，不是前者——"LLM 调用要网络、DB 写要 app_user 角色"这些 Agent 必要能力都在可信区，不受影响。
+**三个会影响功能的坑及解法**：
+1. 只读角色/白名单挡住 Agent 需要的表或函数 → **能力白名单配全**（正常功能需要的表/操作显式加入），测试覆盖
+2. 无网络挡住"代码调外部 API" → 本来就该禁止：需要网络的功能走**能力路由**（可信工具通道：httpx 工具 / RAG 检索器），不让 LLM 生成的代码碰网络
+3. 内存/超时配额不够 → 按任务真实需求配置（512m 不够调 2g；超时按最长执行时间设），是配置问题不是架构问题
+**能力路由模式（AI Agent 安全架构标准做法）**：不可信代码环境 = "输入数据进来 → 本地计算 → 结果出去"，中间零外部接触（OpenAI Code Interpreter 同款）。需要网络 / 写库的功能全部由可信工具承接。
+**验证方法**：功能清单 × 沙箱限制对照表逐项检查，每项标"不影响 / 影响-配置项"，上线前跑全功能回归。
+**核心一句话**：沙箱只限制"不可信内容的超能力"，不限制"Agent 的必要能力"——系统拆可信区/不可信区按边界隔离，需要网络的功能走可信工具路由，功能零影响、安全最大化。
+
+**考点七十一补：最简单沙箱设计（2026-10-03，方案待确认）**
+**范围最小化**：只沙箱化 app/tools/python 的"LLM 生成代码执行"一个点；SQL 链路沿用已实现的软沙箱（只读角色 + 校验 + 白名单），不动。
+**架构最简**：不建独立 sandbox-runner 服务——api 容器挂宿主 docker.sock，用 docker-py 在 api 内直接起一次性容器。单模块 app/tools/python/executor.py + 单镜像。
+**数据流**：LLM 代码 + 输入数据 → JSON 打包走容器 stdin → 容器内 run.py 读 stdin、exec(code)（受限 globals 注入 pandas/numpy）→ 结果 JSON 写 stdout → 宿主 30s 超时强杀、输出截断（1MB）、解析返回 Agent。无卷挂载（--read-only + /tmp tmpfs），干净。
+**容器安全参数（最简三件套 + 强化）**：--network none（数据出不去）+ --memory 512m --cpus 1 --pids-limit 128（资源）+ --read-only --user nobody --cap-drop ALL --security-opt no-new-privileges（权限）+ --tmpfs /tmp:size=100m（唯一可写）+ --rm（用完即毁）+ timeout 30s（docker-py）。
+**并发控制**：信号量限制同时在跑的沙箱容器数（如 2），防资源耗尽。
+**权衡点（最简方案的代价）**：api 挂 docker.sock = 拿到 socket 者可起任意容器（接近宿主 root）；单机内部系统可接受，生产多租户时应改独立 sandbox-runner 服务（api 只经 HTTP 调它）；dind（docker-in-docker）是中间档——socket 不进 api，但多一个 daemon、更重。
+**工作量**：executor.py ~200 行 + sandbox-runner 镜像 Dockerfile ~10 行 + compose 加一个 service + 全功能回归。
+**核心一句话**：最简沙箱 = 一个模块 + 一个镜像 + docker.sock 透传——"代码和输入走 stdin、结果走 stdout、30s 强杀、用完即毁"的一次性容器，安全三件套（无网络/配额/权限收窄）一样不少；代价是 api 信任 docker socket，单机内部系统可接受。
+
+**追问澄清（2026-10-03）：docker run 那行是临时工吗？程序本身的运行容器是什么？**
+**角色辨析（四个东西别混）**：
+- `docker run --rm --network none ...` = **动作**（"盖屋+派工"的命令），不是人也不是屋——由 api 容器里的 executor.py 发出（拿 docker.sock 钥匙命令 Docker 引擎）
+- **沙箱容器** = 小黑屋（隔离环境），用一次拆一次（--rm）
+- **run.py**（预装在镜像里） = 临时工——真正干活的人：读 stdin 接纸条 → exec(code) 算 → 写 stdout 递纸条
+- **镜像**（python:3.12-slim + pandas/numpy） = 小黑屋的图纸/预制建材，反复用来盖同规格的屋
+**程序本身的容器（用户理解正确）**：是的，项目本身有长期运行的容器——api 容器（FastAPI + APScheduler + Agent 编排 = 主人家，一直住着，有网络、有 DB 写权限、持有 docker.sock 钥匙），外加 webui 容器。沙箱容器是主程序**临时召来**的，两者关系 = 主人家 vs 临时工小黑屋。
+**核心一句话**：docker run 是"盖屋派工"的动作，容器是小黑屋，run.py 是临时工，镜像是小屋图纸；Agent 本体住在长期运行的 api 容器里，小黑屋是它临时召来的、用完即拆。
+┌──────────────── api 容器（主人家）────────────────┐
+│  · 一直住着（restart unless-stopped，不关机）       │
+│  · 你的 Agent 本体：编排 / 调 LLM / 查库 / 调度     │
+│  · 有网络（要调 deepseek/openai）                  │
+│  · 有数据库权限（app_user 写记忆）                 │
+│  · 手里拿着 docker.sock 万能钥匙                   │
+└────────────────────────────────────────────────────┘
+                │ 临时有事：盖间小黑屋
+                ▼
+┌────────── 沙箱容器（临时工小黑屋，用一次拆一次）─────────┐
+│  · 只活几秒~几十秒（--rm 用完即毁）                    │
+│  · 只跑 LLM 生成的那段代码（run.py 执行）              │
+│  · 无网络 / 只读 / 非 root / 限额                     │
+│  · 够不着钥匙、碰不到主人家任何东西                    │
+└──────────────────────────────────────────────────────┘
+
+**追问澄清（2026-10-03）：docker-py 里的 client 是谁？**
+**本质**：client = docker-py（Python 的 Docker SDK）创建的**客户端对象**，是"遥控器/万能钥匙"的编程化身——通过它，Python 代码能指挥 Docker 引擎（dockerd，宿主机上长期运行的守护进程）盖屋/拆屋。创建方式 `docker.from_env()`：自动读环境变量（DOCKER_HOST，默认 unix:///var/run/docker.sock），连上引擎。
+**调用链**：executor.py → docker.from_env() 得到 client（钥匙）→ client.containers.run(...)（按遥控器"盖屋派工"）→ 经 unix socket → dockerd → 真正创建/销毁容器。
+**为什么走 unix socket 不是网络端口**：本机程序专用通道，只有能访问该 socket 文件的程序才有"钥匙"——这就是"拿到 socket ≈ 接近宿主 root"的由来（api 挂 docker.sock 的信任权衡）。
+**Java 类比（迁移）**：docker-py 的 client ≈ Java 的 docker-java 的 DockerClient；docker.from_env() ≈ DockerClientBuilder.getInstance().build()；client.containers.run(...) ≈ client.createContainerCmd(image).exec()。
+**核心一句话**：client 不是 Docker 引擎本身，是引擎的"遥控器"——executor 握着它（via docker.sock）指挥引擎干活；引擎（dockerd）才是真正盖屋拆屋的管家。
+
+### 考点七十二：sweetAgent token 节省优化清单（2026-10-03 讨论）
+
+**token 花在哪（一次典型问答的调用链）**：manager 规划 1 次 → 每部门：plan 1 次 + 每 req（SQL 生成 1 次，注入最多 6 张表 schema+全量 metrics+业务字典 + analyze 1 次，注入全量查询结果 + repair 0~2 次）→ decision 汇总 1 次。4 部门 × 3 req ≈ 12~20 次调用/问。**大头 = SQL 生成的 schema 注入 + analyze 的结果注入，其次是 repair 和 decision 汇总**。（构成比例为估算，未接计量）
+**已省的点（不用动）**：chat_mode 聊天直答（非业务问题不空转部门）✅；invoke_structured 结构化输出（防格式幻觉重试）✅；knowledge 走 RAG（embedding 便宜）✅；tracking 走 MCP ✅；SQL 结果缓存（表级失效索引）✅。
+**节省清单（按优先级）**：
+1. **启用模板 SQL 路由（最大头）**：设计稿就绪（考点五十八/五十九）、接口预留（_try_template + template_router.py + SQL_TEMPLATE_ROUTER_ENABLED），未实现。高频固定口径（日销/退款率/库存风险/毛利率）走模板 = 零 LLM token，省掉 SQL 生成+repair 全部调用；成功 SQL 固化回流模板库正循环。
+2. **prompt 瘦身（输入 token）**：① schema 按需裁剪——只注入 req 相关 1~2 张表，schema 只留列名+类型，metrics 按关键词过滤（SQL 生成省 50~70%）；② observations 裁剪——SQL 层先聚合（COUNT/SUM/GROUP BY），注入前截断每表 ≤50~100 行（大查询省 60~80%）；③ repair 用 small 模型 + 不重复注入全量 schema。
+3. **分析结论缓存**：SQL 缓存省的是 DB 不是 token；新增 task+observations 指纹 → 复用上次分析结论，复用现有表级失效索引（数据更新自动失效）。省 plan+SQL+analyze 全链路。
+4. **输出端限制**：findings/anomalies 条数上限（≤5）、summary 长度上限；结构化 schema 已控字段，补条数即可。
+5. **模型分级（当前无收益，未来有用）**：DeepSeek 三档全是 deepseek-chat，分级无差别；只有混合 provider（gpt-4o vs gpt-4o-mini、deepseek-chat vs reasoner）才有效——届时 plan/repair 用 small、复杂分析用 strong。
+6. **语义缓存（可选）**：相同语义问题（embedding 相似）命中缓存跳过整个链路；收益大但复杂度中高，适合高频重复提问场景。
+**关键提醒**：DeepSeek 单价低，真正成本 = 调用次数 × prompt 大小 的乘积——砍次数（模板路由）和砍大小（裁剪）是两条主路。
+**核心一句话**：token 大头在"SQL 生成的 schema 注入 + analyze 的结果注入"，最大省法是启用已设计未实现的模板 SQL 路由（零成本通道），其次是 schema/结果裁剪和分析缓存；模型分级在纯 DeepSeek 配置下无收益。
+
+**2026-10-03 补充**：完整分析已另存 `docs/token_optimization.md`（含消耗构成、优先级清单、Skill 化关系、落地路线图、验证方式）。**Skill 化 = 省 token 的终极形态**：把"每次让 LLM 现想"变成"调用现成确定性能力"（零 LLM token）——项目里模板 SQL 路由（SQL 生成 skill）、非 LLM 意图/参数匹配（路由 skill）、NL2Cron 能力域模板（任务创建 skill）都已走在 skill 化路上；系统预装 Skill 是给豆包工作流用的，项目内部要建的是"运行时的确定性能力层"，两者思路一致、形态不同。
+
+### 考点七十三：AI Agent 工具误调用怎么防？（2026-10-03 讨论）
+
+**问题定义**：工具误调用 = ①误选工具/数据域（该查 sales 却查 review）②参数错误（品牌/日期填错）③不该调用时调用（闲聊却查库、误触发外部 MCP 烧钱）④重复调用 ⑤危险调用。结合项目具体场景：部门数据域选择、SQL 生成参数、tracking MCP 外部调用（花钱）、NL2Cron 创建任务（有副作用）。
+**现有防线（盘点）**：KNOWN_REQS 数据域白名单 + _extract_plan 过滤 + FALLBACK_REQ 兜底 ✅；chat_mode 直答（非业务问题不触发部门）✅；sqlglot + 只读角色 + statement_timeout（危险 SQL 到不了写路径）✅；部门间数据域隔离 ✅；row_count==0 触发 repair ✅。
+**缺口**：工具选择仍靠 LLM（白名单只过滤不纠正）；SQL/工具参数无 schema/词典校验（NL2Cron 有"参数 Schema 校验"设计但工具层没有）；tracking MCP 无显式意图门控；误调用无专项回流。
+**防线方案（五层纵深，防误调用不能靠"提示 LLM 别调错"）**：
+1. **路由层（非 LLM 优先）**：embedding + 词典先判定数据域/工具（考点六十二/六十三设计），LLM 只做补充——从根上减少误选；工具选择从"LLM 自由选"改为"确定性路由 + LLM 补充"
+2. **参数层（Schema + 词典闸门）**：工具参数过 Pydantic schema（类型/枚举/必填）+ 品牌/市场/SKU 词典校验（复用 _load_dictionary）+ 日期窗口边界（结束>开始、窗口≤上限），失败拒绝或纠正重试——NL2Cron 已验证的模式推广到所有工具
+3. **门控层（高成本工具显式意图）**：tracking MCP 等外部/高成本工具，要求用户显式提及（单号/物流）才放行，否则降级；写操作/外部调用一律人工确认（human-in-the-loop）
+4. **结果层（合理性验证）**：空结果/异常大/类型不符 → repair 或拒绝；decision 层跨部门交叉验证一致性
+5. **反馈层（误调用回流）**：工具调用错误日志 + 用户点踩 → evaluation_harvest → 半自动转正 → eval_regression 回归，防同类误调用再犯（复用现有闭环）；加工具调用审计日志（agent/tool/args/结果摘要）
+**优先级**：①非 LLM 路由（从根减少）②参数闸门（拦错误）③外部工具门控（防烧钱）④回流（持续改进）⑤审计（可观测）
+**核心一句话**：防工具误调用 = 五层纵深：非 LLM 路由定方向、schema+词典闸门拦参数、显式意图门控高成本工具、结果验证+交叉检查兜底、误调用案例回流形成正循环——复用项目已有的白名单/chat_mode/点踩回流基础。
+
+**2026-10-03 补充（用户确认设计方向）**：完整方案已另存 `docs/tool_safety.md`。用户确认两个核心设计：**① 工具路由归档**——每个工具进 ToolSpec 注册表（部门白名单/数据域/触发条件/参数 schema/成本等级/门控），Agent 只能调注册表内工具；路由判定非 LLM 优先（embedding+词典召回候选 → 门控过滤 → LLM 只做受限选择+抽参），工具选择从"LLM 自由选"改为"确定性路由召回 + LLM 受限选择"；**② 参数结构化 + 校验**——Pydantic Schema + 词典（复用 _load_dictionary）+ 日期/数值边界三层闸门，失败拒绝或纠正重试、不放行（与 NL2Cron"宁可拒绝不可静默错跑"同一哲学）。五层纵深里执行层与点踩回流骨架已就位，主要补路由层/参数层/门控层。
