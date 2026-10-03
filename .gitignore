@@ -33,3 +33,18 @@ logs/
 tmp/
 dist/
 build/
+
+# ========== 敏感/不该入库的文件（2026-10-03 补充）==========
+# 探针/临时脚本（可能硬编码真实 API key）
+_probe_*.py
+_tmp_*.py
+scripts/_probe_*.py
+scripts/_test_*.py
+docs/_probe_*.txt
+
+# 数据库角色初始化（含明文密码，改用 .env 注入）
+db/00-roles.sql
+
+# 业务/测试数据（含真实品牌/SKU/市场，不入库）
+db/*.json
+db/test.sql
