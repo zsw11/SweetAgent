@@ -57,8 +57,13 @@ def ask(
     question: str,
     user_id: str = "default",
     human_in_the_loop: bool = False,
+    thread_id: str = "",
 ) -> dict[str, Any]:
     """调用 POST /chat，返回 (ok, elapsed, data|error)。
+
+    thread_id：多轮承接的关键——同一会话内传入已保存的 thread_id，
+    后端据此注入 conversation_context（历史摘要+最近轮次），
+    否则每次提问都生成新会话，历史问题就"看不到"了。
 
     human_in_the_loop=True 时，质量门自动回炉耗尽且答案仍不合格，
     后端返回 stage="awaiting_feedback"（候选答案 + issues），
@@ -66,15 +71,14 @@ def ask(
     """
     t0 = time.time()
     try:
-        r = requests.post(
-            f"{base}/chat",
-            json={
-                "question": question,
-                "user_id": user_id,
-                "human_in_the_loop": human_in_the_loop,
-            },
-            timeout=300,
-        )
+        payload: dict[str, Any] = {
+            "question": question,
+            "user_id": user_id,
+            "human_in_the_loop": human_in_the_loop,
+        }
+        if thread_id:
+            payload["thread_id"] = thread_id
+        r = requests.post(f"{base}/chat", json=payload, timeout=300)
         elapsed = round(time.time() - t0, 1)
         r.raise_for_status()
         return {"ok": True, "elapsed": elapsed, "data": r.json()}
@@ -159,6 +163,47 @@ def extract_memory(
         )
         r.raise_for_status()
         return {"ok": True, "data": r.json()}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def send_feedback(
+    base: str,
+    thread_id: str,
+    user_id: str,
+    rating: str,
+    question: str,
+    answer: str,
+    comment: str = "",
+) -> dict[str, Any]:
+    """POST /chat/feedback：用户点踩（rating=down）触发失败案例采集回流（考点六十六）。
+
+    rating=down 时，后端把问题/回答（脱敏）写入 evaluation_harvest 采集池，
+    开发人员可在管理台（/scheduler-ui 失败案例池）半自动转正为回归用例；
+    rating=up 仅做满意度计数，不采集。
+    """
+    try:
+        r = requests.post(
+            f"{base}/chat/feedback",
+            json={
+                "thread_id": thread_id,
+                "user_id": user_id,
+                "rating": rating,
+                "question": question,
+                "answer": answer,
+                "comment": comment,
+            },
+            timeout=30,
+        )
+        r.raise_for_status()
+        return {"ok": True, "data": r.json()}
+    except requests.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.response.json().get("detail", "")
+        except Exception:
+            pass
+        return {"ok": False, "error": f"HTTP {exc.response.status_code}: {detail}"}
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
 
@@ -342,10 +387,67 @@ def render_memory_panel(base: str, user_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 主页面
+# 主页面（豆包式聊天窗口：左侧会话列表 + 主区消息流）
 # ---------------------------------------------------------------------------
-def render_chat_result(resp: dict[str, Any], data: dict[str, Any], q: str, uid: str) -> None:
-    """渲染一次 /chat 完整结果（决策报告 / 各部门 / 路由），并记录本轮供"立即沉淀"。"""
+def _current_thread() -> str:
+    return st.session_state.get("thread_id") or ""
+
+
+def _append_msg(role: str, content: str, detail: Optional[dict[str, Any]] = None) -> None:
+    """往当前会话消息流追加一条（含可选完整响应 detail，用于历史重渲染详细报告）。"""
+    msgs = st.session_state.setdefault("messages", [])
+    msgs.append({"role": role, "content": content, "detail": detail})
+    st.session_state["messages"] = msgs
+
+
+def _compose_answer_text(data: dict[str, Any]) -> str:
+    """组装助手消息正文（聊天窗口主文案）：最终答案 + 决策摘要。"""
+    parts = [data.get("final_answer", "")]
+    decision = data.get("decision_result") or {}
+    if decision.get("summary"):
+        parts.append(f"**决策摘要**：{decision['summary']}")
+    return "\n\n".join(p for p in parts if p) or "（无回答）"
+
+
+def render_feedback_bar(base: str, uid: str, q: str, answer: str, seq: int) -> None:
+    """回答反馈（点踩回流，考点六十六）——状态机写法，避免 Streamlit 嵌套按钮 bug。
+
+    点「👎 没用」只置 session_state 标志并 rerun；评论框与提交按钮在标志位
+    为真时于同一层渲染，提交后才真正调 /chat/feedback（rating=down → 落采集池）。
+    """
+    fb_key = f"fb_{seq}"
+    st.caption("这个回答对你有帮助吗？")
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("👍 有用", key=f"{fb_key}_up"):
+            res = send_feedback(base, _current_thread(), uid, "up", q, answer)
+            if res["ok"]:
+                st.success("已记录 👍（用于满意度统计）")
+            else:
+                st.error(f"反馈失败：{res['error']}")
+    with c2:
+        if st.button("👎 没用", key=f"{fb_key}_down"):
+            st.session_state[f"{fb_key}_pending"] = True
+
+    if st.session_state.get(f"{fb_key}_pending"):
+        comment = st.text_input(
+            "哪里不对？（可选，帮助改进）",
+            key=f"{fb_key}_comment",
+            placeholder="例如：没给具体数字 / 数据看起来不对",
+        )
+        if st.button("提交 👎 反馈", key=f"{fb_key}_submit"):
+            res = send_feedback(base, _current_thread(), uid, "down", q, answer,
+                                comment.strip())
+            st.session_state.pop(f"{fb_key}_pending", None)
+            if res["ok"]:
+                st.warning("已采集 👎，开发人员可在【定时任务管理台 /scheduler-ui 失败案例池】处理转正")
+            else:
+                st.error(f"反馈失败：{res['error']}")
+
+
+def render_answer_card(base: str, resp: dict[str, Any], data: dict[str, Any], q: str,
+                       uid: str, seq: int) -> None:
+    """渲染一条完整回答（决策报告 / 各部门 / 路由）+ 反馈条。"""
     stage_zh = STAGE_LABELS.get(data["stage"], data["stage"])
     st.caption(
         f"耗时 {resp['elapsed']}s · 阶段：{stage_zh} · "
@@ -369,37 +471,85 @@ def render_chat_result(resp: dict[str, Any], data: dict[str, Any], q: str, uid: 
         st.write("**已完成任务**：", data.get("completed_tasks"))
         st.write("**跳过任务**：", data.get("skipped_tasks"))
 
-    # 记录本轮，供"立即沉淀"使用（/chat 内置钩子已自动尝试提取）
-    st.session_state["last"] = {
-        "thread_id": data["thread_id"],
-        "question": q,
-        "answer": " ".join(
-            filter(
-                None,
-                [
-                    data.get("final_answer", ""),
-                    str((data.get("decision_result") or {}).get("summary", "")),
-                ],
-            )
-        ),
-    }
+    st.divider()
+    render_feedback_bar(base, uid, q, data.get("final_answer", ""), seq)
+
     st.caption(
         "💡 记忆说明：/chat 后端已内置【对话后自动沉淀记忆】钩子（规则+历史阈值触发，"
         "零额外费用）；如未自动触发，可在左侧【记忆管理】点【立即沉淀本轮对话为记忆】。"
     )
 
 
-def _handle_resume_result(base: str, resp: dict[str, Any], q: str, uid: str) -> None:
-    """resume 返回后统一处理：成功则渲染结果；若再次暂停（re-revise 后仍不合格）则继续等待。"""
-    if not resp["ok"]:
-        st.error(f"恢复执行失败：{resp['error']}")
+def render_message_flow(base: str, uid: str) -> None:
+    """按消息流渲染当前会话全部消息（豆包式聊天窗口）。
+
+    用户消息 = 气泡；助手消息 = 答案卡片（有完整 detail 时展开详细报告，
+    历史会话回读只有文本内容则只显示正文）。
+    反馈条的问题取该回答之前最近一条用户消息（历史会话无 question 字段时）。
+    """
+    msgs: list[dict[str, Any]] = st.session_state.get("messages") or []
+    last_question = ""
+    for i, m in enumerate(msgs):
+        if m["role"] == "user":
+            last_question = m["content"]
+            with st.chat_message("user"):
+                st.write(m["content"])
+        else:
+            q = m.get("question") or last_question
+            with st.chat_message("assistant"):
+                st.markdown(m["content"])
+                detail = m.get("detail")
+                if detail:
+                    resp, data = detail.get("resp"), detail.get("data")
+                    if resp and data:
+                        with st.expander("查看完整决策报告（详情）", expanded=False):
+                            render_answer_card(base, resp, data, q, uid, i)
+                else:
+                    # 历史会话回读：无完整响应，仅展示文本 + 反馈条
+                    st.divider()
+                    render_feedback_bar(base, uid, q, m["content"], i)
+
+
+def render_thread_list(base: str, uid: str) -> None:
+    """左侧会话列表（新会话 + 历史切换）。"""
+    st.sidebar.markdown("### 💬 会话")
+    if st.sidebar.button("➕ 新会话", use_container_width=True, key="new_thread"):
+        st.session_state["thread_id"] = None
+        st.session_state["messages"] = []
+        st.session_state.pop("last", None)
+        st.rerun()
+
+    try:
+        r = requests.get(f"{base}/chat/threads", params={"user_id": uid}, timeout=10)
+        r.raise_for_status()
+        threads = r.json().get("items") or []
+    except Exception as exc:
+        st.sidebar.caption(f"会话列表加载失败：{exc}")
         return
-    data = resp["data"]
-    if data.get("stage") == "awaiting_feedback":
-        render_quality_pending(base, data, uid, q)
-    else:
-        st.success("✅ 已按你的意见恢复执行完成")
-        render_chat_result(resp, data, q, uid)
+
+    if not threads:
+        st.sidebar.caption("暂无历史会话")
+        return
+
+    cur = _current_thread()
+    for t in threads:
+        label = f"{t['last_question'] or '（空）'}\n{t['message_count']} 条"
+        if st.sidebar.button(label, key=f"thr_{t['thread_id']}",
+                             use_container_width=True):
+            try:
+                r = requests.get(f"{base}/chat/{t['thread_id']}/messages", timeout=10)
+                r.raise_for_status()
+                raw = r.json().get("messages") or []
+            except Exception as exc:
+                st.sidebar.error(f"读取会话失败：{exc}")
+                continue
+            st.session_state["thread_id"] = t["thread_id"]
+            st.session_state["messages"] = [
+                {"role": m["role"], "content": m["content"], "detail": None}
+                for m in raw
+            ]
+            st.session_state.pop("last", None)
+            st.rerun()
 
 
 def render_quality_pending(base: str, data: dict[str, Any], uid: str, q: str) -> None:
@@ -440,8 +590,51 @@ def render_quality_pending(base: str, data: dict[str, Any], uid: str, q: str) ->
                 _handle_resume_result(base, resp, q, uid)
 
 
+def _handle_resume_result(base: str, resp: dict[str, Any], q: str, uid: str) -> None:
+    """resume 返回后统一处理：成功则渲染结果；若再次暂停（re-revise 后仍不合格）则继续等待。"""
+    if not resp["ok"]:
+        st.error(f"恢复执行失败：{resp['error']}")
+        return
+    data = resp["data"]
+    if data.get("stage") == "awaiting_feedback":
+        render_quality_pending(base, data, uid, q)
+    else:
+        st.success("✅ 已按你的意见恢复执行完成")
+        _append_msg("assistant", _compose_answer_text(data),
+                    detail={"resp": resp, "data": data})
+        st.session_state["thread_id"] = data["thread_id"]
+        st.session_state["last"] = {
+            "thread_id": data["thread_id"],
+            "question": q,
+            "answer": _compose_answer_text(data),
+        }
+        st.rerun()
+
+
 def main() -> None:
     st.set_page_config(page_title="SweetNight Agent 工作台", layout="wide")
+    # 聊天窗口样式：用户消息右对齐蓝气泡、助手左对齐浅灰气泡、圆角+头像
+    st.markdown(
+        """
+        <style>
+        .stChatMessage { display: flex; margin-bottom: 12px; }
+        [data-testid="stChatMessage"] { border-radius: 12px; }
+        [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatar"] svg[data-testid="chatAvatarIcon-user"]) {
+            flex-direction: row-reverse;
+        }
+        [data-testid="stChatMessageAvatar"] { margin: 4px 10px 0 0; }
+        [data-testid="stChatMessageContent"] p { margin: 0; line-height: 1.55; }
+        .stChatMessageContent { border-radius: 12px; padding: 10px 14px; }
+        [data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-user"]) [data-testid="stChatMessageContent"] {
+            background: #1c7ed6; color: #fff; border-radius: 14px 4px 14px 14px;
+        }
+        [data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-assistant"]) [data-testid="stChatMessageContent"] {
+            background: #f1f3f5; color: #1a1a1a; border-radius: 4px 14px 14px 14px;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
     st.title("SweetNight 跨境电商 AI Agent 工作台")
     st.caption(
         "Manager 规划 → 部门 Agent 分析（Operation/Finance/Logistics/Product）→ Decision 决策汇总"
@@ -464,8 +657,21 @@ def main() -> None:
         st.sidebar.error(f"后端未连接：{health['error']}")
         st.sidebar.caption("请先启动后端：.venv\\Scripts\\uvicorn app.main:app --port 8000")
 
+    # 管理台入口（定时任务管理台 / 失败案例池 / 半自动转正）
+    st.sidebar.markdown("### ⏰ 管理台")
+    admin_base = base
+    st.sidebar.link_button("📋 定时任务管理台（含失败案例池）",
+                           f"{admin_base}/scheduler-ui", use_container_width=True)
+    st.sidebar.caption("任务审核 · 失败案例池 · 半自动转正 都在这里")
+
+    # 左侧会话列表（新会话 + 历史切换）
+    render_thread_list(base, uid)
     render_memory_panel(base, uid)
 
+    # 主区：豆包式消息流（历史 + 当前会话）
+    render_message_flow(base, uid)
+
+    # 提问区
     with st.form("ask_form"):
         question = st.text_area(
             "你的问题",
@@ -479,16 +685,35 @@ def main() -> None:
         if not q:
             st.warning("请输入问题。")
         else:
+            # 先落用户消息，再真实调用（失败也保留问题气泡）
+            _append_msg("user", q)
             with st.spinner("Agent 执行中（真实调用多部门 LLM，预计 10~60 秒）..."):
-                resp = ask(base, q, uid, human_in_the_loop=hilt)
+                resp = ask(base, q, uid, human_in_the_loop=hilt,
+                           thread_id=_current_thread())
             if not resp["ok"]:
-                st.error(f"执行失败：{resp['error']}")
+                _append_msg("assistant", f"⚠️ 执行失败：{resp['error']}")
+                st.rerun()
             else:
                 data = resp["data"]
+                st.session_state["thread_id"] = data["thread_id"]
                 if data.get("stage") == "awaiting_feedback":
+                    # 质量门暂停：渲染候选答案 + 审批面板，等待用户 approve/revise
+                    # （不 rerun，否则面板会被刷新掉；用户操作走 resume 端点）
+                    _append_msg(
+                        "assistant",
+                        "⚠️ 质量门：答案经自动回炉仍不合格，已暂停等待你确认或纠正（见下方面板）。",
+                        detail={"resp": resp, "data": data},
+                    )
                     render_quality_pending(base, data, uid, q)
                 else:
-                    render_chat_result(resp, data, q, uid)
+                    _append_msg("assistant", _compose_answer_text(data),
+                                detail={"resp": resp, "data": data})
+                    st.session_state["last"] = {
+                        "thread_id": data["thread_id"],
+                        "question": q,
+                        "answer": _compose_answer_text(data),
+                    }
+                    st.rerun()
 
 
 if __name__ == "__main__":

@@ -158,6 +158,43 @@ def get_messages(thread_id: str) -> list[dict[str, Any]]:
     ]
 
 
+def list_threads(user_id: str, limit: int = 50) -> list[dict[str, Any]]:
+    """按用户列出会话（thread_id / 最新问题 / 消息数 / 最后活跃时间），最后活跃倒序。
+
+    供"聊天窗口左侧会话列表"使用（豆包式历史会话切换）；无会话返回空列表。
+    """
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT t.thread_id, t.last_question, t.msg_count, t.last_at
+            FROM (
+                SELECT c1.thread_id,
+                       COUNT(*)                                AS msg_count,
+                       MAX(c1.created_at)                      AS last_at,
+                       (SELECT c2.content FROM conversation_messages c2
+                         WHERE c2.thread_id = c1.thread_id
+                           AND c2.role = 'user'
+                         ORDER BY c2.seq DESC LIMIT 1)         AS last_question
+                FROM conversation_messages c1
+                WHERE c1.user_id = %s
+                GROUP BY c1.thread_id
+            ) t
+            ORDER BY t.last_at DESC
+            LIMIT %s
+            """,
+            (user_id, limit),
+        ).fetchall()
+    return [
+        {
+            "thread_id": r[0],
+            "last_question": r[1],
+            "message_count": r[2],
+            "last_active_at": r[3].isoformat() if r[3] else None,
+        }
+        for r in rows
+    ]
+
+
 def history_token_count(thread_id: str) -> int:
     """会话当前总 token（全部消息求和；压缩后旧消息已移除，summary 计入）。"""
     with connect() as conn:

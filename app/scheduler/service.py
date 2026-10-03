@@ -287,6 +287,7 @@ def _execute_wrapper(job_id: int) -> None:
 
         start = time.perf_counter()
         try:
+            # 执行定时任务，@retry注解有重试机制
             result = _run_with_retry(job_id, domain_key, params)
             duration_ms = int((time.perf_counter() - start) * 1000)
             ok = bool(result.get("ok"))

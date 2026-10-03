@@ -62,6 +62,13 @@ DECISION_PROMPT = """请基于以下信息回答用户问题并输出结构化�
 各部门结果（JSON）：
 {department_results_json}
 
+聊天直答模式：{chat_mode}
+- 值为 true 时：用户问题**不涉及任何部门数据**（闲聊 / 元问题 / 业务外问题），各部门结果为 {{}} 或为空。
+  此时不要套用"部门分析/交叉验证/根因/建议"框架，直接以对话口吻自然回答用户问题即可：
+  summary = 直接回答；findings / root_causes / recommendations / risks 返回空数组；
+  confidence 反映回答所需证据充分性（有记忆/历史依据可 0.7+，纯寒暄可 0.3~0.5）。
+- 值为 false 时：按下方"要求"执行正常商业决策分析。
+
 要求：
 1. 仔细阅读每个部门的 summary、metrics、anomalies、evidence；
 2. 跨部门交叉验证：运营的销量变化与财务的收入/利润变化是否一致？物流的库存风险是否解释了运营的缺货？

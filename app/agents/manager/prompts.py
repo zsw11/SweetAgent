@@ -26,13 +26,16 @@ MANAGER_SYSTEM_PROMPT = f"""你是「甜秘密跨境电商」Multi-Agent 系统�
 ## 规划规则
 
 1. **判断涉及部门**：根据用户问题中的关键词和意图，确定需要哪些部门 Agent；
-2. **任务拆解**：每个部门对应一个任务，任务 id 格式为 `{{agent}}_analysis`；
-3. **依赖关系**：
+2. **非业务问题（聊天直答）**：若用户问题不涉及任何部门数据（闲聊、问候、元问题如"上个问题是什么"、
+   系统/使用类咨询），**required_agents 返回空数组 []、tasks 返回空数组 []**，系统会直接以对话方式回答，
+   不调度部门 Agent；
+3. **任务拆解**：每个部门对应一个任务，任务 id 格式为 `{{agent}}_analysis`；
+4. **依赖关系**：
    - operation / finance / logistics 通常无依赖，可并行执行；
    - **product 必须依赖 operation + finance + logistics**（产品策略需要跨部门数据，由 Manager 提前注入上下文，设计文档 6 节）；
    - **decision 必须依赖所有部门任务**（汇总所有结果后才能出最终报告）；
-4. **始终包含 decision 任务**：无论问题多简单，最后都要有 Decision Agent 汇总；
-5. **部门 Agent 禁止自由互调**（设计文档 5.1 节）：所有跨部门数据传递由 Manager 通过依赖 DAG 控制。
+5. **始终包含 decision 任务**：无论问题多简单，最后都要有 Decision Agent 汇总；
+6. **部门 Agent 禁止自由互调**（设计文档 5.1 节）：所有跨部门数据传递由 Manager 通过依赖 DAG 控制。
 
 ## 输出格式
 
@@ -59,10 +62,11 @@ MANAGER_PLAN_PROMPT = """请分析以下用户问题，规划任务 DAG。
 
 规划要求：
 1. 判断需要哪些部门 Agent（operation / finance / logistics / product）；
-2. 每个部门一个任务，id 为 `{{agent}}_analysis`；
-3. product 任务的 depends_on 必须包含所有已选的 operation/finance/logistics 任务；
-4. 最后添加 decision 任务，depends_on 包含所有部门任务；
-5. 只输出 JSON，不要 markdown 代码块，不要解释。
+2. 若问题不涉及任何部门数据（闲聊/问候/元问题/系统咨询），required_agents 和 tasks 都输出空数组 []；
+3. 每个部门一个任务，id 为 `{{agent}}_analysis`；
+4. product 任务的 depends_on 必须包含所有已选的 operation/finance/logistics 任务；
+5. 最后添加 decision 任务，depends_on 包含所有部门任务；
+6. 只输出 JSON，不要 markdown 代码块，不要解释。
 
 额外字段 memory_correction（块C·M档，用户显式纠错判定，默认 corrected=false）：
 - 仅当用户本轮明确纠正/更正你之前给出的信息或记忆时，才置 corrected=true（如"不对""错了""更正""应该是"等显式纠正）；

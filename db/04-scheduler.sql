@@ -15,6 +15,8 @@ SET search_path TO public;
 --         approved → active(调度中) / paused(暂停) / disabled(禁用)
 -- 任何变更写 scheduler_job_events 审计（见下）
 -- ============================================================
+select * from scheduler_run_logs;
+select * from scheduler_jobs;
 CREATE TABLE IF NOT EXISTS scheduler_jobs (
     id                BIGSERIAL PRIMARY KEY,               -- 任务ID
     user_id           BIGINT NOT NULL REFERENCES users(id),-- 创建者（权限归属）
@@ -81,6 +83,7 @@ CREATE TABLE IF NOT EXISTS scheduler_locks (
 --       + 人工确认）→ 插入 evaluation_cases（category='online'）
 --       → eval_regression 的 load_cases 自动带上（评估逻辑零改动）
 -- ============================================================
+select * from  evaluation_harvest;
 CREATE TABLE IF NOT EXISTS evaluation_harvest (
     id            BIGSERIAL PRIMARY KEY,              -- 采集ID
     user_id       BIGINT NOT NULL REFERENCES users(id), -- 点踩用户

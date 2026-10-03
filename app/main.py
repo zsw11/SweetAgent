@@ -1,5 +1,14 @@
 """FastAPI 应用入口。"""
 
+import sys
+from pathlib import Path
+
+# 脚本以 app/main.py 直接运行时，sys.path[0] 是 app/ 而非项目根，
+# 顶部任何 from app.xxx import 都会 ModuleNotFoundError——必须在首个 app.* import 前修正。
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -67,3 +76,19 @@ app.include_router(scheduler_ui_router)
 @app.get("/")
 def root() -> dict:
     return {"service": "sweetnight-agent", "docs": "/docs"}
+
+
+if __name__ == "__main__":
+    """直接运行入口（PyCharm Run app/main.py 亦可启动，等价 uvicorn app.main:app）。
+
+    --reload 仅开发期使用；生产由外部进程管理器（systemd/supervisor）拉起 uvicorn，
+    不经过本入口。
+    """
+    import uvicorn
+
+    uvicorn.run(
+        "app.main:app",
+        host="127.0.0.1",
+        port=8000,
+        reload=settings.APP_DEBUG,
+    )

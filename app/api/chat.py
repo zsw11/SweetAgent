@@ -12,7 +12,7 @@ from __future__ import annotations
 import uuid
 from typing import Any, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
@@ -292,3 +292,29 @@ def feedback(body: FeedbackRequest) -> FeedbackResponse:
     logger.info("api.chat.feedback.down", thread_id=body.thread_id,
                 harvest_id=result["harvest_id"])
     return FeedbackResponse(ok=True, harvest_id=result["harvest_id"])
+
+
+@router.get("/threads")
+def list_threads_endpoint(
+    user_id: str = Query("default", description="用户 ID"),
+    limit: int = Query(50, ge=1, le=200),
+) -> dict[str, Any]:
+    """列出当前用户的会话历史（豆包式左侧会话列表），最后活跃倒序。
+
+    数据源 conversation_messages（/chat 每轮自动写入 user+assistant 两条），
+    与 checkpoints（中断恢复快照）无关。
+    """
+    from app.memory.conversation import list_threads
+
+    return {"items": list_threads(user_id=user_id, limit=limit)}
+
+
+@router.get("/{thread_id}/messages")
+def thread_messages_endpoint(thread_id: str) -> dict[str, Any]:
+    """回读某个会话的全部消息（role/content/seq，按 seq 升序）。
+
+    切换会话时前端用它渲染历史消息流；含 summary 压缩摘要（role='summary'）。
+    """
+    from app.memory.conversation import get_messages
+
+    return {"thread_id": thread_id, "messages": get_messages(thread_id)}

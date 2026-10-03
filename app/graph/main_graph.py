@@ -173,11 +173,13 @@ def build_main_graph(
         effective_question = state.get("rewritten_question") or user_question
         department_results = state.get("department_results") or {}
         feedback = state.get("quality_feedback") or ""
+        chat_mode = bool(state.get("chat_mode"))
         skipped = state.get("skipped_tasks") or []
         if skipped:
             logger.info("main.decision.with_skipped", skipped=skipped)
 
-        logger.info("main.decision.start", departments=list(department_results.keys()), has_feedback=bool(feedback))
+        logger.info("main.decision.start", departments=list(department_results.keys()),
+                    has_feedback=bool(feedback), chat_mode=chat_mode)
         try:
             # 决策阶段注入用户级记忆（画像/偏好/通用记忆）：
             # Manager 只在规划时看到记忆，最终回答由 Decision 生成，
@@ -190,8 +192,10 @@ def build_main_graph(
                 feedback=feedback or None,
                 injection_warning=injection_warning,
                 conversation_context=conversation_context,
+                chat_mode=chat_mode,
             )
-            logger.info("main.decision.done", confidence=report.get("confidence"))
+            logger.info("main.decision.done", confidence=report.get("confidence"),
+                        chat_mode=chat_mode)
             return {
                 "decision_result": report,
                 "final_answer": report.get("summary", ""),
@@ -326,10 +330,36 @@ def build_main_graph(
         return "revise"
 
     # ------------------------------------------------------------------
+    # 聊天直答分支（考点六十八）：required_agents 为空 -> 跳过部门，直接 decision
+    # ------------------------------------------------------------------
+
+    def _chat_gate(state: dict[str, Any]) -> dict[str, Any]:
+        """无部门问题门：required_agents 为空（闲聊/元问题/业务外）时走聊天直答。
+
+        不涉及任何部门数据的问题（如"上个问题是什么""你好"），
+        不应空转部门 Agent 再硬套商业分析报告——标记 chat_mode=True，
+        由条件边直接调度 decision（department_results 留空，Decision 以对话方式回答）。
+        """
+        required = state.get("required_agents") or []
+        chat = len(required) == 0
+        logger.info(
+            "main.chat_gate",
+            chat_mode=chat,
+            required_agents=required,
+            question=(state.get("rewritten_question") or state.get("user_question", ""))[:80],
+        )
+        return {"chat_mode": chat}
+
+    def _chat_route(state: dict[str, Any]) -> str:
+        """chat_gate 条件边：chat_mode -> decision（直答）；否则 -> router（部门调度）。"""
+        return "decision" if state.get("chat_mode") else "router"
+
+    # ------------------------------------------------------------------
     # 图组装
     # ------------------------------------------------------------------
     builder = StateGraph(GlobalState)
     builder.add_node("manager", _manager)
+    builder.add_node("chat_gate", _chat_gate)
     builder.add_node("router", router_node)
     builder.add_node("operation", operation_node)
     builder.add_node("finance", finance_node)
@@ -350,7 +380,13 @@ def build_main_graph(
         builder.add_edge("decision", END)
 
     builder.add_edge(START, "manager")
-    builder.add_edge("manager", "router")
+    # 聊天直答门：无部门 -> decision；有部门 -> router 调度（考点六十八）
+    builder.add_conditional_edges(
+        "chat_gate",
+        _chat_route,
+        {"router": "router", "decision": "decision"},
+    )
+    builder.add_edge("manager", "chat_gate")
 
     # 路由条件边：route_fn 返回就绪 agent 列表（并行 fan-out 无依赖部门）；
     # 全部完成 -> decision；Product 依赖 O/F/L 自然落在后续批次（串行）

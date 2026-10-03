@@ -46,6 +46,11 @@ class GlobalState(TypedDict, total=False):
     task_plan: dict[str, Any]
     required_agents: list[str]
 
+    # 聊天直答模式（2026-10-02，考点六十八）：
+    # required_agents 为空（问题不涉及任何部门数据，如闲聊/元问题/业务外问题）时置 True，
+    # 跳过部门 Agent 执行，直接由 Decision 以对话方式回答（department_results 留空）。
+    chat_mode: bool
+
     # 当前执行阶段（planning / running / interrupted / done / error）
     current_stage: str
 

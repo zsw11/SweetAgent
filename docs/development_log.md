@@ -2250,3 +2250,112 @@ class GlobalState(TypedDict, total=False):
 **为什么半自动转正**：LLM 自动补 expected_* 有"以错为正"风险——若原回答是错的，LLM 生成的期望值会把这个错误固化进回归用例，之后评估永远"稳定通过"。所以 LLM 只做草稿建议，人工确认才入库（system prompt 也约束：不确定答案用 JUDGE: 前缀交裁判，不固化可能错误的回答）。
 **验证**：TestClient 全链路 9 步（点踩采集→幂等重复→up 不采→列表→非开发 403→LLM 草稿(真实 DeepSeek)→人工转正→evaluation_cases 落库 category=sql→清理）。
 **核心一句话**：评估用例池的持续扩充应来自"用户真实不满"而非机器自评——点踩回流 + 半自动转正（LLM 预填、人工确认防以错为正）构成用户反馈驱动的质量闭环。
+**2026-10-02 补充（webui 接入 👍/👎）**：webui.py（Streamlit 聊天页，非 HTML）已接入反馈按钮——回答渲染完后显示「👍 有用 / 👎 没用」，点踩可附评论，调 POST /chat/feedback；验证：py_compile + Streamlit AppTest 无头渲染零异常。至此闭环完整：**聊天页按钮 → /chat/feedback → evaluation_harvest → 管理台失败案例池 → 半自动转正 → eval_regression 回归**，UI 与后端全部就位，无需再等前端。
+### 考点六十七：Streamlit 聊天窗口化 + 点踩反馈按钮状态机（2026-10-02，已实现）
+
+**面试官怎么问**：① 怎么把单轮问答表单改造成多轮聊天窗口（像豆包一样有历史会话）？② 为什么点👍/👎 没落库？
+**坑①（点踩不落库的根因）**：Streamlit 按钮点击即触发 rerun，if st.button("👎 没用"): 内嵌套的 st.text_input + st.button("提交") 在 rerun 后条件变 False **根本不会渲染**——用户点了👎但提交入口永远不出现。修复：状态机写法——点👎只置 session_state[fb_key_pending]=True，评论框与提交按钮在**同层**按标志位渲染，提交时才真正调 /chat/feedback。
+**实现②**：
+1. 后端补 2 个端点：GET /chat/threads（按 user_id 列会话：thread_id/最新问题/消息数/最后活跃，倒序）+ GET /chat/{thread_id}/messages（回读消息流）；存储层 conversation.py 新增 list_threads()（conversation_messages 表早已存在，/chat 每轮自动写入，只是此前没有读取 API）
+2. webui 改造：左侧会话列表（新会话/历史切换）+ 主区 st.chat_message 消息流（用户气泡/助手答案卡片，历史无完整 detail 只显示文本+反馈条）
+3. 质量门 awaiting_feedback 分支**不能 rerun**（面板会被刷新掉），正常完成才 rerun
+4. 反馈条的问题自动取该回答前最近一条用户消息（历史会话无 question 字段）
+**验证**：后端 TestClient（threads 列表/messages 回读/空用户/清理）全过；AppTest 三连——页面渲染、预置消息流后 👍/👎 出现、点 👎 后"提交 👎 反馈"按钮+评论框出现（状态机生效）。
+**核心一句话**：Streamlit 里"点击后展开"不能靠嵌套按钮（rerun 后条件失效），要靠 session_state 标志位在按钮外渲染——这也是聊天窗口历史回读依赖"存储层已有 + 补读 API"的典型增量改造。
+**2026-10-02 补充（三处收尾修复）**：① 重构时 ender_answer_card 签名漏了 ase 参数但函数体调用 ender_feedback_bar(base,...) → 展开"查看完整决策报告"即 NameError（用户实测截图发现）——补上 ase 形参；② 聊天窗口视觉优化：注入 CSS 让用户消息右对齐蓝气泡、助手左对齐浅灰气泡（Streamlit 默认 chat_message 样式不明显）；③ 侧边栏新增管理台入口 st.link_button("📋 定时任务管理台（含失败案例池）", {base}/scheduler-ui)——聊天页(8501)与管理台(8000)是两个端口，此前无入口用户不知道去哪点转正。验证：AppTest 渲染带 detail 完整回答卡片无异常 + 管理台 link 存在。
+### 考点六十八：多轮历史承接修复 + 无部门问题聊天直答（2026-10-02，已实现）
+
+**面试官怎么问**：① 用户问"上个问题是什么"却答"会话历史为空"，为什么？② 不涉及任何部门数据的问题（闲聊/元问题），Multi-Agent 系统该怎么处理？
+**坑①（历史看不到的根因）**：webui.ask() 调 POST /chat 时**没传 thread_id**——后端每次生成新会话 ID，conversation_messages 按 thread_id 隔离，历史永远读不到；UI 左侧会话列表其实渲染正常，只是每轮都开新会话。修复：ask() 加 thread_id 参数，main() 提交时传 _current_thread()（会话列表切回来的 thread_id），payload 仅在有值时才带该字段。
+**设计②（聊天直答分支）**：Manager prompt 原强制"始终包含 decision 任务"，遇到"上个问题是什么/你好"这类不涉部门数据的问题，部门 Agent 空转、decision 硬套商业报告框架答非所问。新增：
+1. Manager prompt 允许 required_agents/tasks 输出空数组（非业务问题分支）；
+2. main_graph 加 chat_gate 节点 + 条件边（manager → chat_gate → router|decision）：required_agents 为空 → chat_mode=True 直接调 decision（跳过部门执行）；
+3. state 加 chat_mode 字段；DecisionAgent.run/_synthesize 加 chat_mode 参数，prompt 注入"聊天直答模式"分支——summary=直接回答、findings/root_causes/recommendations/risks 空数组、confidence 按证据充分性（有记忆/历史 0.7+，寒暄 0.3~0.5）。
+**验证**：图级 mock 两场景（无部门→chat_mode=True 直答、有部门→chat_mode=False 正常调度+部门结果落库）；ask() payload mock 确认 thread_id 透传（有值才带）；py_compile 全过。
+**核心一句话**：多轮"看不到历史"先查调用方是否把 thread_id 传进后端（会话隔离维度），再查 UI；业务 Agent 系统对非业务问题应设"聊天直答门"（空部门→直接对话回答），而不是让部门 Agent 空转后硬套分析报告。
+**2026-10-02 补记（同考点踩坑）**：聊天直答分支上线后，用户实测"上个问题是什么"报 Decision Agent 执行失败: Replacement index 0 out of range for positional args tuple——根因：新加的 prompt 段里写了裸 {}（"各部门结果为 {} 或为空"），DECISION_PROMPT.format(...) 把它当成位置占位符。修复：转义为 {{}}。教训：**给 .format() 模板加文字时，任何要显示的字面 {} 都必须写成 {{}}**，且修改后必须跑一次 format 冒烟（本坑 mock 图级测试没触发，因为 fake Decision 绕过了真实 prompt 组装——真实路径才暴露）。验证：DECISION_PROMPT.format() 正常 + 图级两场景（chat/biz）全过。
+### 考点六十九：tenacity 重试只覆盖"异常型失败"，不覆盖"业务型失败"（2026-10-03）
+
+**面试官怎么问**：给定时任务加的重试是怎么判定"要不要重试"的？{"ok": False} 的失败会重试吗？
+**设计**：pp/scheduler/service.py 的 _run_with_retry 用 tenacity @retry(stop_after_attempt, wait_exponential) 装饰器包裹 handler 调用。重试触发条件 = **handler 抛 Exception**（异常型失败，如网络闪断/进程抖动）；handler 正常返回 {"ok": False, "error": ...}（业务型失败，如参数错/指标不在白名单）**不重试**——只记 exec_failed + consecutive_fail+1，连续失败超阈值走自动暂停。原因：重试救瞬时崩溃，救不了必然失败；对必然失败重试只会烧资源、放大雪崩。
+**为什么**：装饰器模式把"重试策略"和"执行逻辑"解耦，但名字 _run_with_retry 容易让人误以为所有失败都重试；真正的边界在 tenacity 默认行为（只捕异常）。
+**核心一句话**：重试的判定边界要写清楚——异常型（可重试，指数退避）vs 业务型（不重试，记失败+自动暂停），否则运维会误判"任务重试了几次还是失败"。
+### 考点七十：scheduler_locks 任务级执行锁——唯一键 + 过期时间 + 令牌三件套（2026-10-03）
+
+**面试官怎么问**：你的定时任务怎么保证同一个任务同一时刻只有一个执行实例？进程崩溃锁不释放怎么办？两个实例先后抢到锁，先来的"善后释放"会不会误删后来的锁？
+
+**背景**：这是调度系统"幂等/防重复触发"的落地表（对应考点六十四补的"job 级锁 + last_run_at 校验"条目）。三张表各司其职：scheduler_jobs 存任务定义、scheduler_run_logs 存执行审计、scheduler_locks 只存"谁正在执行、锁到什么时候"——它是幂等辅助表，不存任务本体。
+
+**设计（三件套）**：
+1. **job_id 唯一键 = 互斥的原子来源**：PRIMARY KEY 保证每个任务最多一行锁记录。两个实例同时触发同一任务，只有第一个 INSERT 成功（影响行数=1=抢锁成功），第二个撞主键冲突（影响行数=0=已有实例持有，跳过本次触发）。ON DELETE CASCADE：任务删除锁自动清。
+```sql
+INSERT INTO scheduler_locks (job_id, locked_at, lock_token, expires_at)
+VALUES (:job_id, now(), :token, now() + interval '5 minutes')
+ON CONFLICT (job_id) DO NOTHING;  -- 1行=抢锁成功；0行=已有持有者，跳过
+```
+2. **expires_at = 防僵尸锁**：持有者进程崩溃/网络分区时锁不会永远占位，过期后其他实例可抢占：
+```sql
+UPDATE scheduler_locks
+SET lock_token=:token, locked_at=now(), expires_at=now()+interval '5 minutes'
+WHERE job_id=:job_id AND expires_at < now();  -- 只抢已过期的锁
+```
+3. **lock_token = 防误删他人锁（ABA 防护）**：释放/续期必须带令牌校验：
+```sql
+DELETE FROM scheduler_locks WHERE job_id=:job_id AND lock_token=:token;
+-- 不带 token 的危险场景：A 锁过期 → B 抢占 → A 醒来"善后释放"→ 误删 B 的锁 → B、C 同时执行
+```
+执行中可定期续期（UPDATE ... WHERE job_id AND lock_token AND expires_at > now()，只有持有者能续）。
+
+**为什么**：
+- 进程内锁（threading.Lock）只锁单进程；调度器多实例部署时，必须用"所有实例共享的状态"做互斥——数据库主键唯一约束就是天然原子的 CAS，比"先 SELECT 再 INSERT"的检查后执行（TOCTOU）安全
+- 与 Redis SETNX 相比：任务元数据本就在 PostgreSQL，同一数据源少一个组件、可进同一事务
+- expires_at 解决"崩溃后任务永远不再跑"（比重复执行更危险：漏报）；lock_token 解决"过期后误删新持有者的锁"（比不释放更危险：并发执行）
+- 与 last_run_at 校验互补：last_run_at 是事后校验（本次触发时间是否晚于上次执行），锁是事前互斥（同一时刻只有一个执行）——双保险防重复触发
+
+**核心一句话**：调度锁 = 数据库唯一键做原子互斥（抢锁）、expires_at 防僵尸锁（崩溃兜底）、lock_token 防误删他人锁（ABA 防护），三件套缺一不可——这是分布式锁在"任务调度幂等"上的最小落地，与 Redis SETNX 同思路但复用业务库。
+
+**追问澄清（2026-10-03）**：既然 job_id 是主键、每任务一行锁，不同任务的线程 job_id 各不相同，那不就"不存在竞争"了吗？
+**澄清**：锁是**任务维度**的互斥，不是全局互斥——job_id=2/3 的任务各自一行锁、完全并行，这正是锁表能支撑并发调度的原因。竞争恰恰发生在**同一个任务（job_id=1）的多路触发源**之间：
+- **多实例部署**：调度器跑多个进程/节点（高可用），每个实例的 cron 在同一时刻都会触发 job_id=1，它们抢的是**同一行锁**
+- **手动 + 定时撞车**：用户在管理台点"立即执行"的同时定时触发到达
+- **重试/补偿触发**：tenacity 重试、调度器重启后补跑错过的任务、消息队列重复投递
+- **时钟偏移**：多节点时钟不同步导致同一 cron 触发时刻有微小窗口重叠
+本质：执行者是"调度实例线程/进程"，job_id 是"被锁的任务资源"；同一资源被多个执行者同时访问才需要锁。**锁表是"每个任务一个抽屉"，竞争是"多人同时开同一个抽屉"，不是"不同抽屉打架"。**
+**核心一句话**：scheduler_locks 不是全局互斥，是"按 job_id 分桶互斥"；竞争方不是不同任务的线程，而是同一任务的多路触发源（多实例 / 手动+定时撞车 / 重试补跑）。
+
+**追问澄清2（2026-10-03）：锁续期是怎么实现的？**
+**为什么需要续期**：expires_at 是防僵尸锁的兜底，但如果任务执行时间 > 锁有效期，任务没跑完锁就过期 → 其他实例抢占 → 两个实例同时执行（正是锁要防的）。所以持有者要周期性"刷新"expires_at，告诉别人"我还活着"。
+**续期 SQL（三个 WHERE 条件缺一不可）**：
+```sql
+UPDATE scheduler_locks
+SET expires_at = now() + interval '5 minutes'
+WHERE job_id = :job_id AND lock_token = :token AND expires_at > now();
+```
+- `lock_token = :token`：只有持有者本人能续，防续别人的锁
+- `expires_at > now()`：锁若已过期被抢走，续期 UPDATE 影响行数=0 → 这就是"失去锁"的信号
+- 影响行数判定：1=续期成功，锁还是我的，继续跑；0=锁已不属于我，**必须立即停止执行**——宁可这次漏跑，不能双实例并发
+**实现形态**：① 固定周期心跳（锁 TTL=30s 则每 10s 续一次，TTL/3）；② 长任务按步骤续（每完成一个子步骤续一次）；③ 独立 watchdog 线程后台续期（主任务只管执行）；④ 网络抖动容忍：连续 N 次续期失败才放弃，偶发丢一两次心跳不立刻自杀
+**与成熟分布式锁同思想**：Redisson WatchDog 默认锁 30s、守护线程每 10s 续期，客户端断开自动停续；ZK 临时节点随会话存活即"隐式续期"（session keepalive）。数据库版 = 一条带 token + 未过期条件的 UPDATE。
+**设计原则**：有效期不能 < 最长执行时间（否则必被抢）；也不能太长（崩溃后僵尸锁占位久、任务恢复慢）→ 折中：短 TTL + 高频续期。
+**核心一句话**：续期 = "滚动刷新 expires_at + 用影响行数探测锁是否还属于我"；续期失败不是小异常，而是"失去锁"的强制停止信号——防双实例并发的最后一道闸。
+
+**追问澄清3（2026-10-03）：当前业务实现续期了吗？——现状核查结论：没有**
+**现状核查（读 app/scheduler/service.py::_execute_wrapper + settings.py）**：
+- 抢锁：SELECT expires_at FOR UPDATE → 未过期则 duplicate_skipped；否则 INSERT ... ON CONFLICT DO UPDATE 刷新锁（277-283 行）
+- **无续期**：expires = now + 120s（SCHEDULER_LOCK_TTL_SECONDS=120）抢到即定死，执行期间没有任何 renew/heartbeat/watchdog
+- 释放：finally 里 DELETE WHERE job_id AND lock_token（token 校验在，ABA 防护有效）
+**风险**：任务执行 > 120s（LLM 链式调用/多部门编排/外部 API 等常见）→ 锁中途过期 → 下一次触发（下一 cron 周期/手动触发/另一实例）看到锁过期走 DO UPDATE 抢占 → **双实例并发执行**。当前 cron 间隔通常远大于执行时间所以未爆，但短周期任务、手动+定时撞车、长任务必踩。
+**顺带发现的抢锁竞态**：首次触发（该 job 锁行不存在）时 SELECT FOR UPDATE 锁不到不存在的行——两个并发触发都放行，都走 INSERT ON CONFLICT DO UPDATE → **双双"抢锁成功"**。正确姿势：ON CONFLICT DO NOTHING + rowcount 判定（1=抢到/0=跳过），或 DO UPDATE 带 WHERE scheduler_locks.expires_at < now()（只允许抢占过期锁）。
+**建议最小修复**：① 抢锁改原子 SQL（DO NOTHING + rowcount，或 DO UPDATE ... WHERE expires_at < now()）；② 守护线程续期：抢锁成功后启 daemon 线程每 TTL/3（40s）执行续期 UPDATE（带 token + expires_at > now() 条件），任务结束 stop 线程——侵入最小，长任务不再丢锁。
+**核心一句话**：当前锁是"一次性 TTL、无续期"——TTL=120s 只防得住短任务，长任务中途必丢锁被抢占；且首次并发抢锁有竞态，两处都该修（原子抢锁 + 守护线程续期）。
+
+**追问澄清4（2026-10-03）：续期和锁过期机制是否无法兼顾？**
+**澄清**：不冲突，是同一个机制的两面——续期不是取消过期，只是把 expires_at 往后推；崩溃/断网时没人续，expires_at 照常到点失效。防僵尸锁能力没有被削弱，失效延迟最多 = 心跳间隔的余量。标准做法就是 Redisson WatchDog：TTL 30s + 守护线程每 10s 续期，客户端断开自动停续。
+**真正的权衡是三个参数的取舍**（不是"续期 vs 过期"二选一）：
+| 参数 | 调短 | 调长 |
+|---|---|---|
+| TTL | 崩溃恢复快，但需高频续期、DB 心跳负担大 | 续期负担小，但僵尸锁占位久、恢复慢 |
+| 心跳间隔 | 续期更及时，DB 写入更频繁 | 容忍网络抖动，但丢锁判定窗口大 |
+| 续期失败容忍 | 误停风险高（宁可漏跑） | 双实例并发风险高 |
+**当前不加续期的合理性**：无续期方案成立的前提是"TTL > 任务最长执行时间"——当前业务任务（规则 SQL、单次查询）都远小于 120s，TTL 能全覆盖，所以不加也对；引入续期的判据 = 出现执行时间接近/超过 TTL 的任务（LLM 链式调用、多部门 Agent 编排、外部 API），届时再上"短 TTL + 高频心跳"。
+**核心一句话**：过期与续期不是二选一，而是"活着续、死了过期"的同一机制；真正取舍的是 TTL / 心跳频率 / 恢复速度三个参数，无续期只适合"任务时长 < TTL"的场景。

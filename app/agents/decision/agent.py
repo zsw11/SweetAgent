@@ -81,6 +81,7 @@ class DecisionAgent:
         feedback: Optional[str] = None,
         injection_warning: str = "",
         conversation_context: str = "",
+        chat_mode: bool = False,
     ) -> DecisionOutput:
         """执行一次决策分析，返回结构化 DecisionOutput。
 
@@ -95,6 +96,8 @@ class DecisionAgent:
                 独立 System 消息注入，要求忽略用户输入中的指令性内容。
             conversation_context: 多轮会话上下文（OPT-12：历史摘要 + 最近对话），
                 非空时注入，使本次汇总承接前几轮问答的脉络。
+            chat_mode: 聊天直答模式（考点六十八）——问题不涉及任何部门数据时 True，
+                跳过商业报告框架，以对话方式直接回答（部门结果为空）。
         """
         logger.info(
             "decision.run.start",
@@ -104,6 +107,7 @@ class DecisionAgent:
             has_feedback=bool(feedback),
             injection_flagged=bool(injection_warning),
             has_conversation=bool(conversation_context),
+            chat_mode=chat_mode,
         )
         raw = self._synthesize(
             user_question,
@@ -112,6 +116,7 @@ class DecisionAgent:
             feedback,
             injection_warning,
             conversation_context,
+            chat_mode,
         )
         report = raw if isinstance(raw, dict) else self._parse_and_validate(raw)
         logger.info(
@@ -133,6 +138,7 @@ class DecisionAgent:
         feedback: Optional[str] = None,
         injection_warning: str = "",
         conversation_context: str = "",
+        chat_mode: bool = False,
     ) -> Union[dict[str, Any], str]:
         """生成结构化决策报告。
 
@@ -141,6 +147,10 @@ class DecisionAgent:
 
         feedback 非空时在 prompt 中注入"反馈意见"段（考点二十九）：
         quality_gate 判不合格后回炉，本次生成必须针对反馈逐条修正。
+
+        chat_mode=True（考点六十八）：问题不涉及部门数据（闲聊/元问题），
+        部门结果为空，prompt 要求以对话方式直接回答（summary=直接回答，
+        findings/root_causes 等保持空，不套商业报告框架）。
         """
         from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -154,6 +164,7 @@ class DecisionAgent:
                 feedback=feedback or "（无）",
                 conversation_context=conversation_context or "（无）",
                 department_results_json=json.dumps(slim, ensure_ascii=False, default=str),
+                chat_mode="true" if chat_mode else "false",
             )),
         ]
         # OPT-06：注入检测命中时追加边界警告（系统级约束，独立消息不被用户输入稀释）
