@@ -2476,3 +2476,174 @@ WHERE job_id = :job_id AND lock_token = :token AND expires_at > now();
 **核心一句话**：防工具误调用 = 五层纵深：非 LLM 路由定方向、schema+词典闸门拦参数、显式意图门控高成本工具、结果验证+交叉检查兜底、误调用案例回流形成正循环——复用项目已有的白名单/chat_mode/点踩回流基础。
 
 **2026-10-03 补充（用户确认设计方向）**：完整方案已另存 `docs/tool_safety.md`。用户确认两个核心设计：**① 工具路由归档**——每个工具进 ToolSpec 注册表（部门白名单/数据域/触发条件/参数 schema/成本等级/门控），Agent 只能调注册表内工具；路由判定非 LLM 优先（embedding+词典召回候选 → 门控过滤 → LLM 只做受限选择+抽参），工具选择从"LLM 自由选"改为"确定性路由召回 + LLM 受限选择"；**② 参数结构化 + 校验**——Pydantic Schema + 词典（复用 _load_dictionary）+ 日期/数值边界三层闸门，失败拒绝或纠正重试、不放行（与 NL2Cron"宁可拒绝不可静默错跑"同一哲学）。五层纵深里执行层与点踩回流骨架已就位，主要补路由层/参数层/门控层。
+
+### 考点七十四：任务"暂停 / 恢复 / 续跑"全景——一个系统里三层断点机制（2026-10-04 代码精读）
+
+**面试官怎么问**：你的 Agent 系统，任务"暂停后能恢复、中断后能续跑"具体是怎么实现的？拆开问：①质量门要等用户确认时，图执行怎么"挂起"、怎么"接着跑"？②定时任务怎么暂停/恢复？进程重启任务怎么不丢？③多轮对话怎么承接上文"续聊"？这三层是同一套机制吗？
+
+**设计（本项目真实实现，三层各司其职）**：
+
+**第 1 层｜图执行中断恢复（核心，承接考点十九/二十九）**：`interrupt()` + PostgresSaver checkpoint + `Command(resume)`。
+- 暂停：quality_gate 节点在自动回炉耗尽（QUALITY_GATE_MAX_AUTO_RETRIES=2）且 human_in_the_loop=True 时调 `interrupt({draft_answer, issues, iteration})`（main_graph.py:265）。interrupt 通过抛 GraphInterrupt 实现"暂停点 + 断点落盘 + 控制权交还"，invoke 立即返回、后端线程释放——不是阻塞等待
+- 断点：编译时 `builder.compile(checkpointer=PostgresSaver)`（memory/checkpoint.py，连接池 autocommit 单例），每节点执行后 State 快照按 thread_id 写 Postgres（checkpoints / checkpoint_writes 表）——这就是"恢复点"
+- 恢复：前端展示候选答案+issues → 用户 approve / revise → `POST /chat/{thread_id}/resume` → `app.invoke(Command(resume=payload), config={"configurable":{"thread_id":...}})`（chat.py:223）。resume 不是发新任务，是"回答那个被暂停的调用点"——interrupt() 的返回值 = payload；approve 放行 END，revise 带 feedback 回 decision 重生成、再走一轮质量门
+- 降级：`_hilt_ok = human_in_the_loop and checkpointer is not None`；不满足时自动回炉耗尽 force_pass 放行（保留诊断），评估/verify 既有链路零破坏
+
+**第 2 层｜定时任务调度暂停/恢复（承接考点六十四）**：DB 状态 + APScheduler 同步 + 重启重放。
+- 暂停/恢复：`set_job_status(active/paused/disabled)`（scheduler/service.py:166）——DB status 先落库，再同步调度器：暂停 = APScheduler remove_job，恢复 = 重新 add_job（CronTrigger，replace_existing 防重复）
+- 自动暂停：连续失败 ≥ SCHEDULER_FAIL_AUTO_PAUSE(3) 自动置 paused 并 remove（防持续烧钱/雪崩）
+- 重启恢复：`restore_jobs()` 启动时从 scheduler_jobs 表重放注册（DB 是唯一权威源，进程重启任务不丢）
+- 幂等：scheduler_locks 锁防同一任务并发重复触发 + 唯一键防重复创建
+
+**第 3 层｜多轮会话"续跑"（OPT-12 会话上下文）**：thread_id 维度的对话承接，与图断点无关。
+- conversation_messages 按 thread_id 存 user/assistant（seq 递增 + token 计数）
+- 每轮 `build_conversation_context`（历史摘要 + 最近 N 轮原文）注入 Manager/Decision；`rewrite_question` 把"它呢？"这类指代改写为自包含问题
+- token 超 HISTORY_COMPRESSION_THRESHOLD(35k) 触发 `compress_history`（LLM 压缩，失败降级硬截断）——续跑不因上下文爆炸失忆
+
+**为什么分三层（面试重点）**：
+- **三个"断点"的对象不同**：图断点 = "执行到哪一步 + 状态快照"（面向进程崩溃 / 需要用户介入）；调度断点 = "任务定义 + 启用状态"（面向周期任务生命周期）；会话断点 = "聊了什么"（面向语义上下文）。混用会把三种生命周期耦合，一处改动牵动全局
+- **checkpoints 与 conversation_messages 分工明确**：checkpoints 是图执行快照（恢复/审计/time travel 用，不面向应用查询）；conversation_messages 是应用层历史（前端渲染 + 上下文注入用）——chat.py /chat/threads 注释明确"与 checkpoints（中断恢复快照）无关"
+- **interrupt 设计精髓**：抛异常返回而非阻塞 → 执行无状态化，任何进程拿 thread_id 都能续跑（time-travel）；checkpoint 落库 → 进程重启也能 resume；等待发生在应用层（前端面板），Web 场景不占线程连接
+- **降级哲学贯穿三层**：无 checkpointer 强制放行、LLM 压缩失败硬截断、调度 DB 不可用快速降级——"增强能力"永远不能成为主链路的单点故障
+
+**备选方案**：a) 自建"中间结果落库 + 任务状态机"（要自己实现版本/回放，LangGraph 已内置没必要）；b) 阻塞等待用户输入（占线程/连接，Web 不可接受）；c) 不持久化靠重跑（LLM 调用费钱且结果非确定，长链路不可接受）
+
+**核心一句话**：本系统有三层互不相同但哲学一致的"断点"——图执行靠 interrupt + checkpoint + Command(resume)（暂停点落库、恢复点续跑），定时任务靠 DB 状态 + APScheduler 同步 + 重启重放，多轮会话靠 thread_id 历史注入 + 指代改写 + token 压缩；共同点：断点落盘、应用层等待、无状态化恢复。
+
+**追问：resume 恢复时需不需要再查数据库的对话上下文？checkpoint 自足吗？（2026-10-04）**
+
+**答**：不需要。resume 恢复的是"图执行状态"，checkpoint 里的 GlobalState 快照对续跑自足；对话历史表（conversation_messages）只在"新开一轮"时才需要读。
+1. **checkpoint 存的是完整执行状态**：conversation_context / rewritten_question / user_question / department_results / decision_result / quality_iteration 等全部 channel 值，每节点执行后按 thread_id 快照落库。暂停那一刻的状态 = 该轮完整上下文；恢复时 LangGraph 自动按 thread_id 加载最近 checkpoint + checkpoint_writes 的 pending writes 重建全部 State，interrupt() 直接返回 payload，无需任何业务层查询
+2. **代码证据**：resume_chat（chat.py:196）只做 build_main_graph(checkpointer) + app.invoke(Command(resume=payload), config={thread_id})，没有任何 build_conversation_context / get_messages 调用；恢复后 result.get("user_question") 直接从 state 取（"数据在 checkpoint 里，客户端不用重传"）
+3. **什么时候才需要 conversation_messages**：新轮次 POST /chat 开头 build_conversation_context + rewrite_question（run_question，main_graph.py:453）；前端历史渲染 GET /chat/{thread_id}/messages；记忆提取 / token 压缩
+
+**精读发现的两个小缺口（与注释意图不符）**：
+1. **暂停轮的草稿其实已写历史**：decision 节点先把 current_stage 置 "done" 才轮到 quality_gate interrupt，所以中断返回时 state.current_stage=="done"，run_question 的"仅 done 才 append_turn"守卫挡不住——草稿答案会被写入 conversation_messages（注释意图是 interrupt 不写）。影响小（草稿≈该轮回答）
+2. **resume 完成后不回写**：append_turn / maybe_extract_memories / 脱敏都只在 run_question 里，resume_chat 没有——revise 修正后的最终答案不会进 conversation_messages（下一轮注入看不到修正版）、不进长期记忆提取，响应也未走 OUTPUT_MASKING 脱敏。若要修正答案进历史/记忆，resume 路径需补 run_question 同款收尾
+
+**核心一句话**：恢复对话 = checkpoint 自足（执行状态在库里，框架自动加载，不用再查历史表）；但"执行恢复自足 ≠ 应用层收尾自足"——resume 路径没复用 run_question 的写历史/提记忆/脱敏收尾，是当前实现的一个真缺口。
+**checkpoint 高级用法**：
+答： Time Travel（时间旅行）：
+Time Travel（时间旅行）是基于 Checkpoint 持久化 和 Thread ID 衍生出的高级架构能力。既然我们有了历史所有的快照存档，就可以顺着时间线来回穿梭。
+它的核心应用场景：
+回溯与重试（Rewind & Retry）：Agent 在第 5 步调用工具失败了（比如调错了 API）。开发者可以直接“穿越”回第 4 步的快照，修改参数或提示词，重新执行第 5 步，而不需要让 Agent 从头开始跑（极大节省 Token 和时间）。
+分支探索（Forking）：基于同一个历史快照，创建多个平行分支。比如让 Agent 在某个节点尝试三种不同的策略，对比输出结果，选择最优解。
+调试与审计（Observability）：开发人员可以精确查看 Agent 在历史上的每一个时间点看到了什么信息、做出了什么决策，快速定位 Bug。
+人工干预与回滚：当审批人发现 Agent 前面走偏了，可以拒绝当前结果，并在历史快照中注入新的指令，让 Agent 从某个特定节点重来。
+另外checkpoint数据过多，历史数据需要清理，设置TTL，过期后清理，止存储爆炸和查询性能
+**2026-10-04 补充**：上述两问（三层断点全景 + resume 恢复 checkpoint 自足性）的完整图解总结已另存 `docs/pause_resume_architecture.html`（自包含单页：主链路时序图 / 两条路径数据流对比 / 两张表分工表）。
+
+### 考点七十五：Agent 记忆污染怎么防？——从采集到注入的八道闸门全景（2026-10-04 代码精读）
+
+**面试官怎么问**：LLM 会把闲聊、一次性上下文、重复说法、矛盾说法都写进长期记忆，越积越脏、越注入越错——你的记忆系统怎么防污染？防哪几类污染？从「进库」到「被用」每道闸门是什么？
+
+**先定义污染类型**：噪声（一次性/临时指令进库）、重复（同一事实多条稀释）、矛盾（新旧说法并存）、过时（事实已变化仍生效）、幻觉（LLM 编造无证据内容）、跨域（部门记忆互相串用）。防线按「写侧 → 存储侧 → 读侧」三面布置。
+
+**设计（本项目真实实现，八道闸门）**：
+1. **触发控制**（extractor.py `maybe_extract_memories`）：规则关键词预筛（"我喜欢/我负责/以后都用"等零成本正则）+ 历史 token 阈值，两级触发——不是每轮对话都进记忆，先淘汰大部分噪声
+2. **提取约束**（EXTRACT_PROMPT）：只提取跨会话有用的（身份/职责/稳定偏好/业务规则/历史结论）；临时指令/一次性上下文禁止；evidence 必须引用用户原话、摘不出不写（防 LLM 幻觉编造）；profiles/preferences 白名单 key、memories.type 白名单 [preference/fact/conclusion/rule]
+3. **写入门槛**（extractor）：profiles 必须 confidence ≥ 0.8 且 evidence 非空才写；preferences 必须有 evidence
+4. **两阶段写入**（semantic.add_memory，承接考点二十二）：相似度只召回 top-5 不决策，LLM 裁判判 ADD/NONE/MERGE/UPDATE——duplicate→NONE 只刷新不新增、conflict/negation→UPDATE（置信度不足并存不冒险覆盖）、supplement→MERGE；内容完全相同→规则前置 NONE 不调 LLM；裁判一致性兜底（reason 说重复却给 UPDATE → 降级 NONE）
+5. **版本化不原地覆盖**（`_versioned_replace`）：UPDATE/MERGE 旧条 superseded_at + superseded_by_id 版本链，决策痕迹（decision_reason/decided_by）进 metadata，target_id 非法保守新增——防"覆盖错且不可追溯"
+6. **存储治理**（块B，承接考点四十六）：弱记忆（fact/conclusion）超过 MEMORY_WEAK_TTL_DAYS(90) 未更新惰性软过期（superseded_at），强约束（preference/rule）常驻；软删除保留物理行可追溯
+7. **注入侧过滤**（injection.py，承接考点二十五/四十五）：强约束全量注入、弱记忆相似度 top-k、token 预算保强弃弱——即使库里还有脏记忆，注入时权重偏向可信的强约束
+8. **范围隔离**（injection.py `build_department_memory`）：部门粗筛（department ∈ 意图部门 ∪ 无标签通用）+ business_preferences 按 scope 注入——防跨域记忆串用
+
+**特权通道（块C·M档，承接考点四十七）**：用户显式纠错跳过 LLM 裁判、以用户为准（用户信号是最干净的纠错来源），correction_target 精准定位旧条版本化取代；这是唯一"高置信覆盖"路径。
+
+**为什么这样设计（面试重点）**：
+- **污染必须"进库前拦"而非"用的时候洗"**：记忆一旦落库，检索时无法可靠区分好坏（相似度只反映语义近不近、不反映对不对）——所以写侧闸门最重（触发/约束/门槛/裁判四道）
+- **决策与召回分离**：相似度阈值两难（高则去重失效、低则误覆盖）→ 相似度只召回、LLM 判语义关系（考点二十二）
+- **不确定就往保守方向倒**：duplicate 只刷新、conflict 置信度不足并存、target_id 非法保守新增、reason/event 不一致降级 NONE——宁可不写/不覆盖，不可错写/错覆盖
+- **版本化而非原地覆盖**：错误覆盖无法追溯 = 隐形污染；superseded 链保证任何时刻能回看"这条记忆怎么演变的"
+- **时效遗忘兜底**：事实会过期（"负责美国市场"半年后可能变了），TTL 惰性软过期保证过时信息不长期生效；强约束不参与（偏好/规则要常驻）
+- **分级注入是最后一道闸**：答错代价高的强约束全量、弱记忆 top-k，token 预算保强弃弱
+
+**备选方案与缺口**：
+- 备选：纯阈值去重（阈值两难）；不判断直接 latest-wins（矛盾丢失）；物理删除（不可追溯）
+- 缺口：LLM 裁判本身可能误判（一致性兜底只处理了一种症状）；画像 latest-wins 无 superseded 历史（覆盖即事实，变更日志是待办）；无定期全量整理任务（依赖惰性触发）
+
+**核心一句话**：防记忆污染 = 写侧四道闸（触发控制/提取约束/写入门槛/LLM 裁判两阶段写入）拦"脏信息进库"，存储侧两道闸（版本化 + TTL 惰性软过期）拦"错覆盖与过时驻留"，读侧两道闸（分级注入 + 范围隔离）拦"脏信息被用"——哲学是"不确定就往保守方向倒：宁可不写、不覆盖，不可错写、错覆盖"。
+
+### 考点七十六：LLM 失败 / 返回错误结论 JSON 怎么处理？——通道层不吞业务 + 调用方各自降级 + 质量门自纠回路（2026-10-04 代码精读）
+
+**面试官怎么问**：LLM 可能超时/报错/输出非 JSON/缺字段/类型错——你的 agent 系统在哪几层处理？每层各管什么？"错误结论"怎么被识别出来并纠正？
+
+**设计（三层防御，app/llm/structured.py + 各调用方 + graph/quality.py）**：
+
+**第 0 层：启动守卫（llm/__init__.py）**：`_real_key()` 检测占位符/空值/过短 key，`llm_available()` 未配置时部门 Agent 构造函数直接 `RuntimeError` 启动即报错——不带着坏配置跑。
+
+**第 1 层：通道层统一封装（structured.py，"通道层不吞业务"）**：
+- `invoke_structured`（with_structured_output）：模型不支持/400/超时/网络异常 → try/except 捕获返回 None，记 warning（不抛给业务）；
+- `invoke_tool`（Function Calling）：异常 → (None, None)；模型没走 tool_calls → (None, 文本)（可直接用）；
+- `invoke_text`（文本通道）：失败 → None；
+- `extract_json`（统一 JSON 提取）：markdown 代码块剥壳 → json.loads → 花括号截取（容忍前后杂文）→ 必须是 dict，JSONDecodeError 返回 None；
+- ChatOpenAI 自带 timeout=60 + max_retries=2（网络层重试）。
+- 哲学：通道层只"尝试原生通道"，成功返回 dict、失败返回 None，**降级策略由调用方决定**（每处语义不同）。
+
+**第 2 层：调用方降级策略（各业务点自己选"失败后怎么办"）**：
+- `_plan`（base.py）：结构化失败 → 降级 invoke_text → `_extract_plan` 白名单过滤（剥离 markdown 列表符/序号/多分隔符）→ FALLBACK_REQ 兜底——**LLM 全挂也能查核心数据域**；
+- `_analyze`（base.py）：结构化失败 → 文本 + `parse_analysis_json`（extract_json）；summary 嵌套 JSON 二次提取；彻底失败 → **显式输出"LLM 分析失败，无可用结论。" + raw 进 evidence**（诚实降级不编数据）；metrics/anomalies 逐条类型校验；
+- SQL `_query_one`：执行异常 → `repair_sql` 带错误重生成（max_sql_retries 次）；0 行 → 提示"聚合查询不应为空"修复；
+- Decision `_synthesize`（decision/agent.py）：结构化失败 → 文本 → `_parse_and_validate`：解析失败 → `_fallback_report`（summary="决策分析生成失败：LLM 输出无法解析为结构化 JSON"，findings 带 system 类别）——**显式失败态，供 quality_gate 识别**；字段校验补全 `_ensure_list_of_dicts`（非列表→[]、非 dict 跳过、字符串包装成单字段）、`_clamp_confidence`（0-1 裁剪、非数字→0.5）；
+- 记忆侧：裁判 judge.py 失败返回 None → semantic.py 降级 `_FALLBACK_THRESHOLD=0.7` 版本化否则新增（记忆不阻塞，保守优先）；提取 extractor.py 失败返回空 dict（**不写记忆，不写比错写好**）；改写 rewrite.py 失败 → 返回原问题（回退原文不丢用户问题）。
+
+**第 3 层：质量门自纠回路（quality.py + main_graph.py，考点二十九）**：
+- `check_answer_quality` 确定性规则（零成本永远启用）：核心结论空/过短（<QUALITY_GATE_MIN_SUMMARY_LEN）、**命中降级失败态前缀**（"决策分析生成失败"/"Decision Agent 执行失败"——专门识别第 2 层的 fallback_report）、8 种模板甩锅话术（"请提供更多信息"/"无法回答"等）；
+- LLM 裁判（可选开关 QUALITY_GATE_JUDGE_ENABLED）：跑题/漏答语义检查；**裁判失败/解析失败按"无问题"处理**（裁判不可用不阻塞主流程）；
+- 不合格 → 带 quality_feedback 回 decision 重生成（quality_iteration++，上限 QUALITY_GATE_MAX_AUTO_RETRIES）；
+- 回炉耗尽 → human_in_the_loop=True 时 interrupt() 暂停等用户 approve/revise（checkpoint 断点续跑）；**用户未给有效 feedback → force_pass 放行防死循环**；非交互 → 放行保留诊断。
+
+**为什么这样设计（面试重点）**：
+- **失败分层、职责分离**：通道层只做"能力探测"（成功返回、失败 None），降级是业务决策——plan 的降级是"换通道保住核心"、decision 的降级是"输出可识别失败态"、记忆的降级是"宁可不写"、质量裁判的降级是"放行不阻塞"；
+- **失败要"可识别"才能被纠正**：Decision 解析失败输出带固定前缀的失败态，quality_gate 规则检查专门匹配这些前缀回炉——降级结果不会被当正常答案放行；
+- **解析容错三级递进**：结构化通道（Pydantic 约束，减少格式幻觉）→ 文本 + extract_json（剥壳+截取）→ 字段级校验补全（_ensure_list_of_dicts/_clamp_confidence 默认值兜底）；
+- **确定性优先、LLM 只兜底语义**（与考点二十三同哲学）：规则检查零成本永远启用，LLM 裁判可选；
+- **失败时宁可降级不编造**：分析失败明说"无可用结论"、记忆提取失败不写、知识库无命中显式禁止编造（base.py 动态规则）;
+- **防死循环三保险**：自动回炉有上限、用户没给 feedback 强制放行、裁判失败按通过。
+
+**备选方案与缺口**：
+- 备选：重试+熔断（当前只有 SDK 层 max_retries=2，无指数退避/熔断器）；重试时注入上一次报错（只有 SQL repair 做，LLM 通道无 retry-with-error）；
+- 缺口：invoke_structured 失败后降级文本是无记忆重调（不带上次失败原因）；quality_gate 回炉的 feedback 是 issues 拼接，粒度粗；_fallback_report 的失败态只被规则前缀识别，无结构化 error 码。
+
+**核心一句话**：三层防御——通道层统一 try/except 失败返回 None"不吞业务"，各调用方按语义各自降级（保核心数据域/诚实失败态/宁可不写/回退原文），质量门用确定性规则识别失败态与甩锅话术、带 feedback 回炉重生成、耗尽后 interrupt 或 force_pass 防死循环；关键是"失败要可识别、降级不编造、循环有出口"。
+
+### 考点七十七：Agent 评估系统上线标准——跑多少数据、得分多少、结果什么样才敢上线？（2026-10-04 方案设计）
+
+**面试官怎么问**：你的 agent 系统要上线，评估体系怎么定？样本量怎么算、通过率阈值多少、评估结果以什么形态呈现？你判断哪里最容易不及格？
+
+**现状盘点（本项目）**：无专门评估代码（app/observability/metrics.py 仅 TODO 占位）；可复用资产 = LangSmith 全链路 trace（OPT-02，LLM 输入输出/token/耗时/工具调用/graph 节点/quality_gate 判定，零侵入）+ 运行期 quality_gate 判定日志（规则检查 + 可选 LLM 裁判）。即：**采集层已有，缺评估数据集与打分器**。
+
+**跑多少数据（分阶段 + 分层抽样，不是一次性大样本）**：
+1. **冒烟阶段 30-50 条**：按 6 场景分层（SQL 数值分析 / RAG 知识 / 物流 MCP / 记忆相关 / 闲聊 chat_mode / 多轮改写），每层 ≥5 条——目的不是定阈值，是**发现失败模式聚类**（哪类问题系统性烂）；
+2. **主评估 ≥100-200 条**：每层 ≥20 条。统计依据：二项分布下通过率 90% 时，n=100 的 95% 置信区间约 [83%, 95%]；要区分"85% vs 95%"需要每档 n≥200（否则差异在噪声里）；
+3. 混合场景按真实业务占比加权抽样，不要均匀抽样（SQL 数值分析占比高，权重就高）。
+
+**得分多少（三层门禁，不是单一总分）**：
+- **红线（任一不过即不可上线）**：SQL 执行成功率 ≥95%（且 0 行误判率低）、decision 结构化解析成功率 ≥98%（fallback_report 占比）、编造率 =0（知识库 confidence=none 时不得编造）、quality_gate 0-1 次回炉内通过率 ≥95%；
+- **主指标**：业务数值类回答正确率 ≥90%（逐字段对答案）、全场景混合综合分 ≥85%（LLM-as-judge 打分 + 人工抽样复核，双轨）；
+- **观察指标（不阻塞上线，进回归看板）**：P95 端到端耗时、token 成本/次、平均回炉率、记忆污染率（bad memory 占比）、调度任务成功率。
+- 数字背后逻辑：**数值类错一个字段就是错**（对答案判对错，不给模糊分）；闲聊/元问题单独看（quality_gate 15 字最短规则会误伤短答案，评估时豁免）。
+
+**数据结果什么样（交付三件套）**：
+1. **逐样本记录**：输入 + 各 Agent 中间输出（O/F/L/P/Decision）+ quality_gate 判定 + SQL 成败 + token/耗时 + 判分依据——可回溯到 trace；
+2. **聚合报告**：通过率 / 分维度×分场景矩阵 / 失败聚类（Top 失败模式）/ 分数分布直方图 / bad case 清单（每条附根因）；
+3. **回归对比**：与上一版同数据集对比（通过率 delta、失败模式消长）——**评估集一旦定稿就冻结**，改 prompt/代码后重跑对比，防退化。
+
+**本项目最可能低分的点（结合代码逐条排雷）**：
+1. **SQL 链**（最高风险）：复杂查询 → repair 重试 3 次仍失败 → RuntimeError 抛给上层；0 行误判（聚合应为非空）；宽表 join 生成错列——数值类场景的 70% 失败会在这；
+2. **Decision 解析/语义**：解析失败走 fallback_report（quality_gate 能识别），但**默认 QUALITY_GATE_JUDGE_ENABLED=False**，规则只查 15 字/失败前缀/8 种甩锅话术——语义跑题漏答拦不住，混在一起时综合分被拉低；
+3. **RAG 知识类**：向量无命中 → confidence=none 显式"未收录"（诚实但等于没答）——知识类问题通过率天然低，需单独基线；
+4. **记忆注入错误**：弱记忆 top-k 注入（1.5k token 预算内）带错旧记忆 → 事实性答错（"负责哪个市场"），且记忆错是跨场景复现的；
+5. **跨部门级联**：product 依赖 O/F/L，前序 agent 失败 → 级联影响 decision（quality_gate 只查最终答案，中间失败不暴露）；
+6. **物流 MCP / 外部依赖**：外部 API 失败 → rows 空，analyze 仍可能基于空数据生成看似确定的回答；
+7. **多轮上下文**：rewrite 失败回退原文 → 指代丢失答偏；chat_mode 短答案被质量门 15 字规则误伤。
+
+**核心一句话**：上线评估 = 分层抽样 100-200 条（冒烟 30-50 先找失败聚类）→ 三层门禁（红线硬卡、主指标 90/85、观察指标进看板）→ 三件套交付（逐样本可回溯 + 聚合失败聚类 + 冻结数据集回归对比）；本项目最大失分点按概率排序是 SQL 链 > 语义跑题漏答（默认裁判关着）> RAG 无命中 > 记忆注入错 > 跨部门级联。
+
+**追问：LangSmith trace 算"采集层"吗？（2026-10-04）** 用户纠正：trace 是监控不是采集——采集应指预定义 golden set 导入与用户点踩/纠错记录。核实后确认：① 概念上 trace/日志 = 观测（系统跑得怎么样：耗时/token/失败/链路），不是评估数据源；采集 = 评估数据来源（离线 golden set 标注 + 在线用户反馈回流）。② 项目真实采集资产盘点（修正上轮"无评估代码"的不全盘点）：在线点踩 ✅ POST /chat/feedback（考点六十六）→ security.masking 脱敏 → evaluation_harvest（幂等去重 uq_harvest_dedup）→ LLM 预填 expected_* 草稿 + 人工确认 → 半自动转正 evaluation_cases（category='online'）；离线用例 ⚠️ evaluation_cases 表已建（expected_agents={"required":[...]} 召回优先多规划不扣分 / expected_sql_pattern 命中率评分 / expected_answer_key 关键词 n/m + JUDGE: 前缀交 LLM 裁判 / category=routing/sql/fact/safety/rag，db/02-schema.sql 816 行），但空表、seed_evaluation_cases.py 未实现；评估运行 ⚠️ evaluation_runs / evaluation_scores 表已建（02-schema.sql 827/837 行），eval_regression.load_cases 仅 harvest.py 注释提及、运行代码不存在。③ 结论：监控与采集混为一谈是错的；本项目"采集层"真实状态 = 在线反馈采集已通，离线用例与回归运行待补（表结构 + 判分设计已在 schema 就绪）。
+
+**更正（2026-10-04）：** 上条盘点有误——`scripts/seed_evaluation_cases.py` 与 `scripts/run_evaluation.py` **均已实现**（上轮 Glob 花括号模式漏配 scripts/ 目录）。核实后的实况：
+- seed：**20 条正式用例**幂等灌入 evaluation_cases（routing 6 / sql 4 / fact 4 / safety 3 / rag 3），expected_agents={"required":[...]}、expected_sql_pattern 命中率、expected_answer_key 关键词 n/m + JUDGE: 前缀；
+- run_evaluation：完整实现 `load_cases` → 真实跑主图 run_question → **三维判分**（routing_accuracy 路由命中召回优先 / sql_accuracy 必命中表·关键词·rag:部门 / answer_accuracy 关键词 n/m 或 JUDGE: 三类 LLM 裁判 abstain·no_fabricate·empty）→ UsageCollector 采 token + 费用估算 → 落 evaluation_runs / evaluation_scores（raw_capture 存全量原始输出）→ **--replay 离线重放**（改判分逻辑不重跑主图不重复花钱，--judge 才重判）→ **--fresh 用例间记忆隔离**（每条前清 eval 用户三表，防评估互相污染）；默认只跑 6、10 省钱，--all 跑 20 条；
+- 真正缺口收敛为两点：① **上线门禁（阈值判定）未实现**——run_evaluation 只输出三维均分汇总，没有"红线/主指标/观察指标"通过与否的判定逻辑；② **回归对比报告未实现**——--replay 提供了基础设施，但无"本次 vs 上次 run"自动对比产出。

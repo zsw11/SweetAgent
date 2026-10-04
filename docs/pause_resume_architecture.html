@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>任务暂停 / 恢复与续跑机制 · sweetAgent 代码精读</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%232f6fd0'/%3E%3Crect x='8' y='9' width='4' height='14' rx='1' fill='white'/%3E%3Crect x='15' y='9' width='4' height='14' rx='1' fill='white'/%3E%3Cpath d='M22 10 L28 16 L22 22 Z' fill='white'/%3E%3C/svg%3E">
+<style>
+  :root{
+    --ink:#1a2332; --sub:#5b6472; --line:#dfe3ea; --paper:#ffffff; --bg:#f7f8fa;
+    --blue:#2f6fd0; --blue-bg:#eaf2ff;
+    --green:#1a9c55; --green-bg:#e6f7ec;
+    --red:#d0342c; --red-bg:#fdecec;
+    --amber:#d97706; --amber-bg:#fff6e5;
+    --radius:12px;
+  }
+  *{box-sizing:border-box;margin:0;padding:0;}
+  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--ink);line-height:1.6;}
+  .topbar{height:6px;background:linear-gradient(90deg,var(--blue) 0 33%,var(--green) 33% 66%,var(--red) 66% 100%);}
+  .wrap{max-width:1060px;margin:0 auto;padding:32px 24px 64px;}
+  header.doc{margin-bottom:36px;}
+  header.doc h1{font-size:30px;font-weight:700;letter-spacing:.5px;}
+  header.doc .sub{margin-top:6px;font-size:15px;color:var(--sub);}
+  .meta{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px;}
+  .chip{display:inline-block;font-size:12.5px;color:var(--sub);background:#fff;border:1px solid var(--line);border-radius:999px;padding:3px 12px;}
+  .chip b{color:var(--ink);font-weight:600;}
+  section{margin-top:44px;}
+  .qtag{display:inline-flex;align-items:center;gap:8px;font-size:13px;font-weight:600;color:#fff;border-radius:999px;padding:4px 14px;}
+  .qtag.q1{background:var(--blue);} .qtag.q2{background:var(--green);}
+  section h2{font-size:22px;font-weight:700;margin-top:10px;line-height:1.45;}
+  .lead{margin-top:10px;font-size:15px;color:#3a4557;max-width:860px;}
+  .lead b{color:var(--ink);}
+  .figure{margin-top:20px;background:#fff;border:1px solid var(--line);border-radius:var(--radius);padding:20px;overflow:hidden;}
+  .figure .cap{font-size:12.5px;color:var(--sub);margin-top:12px;border-top:1px dashed var(--line);padding-top:10px;}
+  .figure .cap code{background:var(--bg);border:1px solid var(--line);border-radius:4px;padding:1px 6px;font-size:12px;font-family:Consolas,"Courier New",monospace;}
+  svg.flow{width:100%;height:auto;display:block;}
+  .grid{display:grid;gap:16px;margin-top:20px;}
+  .grid.c3{grid-template-columns:repeat(3,1fr);}
+  .grid.c2{grid-template-columns:repeat(2,1fr);}
+  .card{background:#fff;border:1px solid var(--line);border-radius:var(--radius);padding:18px 18px 16px;}
+  .card .t{font-size:15px;font-weight:700;margin-bottom:8px;display:flex;align-items:center;gap:8px;}
+  .card .t .dot{width:10px;height:10px;border-radius:50%;flex:none;}
+  .card ul{list-style:none;}
+  .card li{font-size:13.5px;color:#3a4557;padding-left:16px;position:relative;margin:5px 0;}
+  .card li::before{content:"";position:absolute;left:2px;top:9px;width:5px;height:5px;border-radius:50%;background:var(--dot,#9aa3af);}
+  .card .ref{display:inline-block;margin-top:8px;font-size:12px;color:var(--sub);background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:2px 8px;}
+  .banner{display:flex;align-items:center;gap:10px;background:var(--green-bg);border:1px solid var(--green);border-radius:var(--radius);padding:14px 18px;margin-top:20px;font-size:14.5px;font-weight:600;color:#14532d;}
+  .banner .ic{flex:none;width:22px;height:22px;border-radius:50%;background:var(--green);color:#fff;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:700;}
+  table.tbl{width:100%;table-layout:fixed;border-collapse:collapse;margin-top:20px;background:#fff;border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;font-size:13.5px;}
+  table.tbl colgroup col:first-child{width:22%;}
+  table.tbl th,table.tbl td{padding:12px 14px;border-bottom:1px solid var(--line);vertical-align:top;text-align:left;}
+  table.tbl thead th{background:var(--bg);font-size:13.5px;font-weight:700;}
+  table.tbl tbody tr:last-child td{border-bottom:none;}
+  table.tbl td.k{font-weight:600;color:var(--sub);background:var(--bg);width:22%;}
+  table.tbl td code{background:var(--bg);border:1px solid var(--line);border-radius:4px;padding:1px 5px;font-family:Consolas,"Courier New",monospace;font-size:12px;}
+  .okline{color:var(--green);font-weight:700;}
+  .footer{margin-top:48px;padding-top:18px;border-top:1px solid var(--line);font-size:12.5px;color:var(--sub);}
+  .footer b{color:var(--ink);}
+  @media (max-width:720px){
+    .grid.c3,.grid.c2{grid-template-columns:1fr;}
+    header.doc h1{font-size:24px;}
+    section h2{font-size:19px;}
+  }
+</style>
+</head>
+<body>
+<div class="topbar"></div>
+<div class="wrap">
+
+<header class="doc">
+  <h1>任务暂停 / 恢复与续跑机制</h1>
+  <div class="sub">sweetAgent 多智能体项目代码精读 · 两个高频问题的图解总结 · 2026-10-04</div>
+  <div class="meta">
+    <span class="chip">代码：<b>main_graph.py · chat.py · checkpoint.py · scheduler/service.py · conversation.py</b></span>
+    <span class="chip">考点：<b>十九 · 二十九 · 六十四 · OPT-12</b></span>
+    <span class="chip">配套：<b>docs/development_log.md 考点七十四及其追问</b></span>
+  </div>
+</header>
+
+<!-- ================= 问题一 ================= -->
+<section>
+  <span class="qtag q1">Q1</span>
+  <h2>任务怎么「暂停 → 恢复 → 续跑」？——一个系统里三层不同的断点机制</h2>
+  <p class="lead">核心是第 1 层：<b>LangGraph 的 interrupt() + PostgresSaver checkpoint + Command(resume)</b>（质量门 human-in-the-loop）。另有两层：定时任务调度（DB 状态 + APScheduler + 重启重放）、多轮会话（thread_id 历史注入）。三者断点对象不同、哲学一致：<b>断点落盘、应用层等待、无状态化恢复</b>。</p>
+
+  <div class="figure">
+    <svg class="flow" viewBox="0 0 960 1030" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="quality_gate human-in-the-loop 暂停恢复主链路">
+      <defs>
+        <marker id="dA" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#2f6fd0"/></marker>
+        <marker id="dR" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#d0342c"/></marker>
+        <marker id="dG" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#1a9c55"/></marker>
+        <marker id="dGr" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#9aa3af"/></marker>
+      </defs>
+
+      <rect x="150" y="24" width="320" height="56" rx="10" fill="#eaf2ff" stroke="#2f6fd0" stroke-width="1.5"/>
+      <text x="310" y="45" text-anchor="middle" font-size="14" font-weight="bold" fill="#111827">用户提问</text>
+      <text x="310" y="64" text-anchor="middle" font-size="12.5" fill="#374151">POST /chat（human_in_the_loop=True）</text>
+      <line x1="310" y1="80" x2="310" y2="104" stroke="#2f6fd0" stroke-width="1.5" marker-end="url(#dA)"/>
+
+      <rect x="150" y="104" width="320" height="60" rx="10" fill="#eaf2ff" stroke="#2f6fd0" stroke-width="1.5"/>
+      <text x="310" y="125" text-anchor="middle" font-size="14" font-weight="bold" fill="#111827">Manager 规划任务 DAG</text>
+      <text x="310" y="143" text-anchor="middle" font-size="12.5" fill="#374151">Router 动态调度部门（并行 fan-out）</text>
+      <line x1="310" y1="164" x2="310" y2="188" stroke="#2f6fd0" stroke-width="1.5" marker-end="url(#dA)"/>
+
+      <rect x="150" y="188" width="320" height="60" rx="10" fill="#eaf2ff" stroke="#2f6fd0" stroke-width="1.5"/>
+      <text x="310" y="209" text-anchor="middle" font-size="14" font-weight="bold" fill="#111827">部门 Agent 并行执行</text>
+      <text x="310" y="227" text-anchor="middle" font-size="12.5" fill="#374151">Operation / Finance / Logistics / Product</text>
+      <line x1="310" y1="248" x2="310" y2="272" stroke="#2f6fd0" stroke-width="1.5" marker-end="url(#dA)"/>
+
+      <rect x="150" y="272" width="320" height="56" rx="10" fill="#eaf2ff" stroke="#2f6fd0" stroke-width="1.5"/>
+      <text x="310" y="293" text-anchor="middle" font-size="14" font-weight="bold" fill="#111827">Decision 汇总</text>
+      <text x="310" y="311" text-anchor="middle" font-size="12.5" fill="#374151">生成候选答案</text>
+      <line x1="310" y1="328" x2="310" y2="352" stroke="#2f6fd0" stroke-width="1.5" marker-end="url(#dA)"/>
+
+      <rect x="150" y="352" width="320" height="64" rx="10" fill="#fff6e5" stroke="#d97706" stroke-width="1.5"/>
+      <text x="310" y="374" text-anchor="middle" font-size="14" font-weight="bold" fill="#111827">quality_gate 质量门</text>
+      <text x="310" y="392" text-anchor="middle" font-size="12.5" fill="#374151">规则检查 + LLM 裁判（可选）</text>
+
+      <line x1="470" y1="388" x2="540" y2="388" stroke="#1a9c55" stroke-width="1.5" marker-end="url(#dG)"/>
+      <text x="505" y="378" text-anchor="middle" font-size="12.5" font-weight="bold" fill="#1a9c55">合格</text>
+      <rect x="540" y="352" width="280" height="64" rx="10" fill="#e6f7ec" stroke="#1a9c55" stroke-width="1.5"/>
+      <text x="680" y="374" text-anchor="middle" font-size="14" font-weight="bold" fill="#111827">合格 → END</text>
+      <text x="680" y="392" text-anchor="middle" font-size="12.5" fill="#374151">返回答案 + 落会话历史</text>
+
+      <path d="M 150 386 C 40 386 40 300 150 300" fill="none" stroke="#9aa3af" stroke-width="1.5" stroke-dasharray="6 4" marker-end="url(#dGr)"/>
+      <text x="90" y="332" text-anchor="middle" font-size="12" fill="#6b7280">不合格 · 自动回炉</text>
+      <text x="90" y="350" text-anchor="middle" font-size="12" fill="#6b7280">（≤2 次，带 feedback）</text>
+
+      <line x1="310" y1="416" x2="310" y2="452" stroke="#d0342c" stroke-width="1.5" marker-end="url(#dR)"/>
+      <text x="140" y="435" text-anchor="end" font-size="12" fill="#d0342c">不合格 · 自动回炉已耗尽 → 暂停</text>
+
+      <rect x="150" y="452" width="320" height="64" rx="10" fill="#fdecec" stroke="#d0342c" stroke-width="1.5"/>
+      <text x="310" y="474" text-anchor="middle" font-size="14" font-weight="bold" fill="#111827">interrupt() 暂停</text>
+      <text x="310" y="492" text-anchor="middle" font-size="12.5" fill="#374151">抛 GraphInterrupt，invoke 立即返回</text>
+      <line x1="310" y1="516" x2="310" y2="540" stroke="#d0342c" stroke-width="1.5" marker-end="url(#dR)"/>
+
+      <rect x="150" y="540" width="320" height="78" rx="10" fill="#fdecec" stroke="#d0342c" stroke-width="1.5"/>
+      <text x="310" y="562" text-anchor="middle" font-size="14" font-weight="bold" fill="#111827">断点落盘</text>
+      <text x="310" y="580" text-anchor="middle" font-size="12.5" fill="#374151">PostgresSaver → checkpoints 表</text>
+      <text x="310" y="598" text-anchor="middle" font-size="12.5" fill="#374151">State 快照按 thread_id 持久化</text>
+      <line x1="310" y1="618" x2="310" y2="642" stroke="#d0342c" stroke-width="1.5" marker-end="url(#dR)"/>
+
+      <rect x="150" y="642" width="320" height="64" rx="10" fill="#fdecec" stroke="#d0342c" stroke-width="1.5"/>
+      <text x="310" y="662" text-anchor="middle" font-size="13.5" font-weight="bold" fill="#111827">API 返回 stage=awaiting_feedback</text>
+      <text x="310" y="682" text-anchor="middle" font-size="12.5" fill="#374151">前端展示：候选答案 + issues 诊断</text>
+      <line x1="310" y1="706" x2="310" y2="740" stroke="#1a9c55" stroke-width="1.5" marker-end="url(#dG)"/>
+
+      <rect x="150" y="740" width="320" height="60" rx="10" fill="#eafaf1" stroke="#1a9c55" stroke-width="1.5"/>
+      <text x="310" y="762" text-anchor="middle" font-size="14" font-weight="bold" fill="#111827">用户选择</text>
+      <text x="310" y="780" text-anchor="middle" font-size="12.5" fill="#374151">approve 接受放行 ／ revise 输入纠正</text>
+      <line x1="310" y1="800" x2="310" y2="824" stroke="#1a9c55" stroke-width="1.5" marker-end="url(#dG)"/>
+
+      <rect x="150" y="824" width="320" height="64" rx="10" fill="#eafaf1" stroke="#1a9c55" stroke-width="1.5"/>
+      <text x="310" y="846" text-anchor="middle" font-size="13.5" font-weight="bold" fill="#111827">POST /chat/{thread_id}/resume</text>
+      <text x="310" y="866" text-anchor="middle" font-size="12.5" fill="#374151">Command(resume=payload)</text>
+      <line x1="310" y1="888" x2="310" y2="912" stroke="#1a9c55" stroke-width="1.5" marker-end="url(#dG)"/>
+
+      <rect x="150" y="912" width="320" height="96" rx="10" fill="#eafaf1" stroke="#1a9c55" stroke-width="1.5"/>
+      <text x="310" y="934" text-anchor="middle" font-size="14" font-weight="bold" fill="#111827">从最近 checkpoint 续跑</text>
+      <text x="310" y="952" text-anchor="middle" font-size="12.5" fill="#374151">interrupt() 返回用户输入（不再暂停）</text>
+      <text x="310" y="970" text-anchor="middle" font-size="12.5" fill="#374151">approve → 放行 END ／ revise → 按 feedback 重生成</text>
+      <text x="310" y="988" text-anchor="middle" font-size="12.5" fill="#374151">再走质量门 → END</text>
+
+      <rect x="540" y="24" width="380" height="96" rx="10" fill="#f6f7f9" stroke="#9aa3af" stroke-width="1.2" stroke-dasharray="4 3"/>
+      <text x="556" y="44" font-size="13" font-weight="bold" fill="#111827">降级路径</text>
+      <text x="556" y="63" font-size="12" fill="#374151">human_in_the_loop=False 或</text>
+      <text x="556" y="79" font-size="12" fill="#374151">无 checkpointer → 回炉耗尽后</text>
+      <text x="556" y="95" font-size="12" fill="#374151">force_pass 放行（诊断保留）</text>
+      <text x="556" y="111" font-size="12" fill="#374151">评估 / verify 链路零破坏</text>
+
+      <rect x="540" y="140" width="380" height="96" rx="10" fill="#f6f7f9" stroke="#9aa3af" stroke-width="1.2" stroke-dasharray="4 3"/>
+      <text x="556" y="160" font-size="13" font-weight="bold" fill="#111827">interrupt() = 暂停并返回，不是阻塞</text>
+      <text x="556" y="179" font-size="12" fill="#374151">断点已落库、线程已释放；</text>
+      <text x="556" y="195" font-size="12" fill="#374151">等待发生在应用层（前端面板）</text>
+      <text x="556" y="211" font-size="12" fill="#374151">Web 场景不占线程 / 连接</text>
+      <text x="556" y="227" font-size="12" fill="#374151">进程重启后仍可用同一 thread_id 续跑</text>
+
+      <rect x="540" y="256" width="380" height="96" rx="10" fill="#f6f7f9" stroke="#9aa3af" stroke-width="1.2" stroke-dasharray="4 3"/>
+      <text x="556" y="276" font-size="13" font-weight="bold" fill="#111827">resume = 回答暂停点</text>
+      <text x="556" y="295" font-size="12" fill="#374151">不是发新任务：payload 成为</text>
+      <text x="556" y="311" font-size="12" fill="#374151">interrupt() 的返回值（time-travel）</text>
+      <text x="556" y="327" font-size="12" fill="#374151">同一 thread_id + checkpoint 从断点续跑</text>
+      <text x="556" y="343" font-size="12" fill="#374151">resume 后可直接取回原始问题（state 里）</text>
+    </svg>
+    <div class="cap">图 1｜quality_gate 的 human-in-the-loop 暂停 / 恢复主链路（示意）。代码：<code>app/graph/main_graph.py:265</code>（interrupt）、<code>app/api/chat.py:196</code>（resume）、<code>app/memory/checkpoint.py</code>（PostgresSaver）。</div>
+  </div>
+
+  <div class="grid c3">
+    <div class="card"><div class="t"><span class="dot" style="background:#2f6fd0"></span>① 图执行断点（核心）</div>
+      <ul>
+        <li>interrupt + checkpoint + Command(resume)</li>
+        <li>恢复点 = State 快照（Postgres · thread_id 键）</li>
+        <li>应对：进程崩溃 / 用户介入恢复</li>
+      </ul>
+      <span class="ref">考点十九 · 二十九</span>
+    </div>
+    <div class="card"><div class="t"><span class="dot" style="background:#1a9c55"></span>② 调度任务断点</div>
+      <ul>
+        <li>DB 状态 + APScheduler 同步 + 重启重放</li>
+        <li>恢复点 = 任务定义 + 启用状态</li>
+        <li>应对：暂停 / 恢复 / 自动暂停 / 重启不丢</li>
+      </ul>
+      <span class="ref">考点六十四</span>
+    </div>
+    <div class="card"><div class="t"><span class="dot" style="background:#d97706"></span>③ 多轮会话续跑</div>
+      <ul>
+        <li>thread_id 历史 + 指代改写 + token 压缩</li>
+        <li>恢复点 = 对话语义上下文</li>
+        <li>应对：换轮次承接上文续聊</li>
+      </ul>
+      <span class="ref">OPT-12</span>
+    </div>
+  </div>
+</section>
+
+<!-- ================= 问题二 ================= -->
+<section>
+  <span class="qtag q2">Q2</span>
+  <h2>resume 恢复时，还要查数据库的对话上下文吗？——checkpoint 自足性</h2>
+  <p class="lead"><b>不需要。</b>resume 恢复的是「图执行状态」，checkpoint 里的 GlobalState 快照对续跑自足；<b>conversation_messages（历史表）只在「新开一轮」时才读</b>。两条路径的数据流完全不同，见下图。</p>
+
+  <div class="figure">
+    <div class="grid c2" style="margin-top:0;">
+      <svg class="flow" viewBox="0 0 460 440" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="新轮次路径：读历史表">
+        <defs><marker id="dB" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#2f6fd0"/></marker></defs>
+        <text x="16" y="24" font-size="14" font-weight="bold" fill="#2f6fd0">新轮次 · POST /chat（run_question）</text>
+        <rect x="16" y="34" width="420" height="78" rx="10" fill="#eaf2ff" stroke="#2f6fd0" stroke-width="1.5"/>
+        <text x="32" y="56" font-size="13.5" font-weight="bold" fill="#111827">读 conversation_messages</text>
+        <text x="32" y="74" font-size="12.5" fill="#374151">build_conversation_context</text>
+        <text x="32" y="92" font-size="12.5" fill="#374151">（历史摘要 + 最近 N 轮原文）</text>
+        <line x1="226" y1="112" x2="226" y2="144" stroke="#2f6fd0" stroke-width="1.5" marker-end="url(#dB)"/>
+        <rect x="16" y="144" width="420" height="60" rx="10" fill="#eaf2ff" stroke="#2f6fd0" stroke-width="1.5"/>
+        <text x="32" y="166" font-size="13.5" font-weight="bold" fill="#111827">注入 GlobalState</text>
+        <text x="32" y="184" font-size="12.5" fill="#374151">conversation_context / rewritten_question</text>
+        <line x1="226" y1="204" x2="226" y2="236" stroke="#2f6fd0" stroke-width="1.5" marker-end="url(#dB)"/>
+        <rect x="16" y="236" width="420" height="92" rx="10" fill="#eaf2ff" stroke="#2f6fd0" stroke-width="1.5"/>
+        <text x="32" y="258" font-size="13.5" font-weight="bold" fill="#111827">图执行：Manager → 部门 → Decision → quality_gate</text>
+        <text x="32" y="276" font-size="12.5" fill="#374151">每节点 State 快照落库</text>
+        <text x="32" y="294" font-size="12.5" fill="#374151">（checkpoints / checkpoint_writes）</text>
+        <line x1="226" y1="328" x2="226" y2="360" stroke="#2f6fd0" stroke-width="1.5" marker-end="url(#dB)"/>
+        <rect x="16" y="360" width="420" height="62" rx="10" fill="#eaf2ff" stroke="#2f6fd0" stroke-width="1.5"/>
+        <text x="32" y="382" font-size="13.5" font-weight="bold" fill="#111827">执行完 stage=done → append_turn</text>
+        <text x="32" y="400" font-size="12.5" fill="#374151">写回 conversation_messages</text>
+      </svg>
+
+      <svg class="flow" viewBox="0 0 460 440" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="恢复路径：只依赖 checkpoint">
+        <defs><marker id="dC" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#1a9c55"/></marker></defs>
+        <text x="16" y="24" font-size="14" font-weight="bold" fill="#1a9c55">恢复 · POST /chat/{thread_id}/resume</text>
+        <rect x="16" y="34" width="420" height="78" rx="10" fill="#eafaf1" stroke="#1a9c55" stroke-width="1.5"/>
+        <text x="32" y="56" font-size="13.5" font-weight="bold" fill="#111827">不读 conversation_messages</text>
+        <text x="32" y="74" font-size="12.5" fill="#374151">resume_chat 零历史查询</text>
+        <text x="32" y="92" font-size="12.5" fill="#374151">只调 graph + checkpointer + invoke</text>
+        <line x1="226" y1="112" x2="226" y2="144" stroke="#1a9c55" stroke-width="1.5" marker-end="url(#dC)"/>
+        <rect x="16" y="144" width="420" height="78" rx="10" fill="#eafaf1" stroke="#1a9c55" stroke-width="1.5"/>
+        <text x="32" y="166" font-size="13.5" font-weight="bold" fill="#111827">LangGraph 按 thread_id 自动加载</text>
+        <text x="32" y="184" font-size="12.5" fill="#374151">最近 checkpoint + pending writes</text>
+        <text x="32" y="202" font-size="12.5" fill="#374151">重建全部 State（含会话上下文）</text>
+        <line x1="226" y1="222" x2="226" y2="254" stroke="#1a9c55" stroke-width="1.5" marker-end="url(#dC)"/>
+        <rect x="16" y="254" width="420" height="92" rx="10" fill="#eafaf1" stroke="#1a9c55" stroke-width="1.5"/>
+        <text x="32" y="276" font-size="13.5" font-weight="bold" fill="#111827">interrupt() 返回 payload（approve / revise）</text>
+        <text x="32" y="294" font-size="12.5" fill="#374151">从暂停那一行继续执行</text>
+        <text x="32" y="312" font-size="12.5" fill="#374151">（time-travel 语义）</text>
+        <line x1="226" y1="346" x2="226" y2="378" stroke="#1a9c55" stroke-width="1.5" marker-end="url(#dC)"/>
+        <rect x="16" y="378" width="420" height="62" rx="10" fill="#fff8e1" stroke="#d97706" stroke-width="1.5"/>
+        <text x="32" y="400" font-size="13.5" font-weight="bold" fill="#111827">approve → END ／ revise → 重生成</text>
+        <text x="32" y="418" font-size="12.5" fill="#b45309">缺口：不回写历史 / 不提取记忆</text>
+      </svg>
+    </div>
+    <div class="cap">图 2｜两条路径数据流对比（示意）：左 = 新轮次入口（读历史表），右 = 恢复入口（只依赖 checkpoint）。代码：<code>app/graph/main_graph.py:453</code>（上下文构造）、<code>app/api/chat.py:196-231</code>（resume 零查询）。</div>
+  </div>
+
+  <div class="banner">
+    <span class="ic">!</span>
+    <span>结论：resume 恢复执行 = checkpoint 自足，无需再查数据库；conversation_messages 只在开新一轮时读。</span>
+  </div>
+
+  <div class="figure">
+    <table class="tbl">
+      <colgroup><col style="width:22%"><col style="width:39%"><col style="width:39%"></colgroup>
+      <thead>
+        <tr><th>维度</th><th>checkpoints / checkpoint_writes</th><th>conversation_messages</th></tr>
+      </thead>
+      <tbody>
+        <tr><td class="k">存什么</td><td>图执行状态快照（每节点一步，按 thread_id 键分区）</td><td>对话文本 user / assistant / summary（seq 递增 + token 计数）</td></tr>
+        <tr><td class="k">谁读</td><td>resume 自动加载 · 审计 · time travel</td><td>新轮次上下文注入 · 前端历史渲染</td></tr>
+        <tr><td class="k">面向</td><td>执行续跑（恢复点）</td><td>应用层历史（新轮次起点）</td></tr>
+        <tr><td class="k">何时用</td><td class="okline">resume 靠它，自足</td><td class="okline">新一轮对话才需要它</td></tr>
+      </tbody>
+    </table>
+    <div class="cap">表 1｜两张表分工：chat.py 的 /chat/threads 注释明确「与 checkpoints（中断恢复快照）无关」。</div>
+  </div>
+
+  <div class="grid c2">
+    <div class="card"><div class="t"><span class="dot" style="background:#d97706"></span>缺口 1：暂停轮的草稿其实已写历史</div>
+      <ul>
+        <li>decision 先把 current_stage 置「done」才轮到 quality_gate 中断</li>
+        <li>中断返回时 stage 仍为 done，run_question 的「仅 done 才 append_turn」守卫挡不住</li>
+        <li>草稿答案已入库（与注释意图不符，影响小）</li>
+      </ul>
+    </div>
+    <div class="card"><div class="t"><span class="dot" style="background:#d97706"></span>缺口 2：resume 完成后不回写</div>
+      <ul>
+        <li>append_turn / maybe_extract_memories / 输出脱敏都只在 run_question 里</li>
+        <li>revise 修正后的答案不进历史表（下一轮注入看不到修正版）、不进长期记忆、响应未脱敏</li>
+        <li>修复方向：resume 端点复用 run_question 同款收尾</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<div class="footer">
+  <b>核心一句话：</b>本系统有三层互不相同但哲学一致的「断点」——图执行靠 interrupt + checkpoint + Command(resume)（暂停点落库、恢复点续跑），定时任务靠 DB 状态 + APScheduler 同步 + 重启重放，多轮会话靠 thread_id 历史注入 + 指代改写 + token 压缩；恢复对话时 checkpoint 自足、无需查历史表，但「执行恢复自足 ≠ 应用层收尾自足」。<br>
+  本页为示意图（非精确时序），完整面试问答格式见 <b>docs/development_log.md 考点七十四及其追问</b>；代码位置以页内标注为准。
+</div>
+</div>
+</body>
+</html>
